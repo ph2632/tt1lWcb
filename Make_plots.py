@@ -43,10 +43,14 @@ class Config:
         # MC sample directory.  youpeng reproduces the scored ntuples every
         # few weeks under a new sub-directory (and has flip-flopped MC/ <->
         # mc/); pick the first readable candidate, newest first.  Override
-        # with $WCB_MC_DIR (absolute path to the directory of *_merged.root).
+        # with $WCB_MC_DIR (absolute path to the dir of *_merged[_Skim].root).
         _mc_candidates = [
             os.environ.get("WCB_MC_DIR", ""),
-            # 2026-09-02 rerun: more GloParT scores added (youpeng)
+            # 2026-09-02 "2final" rerun (shared 2026-09-04): +24 GloParT
+            # sub-nodes, +genZ_eta/phi, +is_qcd; -ak8_gpt_bqq (was a dead
+            # all-zero branch anyway).  Files are now *_merged_Skim.root.
+            # Content verified 1:1 with the previous production for every
+            # branch the analysis reads (xcheck_new_samples.py).
             self.base_path + "MC/scored_samples_2final_v20260902_rerun/",
             self.base_path + "mc/scored_samples_2final_v20260902_rerun/",
             # previous production
@@ -200,7 +204,17 @@ class Config:
         #   can be built at plot time -> new spec `ttreco_jstar_flav`.
         #   Only new cached field; everything else folds in.  Full re-derive
         #   (~25 min).
-        self.cache_tag = "derived_v16h_ttReco_v1"
+        # v17 (derived_v17_2final_v1, 2026-09-04): NEW MC production
+        #   `MC/scored_samples_2final_v20260902_rerun/` (*_merged_Skim.root).
+        #   No derived-code change -- the tag bump is only to force a fresh
+        #   derive off the new ntuples.  Branch content verified identical to
+        #   the old production for everything the analysis reads; the only
+        #   removed branch is `ak8_gpt_bqq` (was all-zero -> _cand_ak8 returns
+        #   0 for it anyway, no behaviour change).  Full re-derive (~25 min).
+        # v18 (2026-09-04): + the 25 finer GloParT sub-nodes from the 2final
+        #   ntuples (_GPT_EXTRA_NODES -> ak8_gpt_<node>_0).  New cached
+        #   fields -> full re-derive.
+        self.cache_tag = "derived_v18_gptnodes_v1"
 
         # ------------------------------------------------------------------
         # Switches
@@ -443,6 +457,8 @@ class Config:
             # extra GloParT raw scores (MAT jet-kinematics study)
             "ak8_gpt_bqq",
             "ak8_gpt_topw",
+        ] + ["ak8_gpt_" + _n for _n in _GPT_EXTRA_NODES] + [
+            # (the 2final finer GloParT sub-nodes -- see _GPT_EXTRA_NODES)
 
             # leading-AK8 substructure (MAT jet-kinematics study)
             "ak8_rawFactor",
@@ -557,7 +573,7 @@ def get_leading(arr, default=-999):
 def get_sample_group(filename, catalog):
     shortname = os.path.basename(filename)
     shortname = shortname.replace("_tree.root", "")
-    shortname = shortname.replace("_merged.root", "")
+    shortname = shortname.replace("_merged_Skim.root", "").replace("_merged.root", "")
 
     for group, keys in catalog.items():
         if any(k in shortname for k in keys):
@@ -923,6 +939,8 @@ _CACHE_ALWAYS_COLUMNS = frozenset({
     "bdr1_pt", "bdr1_eta", "bdr1_phi", "bdr1_m", "bdr1_tag",
     "bbestm1_pt", "bbestm1_eta", "bbestm1_phi", "bbestm1_m", "bbestm1_tag",
     "bdr1_pnuds", "bdr1_pnb",
+    # dR_ja_bL12 (2026-09-04): dR of the 2 loose-b AK4 nearest J
+    "bL1_pt", "bL1_eta", "bL1_phi", "bL2_pt", "bL2_eta", "bL2_phi",
     "bmk1_pt", "bmk1_eta", "bmk1_phi", "bmk1_m", "bmk1_x", "bmk1_tag", "bmk1_pnb", "bmk1_pnc", "bmk1_pnuds",
     "bmk2_pt", "bmk2_eta", "bmk2_phi", "bmk2_m", "bmk2_x", "bmk2_tag", "bmk2_pnb", "bmk2_pnc", "bmk2_pnuds",
     "bmk3_pt", "bmk3_eta", "bmk3_phi", "bmk3_m", "bmk3_x", "bmk3_tag", "bmk3_pnb", "bmk3_pnc", "bmk3_pnuds",
@@ -1223,47 +1241,53 @@ class DataManager:
         def _want(*names):
             return need is None or not set(names).isdisjoint(need)
 
-        # ja_truth_cat : 13-bin categorical of what J / the event is at gen
+        # ja_truth_cat : 14-bin categorical of what J / the event is at gen
         # level, from the RAW cached mat_cat + true_cat + ak8_n_c_in_jet (the
         # code-6 -> 20/21/22 and code-8 -> 23 splits event_context does at plot
         # time are replicated here).
         # Drives the standalone MAT_ttreco_ja_truth composition plot.
-        #   SIGNAL (all W->cb) -- 5 categories:
-        #     0  (cb)        2-prong merged W->cb jet           mat_cat 0/5
-        #     1  (b' c)     top-b + W's c merged               mat_cat 6 & Top_bc
-        #     2  (b' b)     top-b + W's b merged               mat_cat 6 & Top_bq
-        #     3  (b' b c)   fully-merged top t->(bbc)     mat_cat 20 | 6&Top_bqq
-        #     4  (cb) res    W->cb with c,b NOT merged in J   mat_cat 6 (else)
-        #   BACKGROUND:
-        #     5  proxy t     genuine hadronic top, no c prong   mat_cat 2/7 |
-        #                                                       (8 & n_c==0)
-        #     6  t->(b' c)q hadronic top, c prong in J       mat_cat 8 & n_c>=1
-        #     7  W->(cq)     merged W->cq jet                   mat_cat 1/9
-        #     8  W->(qq)     merged light-W jet                 mat_cat 4/11
-        #     9  Z->(cc/bb)  merged heavy-flavour Z jet         mat_cat 14/15
-        #    10  Z->(qq)     merged light-Z jet                 mat_cat 13
-        #    11  resolved bkg  W->cq / W->qq' with no merged W  mat_cat 10/12
-        #    12  rest         everything else incl. resolved Z (no z_decay in
-        #                     the cache -> Z-resolved-by-flavour needs a re-derive)
+        # EACH BIN == EXACTLY ONE DRAWN OVERLAY LINE (2026-09-04, user):
+        # the 4 top-proxy categories each get their own bin, and every
+        # mat_cat that draws as the grey "Rest" line (3, 9, 10, 11, 12 --
+        # W !=j_a + resolved W + rest) is pooled into the single "rest" bin
+        # (was split "resolved bkg" | "rest").
+        #   SIGNAL (all W->cb):
+        #     0  W(cb)          2-prong merged W->cb jet         mat_cat 0/5
+        #     1  t^2(b'c)       top-b + W's c merged             mat_cat 6 & Top_bc
+        #     2  t^2(b'b)       top-b + W's b merged             mat_cat 6 & Top_bq
+        #     3  t^3(b'bc)      fully-merged top t->(bbc)   mat_cat 20 | 6&Top_bqq
+        #     4  c,b,b' res     W->cb with c,b NOT merged in J   mat_cat 6 (else)
+        #   BACKGROUND -- hadronic-top proxy (one bin each):
+        #     5  t^2(b'c) proxy real top, W's c prong merged     mat_cat 2
+        #     6  t^2(b'q)       real top, W's light prong merged mat_cat 7
+        #     7  t^3(b'cq)      full 3-merge, c prong in J       mat_cat 8 & n_c>=1
+        #     8  t^3(b'qq)      full 3-merge, no c prong         mat_cat 8 & n_c<1
+        #   BACKGROUND -- hadronic V (=j_a only, own line):
+        #     9  W(cq)          merged W->cq jet, IS j_a         mat_cat 1
+        #    10  W(qq)          merged light-W jet, IS j_a       mat_cat 4
+        #    11  Z(cc/bb)       merged heavy-flavour Z jet       mat_cat 14/15
+        #    12  Z(qq)          merged light-Z jet               mat_cat 13
+        #    13  rest           the grey "Rest" line: W !=j_a (9/11),
+        #                       resolved W (10/12), everything else (3)
         # true_cat codes (cfg.true_cat_codes): Top_bqq 1, Top_bc 2, Top_bq 3.
         if _want("ja_truth_cat") and {"mat_cat", "true_cat"} <= set(arr.fields):
             _mc = ak.to_numpy(arr["mat_cat"])
             _tc = ak.to_numpy(arr["true_cat"])
             _nc = (ak.to_numpy(arr["ak8_n_c_in_jet"])
                    if "ak8_n_c_in_jet" in arr.fields else np.zeros(len(_mc)))
-            _jt = np.full(len(_mc), 12.0, dtype=np.float32)     # rest
-            _jt[np.isin(_mc, (10, 12))] = 11.0                  # resolved W bkg
-            _jt[_mc == 13] = 10.0                               # Z->(qq) merged
-            _jt[np.isin(_mc, (14, 15))] = 9.0                   # Z->(cc/bb) merged
-            _jt[np.isin(_mc, (4, 11))] = 8.0                    # W->(qq) merged
-            _jt[np.isin(_mc, (1, 9))] = 7.0                     # W->(cq) merged
-            _jt[np.isin(_mc, (2, 7))] = 5.0                     # proxy real top
-            _jt[(_mc == 8) & (_nc < 1)] = 5.0                   #   3-merge, no c
-            _jt[(_mc == 8) & (_nc >= 1)] = 6.0                  # t->(b' c)q
+            _jt = np.full(len(_mc), 13.0, dtype=np.float32)     # rest (Rest line)
+            _jt[_mc == 13] = 12.0                               # Z->(qq) merged
+            _jt[np.isin(_mc, (14, 15))] = 11.0                  # Z->(cc/bb) merged
+            _jt[_mc == 4] = 10.0                                # W->(qq) merged (=j_a)
+            _jt[_mc == 1] = 9.0                                 # W->(cq) merged (=j_a)
+            _jt[(_mc == 8) & (_nc < 1)] = 8.0                   # t^3(b'qq) full merge
+            _jt[(_mc == 8) & (_nc >= 1)] = 7.0                  # t^3(b'cq) full merge
+            _jt[_mc == 7] = 6.0                                 # t^2(b'q) proxy
+            _jt[_mc == 2] = 5.0                                 # t^2(b'c) proxy
             _c6 = _mc == 6
             _jt[_c6] = 4.0                                      # (cb) resolved (SIGNAL)
-            _jt[_c6 & (_tc == 2)] = 1.0                         # (b' c) partial
-            _jt[_c6 & (_tc == 3)] = 2.0                         # (b' b) partial
+            _jt[_c6 & (_tc == 2)] = 1.0                         # t^2(b'c) partial
+            _jt[_c6 & (_tc == 3)] = 2.0                         # t^2(b'b) partial
             _jt[_c6 & (_tc == 1)] = 3.0                         # full merge
             _jt[_mc == 20] = 3.0                                # full merge t->(bbc)
             _jt[np.isin(_mc, (0, 5))] = 0.0                     # 2-prong W->cb merge
@@ -1620,7 +1644,10 @@ class DataManager:
         #   counted, not dropped like SENTINEL).
         # Plus the AK4-flavour / PNet-discriminant diagnostics of the chosen
         # jets (bdr1 = dR-closest AK4; bbestm1 = best-m_t AK4).
-        _tadr_out = ("mt", "mt_nojs", "dR_ja_mt", "jstar_flav",
+        _tadr_out = ("mt", "mt_xself", "mt_nojs",
+                     "dR_ja_mt", "dR_ja_bdr1", "dR_ja_bL12",
+                     "xself_jstar", "dRpt_jstar", "pt_jstar", "xself_bmk1",
+                     "jstar_flav",
                      "bdr1_flav", "bbestm1_flav",
                      "bvuds_near", "bvuds_bestm", "cvuds_bestm",
                      "bcvuds_bestm",
@@ -1674,7 +1701,22 @@ class DataManager:
 
             _out = {
                 "bdr1_flav":  _flav4(_bdr1_tag, _ok_dr),
+                # dR(J, nearest AK4 outside the cone) -- strongest single tag
+                # of the "isolated boosted W-jet" (w/o-j*) population:
+                # ~2.8 there vs ~1.5 for a normal boosted W->cb top
+                # (2026-09-04, user).  -1 when there is no such AK4.
+                "dR_ja_bdr1": np.where(_ok_dr, _dR_dr, -1.0),
             }
+            # dR between the TWO loose-b AK4 nearest J (bL1, bL2 seeds) --
+            # "dR of the nearest 2 b^L jets", restricted to outside the J cone
+            # (2026-09-04, user).  -1 when < 2 such loose-b jets.
+            if {"bL1_pt", "bL2_pt", "bL1_eta", "bL2_eta"} <= set(arr.fields):
+                _b1ok = _g("bL1_pt") > 0.0
+                _b2ok = _g("bL2_pt") > 0.0
+                _dpb = np.abs(_g("bL1_phi") - _g("bL2_phi"))
+                _dpb = np.where(_dpb > np.pi, 2.0 * np.pi - _dpb, _dpb)
+                _drb12 = np.hypot(_g("bL1_eta") - _g("bL2_eta"), _dpb)
+                _out["dR_ja_bL12"] = np.where(_b1ok & _b2ok, _drb12, -1.0)
             if "bbestm1_tag" in arr.fields:
                 _out["bbestm1_flav"] = _flav4(
                     _g("bbestm1_tag"), _g("bbestm1_pt") > 0.0)
@@ -1697,34 +1739,72 @@ class DataManager:
                 return np.where(_ok & (_den > 0.0),
                                 _num / np.maximum(_den, 1e-12), SENTINEL)
 
-            # mt: the single kept top-mass reco.  m(J + AK4) for the FIRST
-            # of the top-5 best-|m(J+AK4) - M_top| AK4 (seeds bmk1..bmk5)
-            # whose top-consistency variable
-            # x = dR(AK4,J)*pT(J+AK4)/(2*172.5) is below WCB_TTRECO_XMT
-            # (default 2.0).  Events with NO AK4 satisfying this -> m = -1
-            # (underflow bin; counted, not dropped).
-            # {b,c,bc}vuds_bestm = PNetAK4 b/(b+uds), c/(c+uds), (b+c)/(b+c+uds)
-            # of the SAME winning AK4 (-1 when there is no candidate).
-            # dR_ja_mt = dR(J, j*) where j* is that winning AK4 -- the angular
-            # separation between the cb candidate and the AK4 that reconstructs
-            # m_t (-1 when there is no candidate).
+            # m_t reconstruction -- see the big block above build_mat_plot_
+            # settings for the full rationale.  m_t = m(J+j*) only when
+            # 40 < m(J) < 130 AND a j* is found, else m_t = m(J).  Two j*
+            # gates run in parallel:
+            #   PRIMARY  ttreco_mt        dR*pT(J+j*)/2 < 2*172.5   (env XMT)
+            #   ALT      ttreco_mt_xself  dR*pT(J+j*)/2 < 2*m(J+j*)  (env XSELF)
+            # j* = first of bmk1..bmk5 (5 best-|m(J+AK4)-172.5| AK4) to pass.
             if "bmk1_pt" in arr.fields:
-                _xmt = float(os.environ.get("WCB_TTRECO_XMT", "2.0"))
-                _mres = np.full(_N, -1.0)
+                _msd_j = _g("ak8_sdmass_0")
+                _msd_ok = _msd_j > 0.0
+                # top reco (J+j*) is only done when J's soft-drop mass says J
+                # is a W / merged-top jet -- i.e. m(J) in [MRG_LO, MRG_HI]
+                # (default 40..130 GeV, 2026-09-04 user).  Below 40 GeV J is a
+                # light/QCD "Rest" jet with no W or t^2 candidate; above 130 J
+                # already IS the (merged) top.  Outside the window (and when
+                # no j* is found) -> m_t = m(J).
+                _mrg_lo = float(os.environ.get("WCB_TTRECO_MRG_MSD_LO", "40"))
+                _mrg_hi = float(os.environ.get("WCB_TTRECO_MRG_MSD",    "130"))
+                _win = _msd_ok & (_msd_j >= _mrg_lo) & (_msd_j <= _mrg_hi)
+
+                # PRIMARY j* gate:      dR*pT(J+j*)/2 < K * 172.5
+                # ALTERNATIVE j* gate:  dR*pT(J+j*)/2 < K * m(J+j*)
+                # K = env WCB_TTRECO_XMT / WCB_TTRECO_XSELF, both default 2.0
+                # (the "2" is optimal for the primary).  Primary = a top-mass
+                # hypothesis test (best for a tt sample, recovers the t^2
+                # partial merges); alternative = mass-agnostic (best for
+                # shape-based template fits).  Both == "dR*pT < 4 * M".
+                # defaults = the Youden-optimal coefficients from the
+                # true-b (topb_jetidx) study: 1.35*172.5 for the fixed ref,
+                # 1.10*m(J+j*) for the self ref (2026-09-04, user).
+                _kfix = float(os.environ.get("WCB_TTRECO_XMT",   "1.35"))
+                _kslf = float(os.environ.get("WCB_TTRECO_XSELF", "1.10"))
+                _MT_REF = 172.5
+
+                _mjjs   = np.full(_N, -1.0)   # m(J+j*), primary gate
+                _mjjs2  = np.full(_N, -1.0)   # m(J+j*), x_self gate
                 _dr_sel = np.full(_N, -1.0)
+                _xs_sel = np.full(_N, -1.0)
+                _drpt_sel = np.full(_N, -1.0)
+                _pt_sel = np.full(_N, -1.0)
+                _xs_bmk1 = np.full(_N, -1.0)
                 _tag_sel = np.full(_N, -1.0)
                 _pnb_sel = np.full(_N, -1.0)
                 _pnc_sel = np.full(_N, -1.0)
                 _pnu_sel = np.full(_N, -1.0)
-                _done = np.zeros(_N, dtype=bool)
+                _done  = np.zeros(_N, dtype=bool)   # found a j* (primary gate)
+                _done2 = np.zeros(_N, dtype=bool)   # found a j* (x_self gate)
                 for _k in range(1, 6):
                     _kb = "bmk%d" % _k
                     if _kb + "_pt" not in arr.fields:
                         continue
-                    _mk, _, _dRk, _okk = _ta_with(_kb)
-                    _take = (~_done) & _okk & (_g(_kb + "_x") < _xmt)
-                    _mres = np.where(_take, _mk, _mres)
+                    _mk, _ptk, _dRk, _okk = _ta_with(_kb)
+                    _drpt_k = _dRk * _ptk
+                    _xself_k = np.where(_okk & (_mk > 0.0),
+                                        _drpt_k / (2.0 * np.maximum(_mk, 1e-6)),
+                                        1.0e9)
+                    if _k == 1:
+                        _xs_bmk1 = np.where(_okk, _xself_k, -1.0)
+                    # primary gate:  dR*pT(J+j*)/2 < K * 172.5
+                    _take = (~_done) & _okk & (
+                        0.5 * _drpt_k < _kfix * _MT_REF)
+                    _mjjs = np.where(_take, _mk, _mjjs)
                     _dr_sel = np.where(_take, _dRk, _dr_sel)
+                    _xs_sel = np.where(_take, _xself_k, _xs_sel)
+                    _drpt_sel = np.where(_take, 0.5 * _drpt_k, _drpt_sel)
+                    _pt_sel = np.where(_take, _ptk, _pt_sel)
                     if _kb + "_tag" in arr.fields:
                         _tag_sel = np.where(_take, _g(_kb + "_tag"), _tag_sel)
                     if _kb + "_pnb" in arr.fields:
@@ -1733,32 +1813,49 @@ class DataManager:
                     if _kb + "_pnc" in arr.fields:
                         _pnc_sel = np.where(_take, _g(_kb + "_pnc"), _pnc_sel)
                     _done |= _take
+                    # x_self gate (for the alternative m_t)
+                    # alternative gate:  dR*pT(J+j*)/2 < K * m(J+j*)
+                    _take2 = (~_done2) & _okk & (
+                        0.5 * _drpt_k < _kslf * np.maximum(_mk, 1e-6))
+                    _mjjs2 = np.where(_take2, _mk, _mjjs2)
+                    _done2 |= _take2
 
-                # ---- fully-merged-top exception (2026-09-04, user) ----------
-                # mt = mSD(J)  when  mSD(J) > 130 GeV  OR  no j* was found;
-                # only fall back to the J+j* combination for the
-                # mSD(J) <= 130 & has-j* remainder.  130 is the crossover
-                # where mSD(J) beats m(J+j*) for every W->cb topology.
-                _mrg_msd = float(os.environ.get("WCB_TTRECO_MRG_MSD", "130"))
-                _msd_j = _g("ak8_sdmass_0")
-                _msd_ok = _msd_j > 0.0
-                _use_msd = _msd_ok & ((_msd_j > _mrg_msd) | (~_done))
-                _mres = np.where(_use_msd, _msd_j, _mres)
-                # j* is actually the mt estimator only on the combined
-                # remainder; the diagnostics below describe that j*.
-                _has_js = _done & ~(_msd_ok & (_msd_j > _mrg_msd))
-                # "no j* candidate at all" flag -> the dotted "J without j*"
-                # overlay (Wcb_nomt / Cat_Top_bc_nomt) keys on this, not on
-                # mt == -1 (mt is now mSD(J) for those events).
+                # m_t = m(J+j*) only inside the m(J) window with a j*;
+                # else m_t = m(J).  m_t = -1 never happens now (m(J) is always
+                # a valid low value) -- unless J itself is missing (mSD<=0).
+                _mres  = np.where(_win & _done,  _mjjs,
+                                  np.where(_msd_ok, _msd_j, -1.0))
+                _mres2 = np.where(_win & _done2, _mjjs2,
+                                  np.where(_msd_ok, _msd_j, -1.0))
+                _out["mt"]       = _mres
+                _out["mt_xself"] = _mres2
+                # j* actually used to build the PRIMARY m_t
+                _has_js = _win & _done
+                # "no j* candidate" flag (primary gate) -> the dotted
+                # "J w/o-j*" overlay (Wcb_nomt / Cat_Top_bc_nomt).
                 _out["mt_nojs"] = (~_done).astype(np.float64)
-
-                _out["mt"] = _mres
-                _out["dR_ja_mt"] = np.where(_has_js, _dr_sel, -1.0)
-                # jstar_flav: 4-bin ParticleNetAK4 flavour categorical (same
-                # ladder as bdr1_flav/bbestm1_flav) of j* -- the AK4 that
-                # reconstructs m_t.  SENTINEL where j* is not used.
+                # dR / x_self / dR*pT / pT of the j* CANDIDATE -- reported
+                # whenever a candidate was found (`_done`), i.e. the -1 /
+                # underflow bin means strictly "no j* candidate" and lines up
+                # with the "J w/o-j*" (mt_nojs) overlay.  (For the merged-top
+                # exception, mSD(J)>130, mt does NOT use this candidate, but
+                # its ΔR is still informative -- it is usually the wide-angle
+                # b_l / ISR jet we chose to ignore.)
+                _out["dR_ja_mt"]   = np.where(_done, _dr_sel, -1.0)
+                _out["xself_jstar"] = np.where(_done, _xs_sel, -1.0)
+                _out["dRpt_jstar"]  = np.where(_done, _drpt_sel, -1.0)
+                # no j* -> the "top pT" is just pT(J)
+                _out["pt_jstar"]    = np.where(_done, _pt_sel, _g("ak8_pt_0"))
+                _out["xself_bmk1"]  = _xs_bmk1
+                # jstar_flav: 5-bin ParticleNetAK4-tag categorical of j* --
+                # bin -1 "w/o j*" (in the m(J) window but no j* found),
+                # then 0 light/untag. | 1 c_L | 2 b_L | 3 b_M.  SENTINEL
+                # (dropped) only OUTSIDE the m(J) window (J is not a top
+                # candidate there).
                 if "bmk1_tag" in arr.fields:
-                    _out["jstar_flav"] = _flav4(_tag_sel, _has_js)
+                    _jf = _flav4(_tag_sel, _has_js)
+                    _jf = np.where(_win & (~_done), -1.0, _jf)
+                    _out["jstar_flav"] = _jf
                 if "bmk1_pnb" in arr.fields:
                     _out["bvuds_bestm"] = np.where(
                         _has_js, _ratio_pn(_pnb_sel, _pnb_sel + _pnu_sel, _has_js),
@@ -1773,19 +1870,20 @@ class DataManager:
                         _ratio_pn(_pnb_sel + _pnc_sel,
                                   _pnb_sel + _pnc_sel + _pnu_sel, _has_js),
                         -1.0)
-                    # mt re-drawn with a flavour cut on j* (2026-09-04, user):
-                    #   b-like    : b/(b+uds)   > 0.4
-                    #   c-like    : c/(c+uds)   > 0.5
-                    #   uds-like  : (b+c)/(b+c+uds) < 0.7
-                    #   b-or-c    : (b+c)/(b+c+uds) > 0.7
-                    # -1 (same sentinel as mt) when there is no j* or j*
-                    # fails the flavour cut.
-                    _bv, _cv, _bcv = (_out["bvuds_bestm"], _out["cvuds_bestm"],
-                                       _out["bcvuds_bestm"])
-                    _out["mt_bjstar"]   = np.where(_has_js & (_bv  > 0.4), _mres, -1.0)
-                    _out["mt_cjstar"]   = np.where(_has_js & (_cv  > 0.5), _mres, -1.0)
-                    _out["mt_udsjstar"] = np.where(_has_js & (_bcv < 0.7), _mres, -1.0)
-                    _out["mt_bcjstar"]  = np.where(_has_js & (_bcv > 0.7), _mres, -1.0)
+                # m_t re-drawn under a ParticleNetAK4-TAG cut on j*
+                # (2026-09-04, user; ak4_tag ladder c_L/M/T = 40/41/42,
+                # b_L/M/T = 50/51/52):
+                #   mt_bjstar   : j* is b_L        (tag >= 50)
+                #   mt_cjstar   : j* is c_L        (40 <= tag < 50)
+                #   mt_bcjstar  : j* is b_L or c_L (tag >= 40)
+                #   mt_udsjstar : j* light/untag.  (tag < 40)
+                # -1 (same sentinel as mt) when no j* or j* fails the cut.
+                if "bmk1_tag" in arr.fields:
+                    _jt = _tag_sel
+                    _out["mt_bjstar"]   = np.where(_has_js & (_jt >= 50.0), _mres, -1.0)
+                    _out["mt_cjstar"]   = np.where(_has_js & (_jt >= 40.0) & (_jt < 50.0), _mres, -1.0)
+                    _out["mt_bcjstar"]  = np.where(_has_js & (_jt >= 40.0), _mres, -1.0)
+                    _out["mt_udsjstar"] = np.where(_has_js & (_jt >= 0.0) & (_jt < 40.0), _mres, -1.0)
 
             for _nm, _v in _out.items():
                 arr = ak.with_field(arr, np.asarray(_v, np.float32), _nm)
@@ -1796,7 +1894,11 @@ class DataManager:
                 if _nm not in arr.fields:
                     if _nm == "mt_nojs":
                         _dflt = 0.0            # flag: "no j*" -> False
-                    elif _nm in ("mt", "dR_ja_mt", "bvuds_bestm",
+                    elif _nm in ("mt", "mt_xself", "dR_ja_mt", "dR_ja_bdr1",
+                                 "dR_ja_bL12",
+                                 "xself_jstar", "dRpt_jstar", "pt_jstar",
+                                 "xself_bmk1",
+                                 "bvuds_bestm",
                                  "cvuds_bestm", "bcvuds_bestm",
                                  "mt_bjstar", "mt_cjstar", "mt_udsjstar",
                                  "mt_bcjstar"):
@@ -2255,6 +2357,11 @@ class DataManager:
         #    are already leading values from leading_or_zero() above.
         g_bqq  = leading_or_zero("ak8_gpt_bqq")
         g_topw = leading_or_zero("ak8_gpt_topw")
+        # the finer GloParT sub-nodes that the 2final ntuples added
+        # (topbw / topw / qcd sub-decays + ss + tauhtauh).  Missing branches
+        # -> leading_or_zero returns 0.  ak8_gpt_<node>_0 for each.
+        _gpt_extra = {("ak8_gpt_%s_0" % _n): leading_or_zero("ak8_gpt_" + _n)
+                      for _n in _GPT_EXTRA_NODES}
 
         gpt_sum = (g_bc + g_bb + g_cc + g_qcd + g_bs + g_qq + g_cs
                    + g_topbw + g_bqq + g_topw + 1e-10)
@@ -2933,6 +3040,7 @@ class DataManager:
             "ak8_gpt_bqq_0": g_bqq,
             "ak8_gpt_topbw_0": g_topbw,
             "ak8_gpt_topw_0": g_topw,
+            **_gpt_extra,
 
             # GloParT discriminant ratios
             "gpt_bc_frac": gpt_bc_frac,
@@ -3222,7 +3330,7 @@ class Histogrammer:
             mat_cat = (ctx["mat_cat"][finite_mask]
                        if ctx["mat_cat"] is not None else None)
             # "no j* candidate" flag aligned to the same event selection --
-            # drives the dotted "J without j*" overlay (Wcb_nomt /
+            # drives the dotted "J w/o-j*" overlay (Wcb_nomt /
             # Cat_Top_bc_nomt).  Prefer the explicit mt_nojs flag; fall back
             # to mt < 0 for caches built before it existed.
             if "mt_nojs" in arr.fields:
@@ -3367,7 +3475,7 @@ class Histogrammer:
                         continue
                     add_cv(key, c, v)
 
-                # --- dotted "J without j*" subsets of signal + proxy ---------
+                # --- dotted "J w/o-j*" subsets of signal + proxy ---------
                 # mat_cat 0/5 = merged W->cb signal ; 2 = t->bc proxy.  The
                 # events for which the m_t reco found NO compatible j* (bmk1..5
                 # all fail x < 2) are re-histogrammed into "Wcb_nomt" /
@@ -3758,17 +3866,17 @@ class Plotter:
             "Wcb_tmrg_bb": r"$t^2(b'b)$",
             "Cat_Top_bbc": r"$t^3(b'bc)$",
             "Wcb_res":     r"$c,b,b'$ resolved",
-            "Wcb_nomt": r"$J$ without $j^{*}$",
-            "Cat_Top_bc_nomt": r"$t^2(b'c)$ without $j^{*}$",
+            "Wcb_nomt": r"$J$ w/o-$j^{*}$",
+            "Cat_Top_bc_nomt": r"$t^2(b'c)$ w/o-$j^{*}$",
             # W background -- 2 darkest of the green V ramp
             "Wcq": r"$W(cq)$",
             "Wqq_light": r"$W(qq)$",
             # hadronic-top proxy -- 4 blue lines
-            "Cat_Top_bc":   r"$t^2(b'c)$  (proxy)",
+            "Cat_Top_bc":   r"$t^2(b'c)$ proxy",
             "Cat_Top_bq":   r"$t^2(b'q)$",
             "Cat_Top_bqqc": r"$t^3(b'cq)$",
             "Cat_Top_bqq":  r"$t^3(b'qq)$",
-            "Rest": r"Rest: $g,q,c,b$, $V^{\mathrm{res}}$",
+            "Rest": r"Rest: $g,q,c,b$, $V^{\mathrm{rsd}}$",
             # merged hadronic Z -- 2 lightest of the green V ramp
             "Zhf":    r"$Z(c\bar c/b\bar b)$",
             "Zlight": r"$Z(qq)$",
@@ -3842,35 +3950,42 @@ class Plotter:
             draw_hists = {k: (v * SIGNAL_SCALE if k in SCALED_KEYS else v)
                           for k, v in abs_hists.items()}
 
-        # Legend percentages: each category's share of the total luminosity-
-        # weighted yield, taken from `hist_data` *before* the per-line shape
-        # normalization. The MAT categories partition the selected sample,
-        # so the shown percentages sum to ~100% (a little under when SENTINEL
-        # fills remove entries with no valid value of this observable). The
-        # percentages use the true (unscaled) yields; the drawn W->cb =J line
-        # is scaled by SIGNAL_SCALE (= t->bc proxy yield / W->cb yield).
+        # Legend: per-line suffix = % share of the total (1 dp, both modes,
+        # 2026-09-04 user); the absolute expected event yields are quoted
+        # once each on the "Signal" / "BKG" group headers.  raw_tot is the
+        # true (unscaled) yield; the drawn W->cb lines are *SIGNAL_SCALE
+        # (the "xN" part of the label).
         _grand = sum(v for k, v in raw_tot.items()
                      if v > 0 and k not in _SUBSET_KEYS)
+        # totals for the group headers
+        _sig_tot = sum(raw_tot.get(k, 0.0) for k in _SIG5)
+        _bkg_tot = sum(v for k, v in raw_tot.items()
+                       if v > 0 and k not in _SIG5 and k not in _SUBSET_KEYS)
 
         def _pct_suffix(key):
             v = raw_tot.get(key, 0.0)
             if _grand <= 0 or v <= 0:
                 return ""
             frac = 100.0 * v / _grand
-            # Integer % for all lines, both MAT and MAT-SIGNAL (user
-            # 2026-09-04: MAT legend should match MAT-SIGNAL).
-            nd = 0
-            lim = 10.0 ** (-nd)
-            return f"  <{lim:g}%" if frac < lim else f"  {frac:.{nd}f}%"
+            # left (signal) legend: 2 dp; middle/right: 1 dp (2026-09-04 user)
+            _nd = 2 if key in SCALED_KEYS else 1
+            _lim = 10.0 ** (-_nd)
+            return (f"  <{_lim:g}%" if frac < 0.5 * _lim
+                    else f"  {frac:.{_nd}f}%")
 
         def _fmt_scale(x):
             # always an integer, no decimal digits (round to nearest)
             return f"{x:,.0f}"
 
+        # the "signal drawn xN for visibility" factor -- quoted ONCE on the
+        # Signal header (2026-09-04, user: was appended to every signal line,
+        # which overran the legend column).
+        _sig_scale_txt = (rf"  $\times{_fmt_scale(SIGNAL_SCALE)}$"
+                          if (not normalize)
+                          and abs(SIGNAL_SCALE - 1.0) > 1e-6 else "")
+
         def _leg_label(key):
             base = mat_labels.get(key, self.label(key))
-            if (not normalize) and key in SCALED_KEYS and abs(SIGNAL_SCALE - 1.0) > 1e-6:
-                base += rf" $\times\,{_fmt_scale(SIGNAL_SCALE)}$"
             return base + _pct_suffix(key)
 
         def _stepify(y):
@@ -3917,11 +4032,11 @@ class Plotter:
         # user): proxy t^2(b'c) / t^2(b'q) / t^3(b'cq) / t^3(b'qq).  All SOLID.
         _c_t1, _c_t2 = "#0000ff", "#008bff"           # ROOT 4  / ROOT 63
         _c_t3, _c_t4 = "#00bbff", "#00ebff"           # ROOT 65 / ROOT 67
-        # hadronic-V background -- ROOT colour indices 209 / 210 / 211 / 212
+        # hadronic-V background -- ROOT colour indices 209 / 210 / 211 / kSpring
         # (dark -> light green), upper->lower of the right legend (2026-09-04,
         # user): W(cq) / W(qq) / Z(cc/bb) / Z(qq).  All SOLID.
         _c_wq_a, _c_wq_b = "#0f8a0f", "#14b814"       # ROOT 209 / ROOT 210
-        _c_z1,   _c_z2   = "#47eb47", "#75f075"       # ROOT 211 / ROOT 212
+        _c_z1,   _c_z2   = "#47eb47", "#33ff00"       # ROOT 211 / kSpring (820)
         style_overrides = {
             # the W->cb SIGNAL -- 5 lines, one per topology, distinct colours,
             # all SOLID, uniform linewidth 2 (2026-09-04, user).  Top->bottom
@@ -4182,14 +4297,17 @@ class Plotter:
         else:
             _ymax = max((float(np.max(h)) for h in _all_h
                          if h is not None and len(h)), default=1.0)
-            # extra headroom for the enlarged in-axes legends
-            ax.set_ylim(0.0, _ymax * 1.7)
+            # extra headroom for the enlarged in-axes legends -- more for the
+            # categorical composition plot (ja_truth) whose tallest bin is a
+            # narrow spike that would otherwise poke into the 3 legends.
+            _hr = 2.6 if cfg.get("xticklabels") else 1.7
+            ax.set_ylim(0.0, _ymax * _hr)
             # powers-of-10 tick labels (1e5, ...) rather than "200000"
             ax.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
             ax.yaxis.get_offset_text().set_size(9)
 
         # Three separate legends across the top (2026-09-04, user):
-        #   left   = the 5 W->cb SIGNAL lines + "J without j*"
+        #   left   = the 5 W->cb SIGNAL lines + "J w/o-j*"
         #   middle = the hadronic-top proxy lines (blue)
         #   right  = the hadronic-V background (green) + Rest
         # Kept as distinct artists so each packs tightly to its width.
@@ -4200,37 +4318,50 @@ class Plotter:
         _v_keys   = ["Wcq", "Wqq_light", "Zhf", "Zlight", "Rest"]
         _hmap = {l: h for h, l in zip(*ax.get_legend_handles_labels())}
 
-        _leg_kw = dict(fontsize=8.3, frameon=False, labelspacing=0.18,
-                       handlelength=1.5, borderaxespad=0.4)
+        # Legend style -- IDENTICAL for MAT and MAT-SIGNAL (2026-09-04, user):
+        # non-bold, ~10% larger than before, no frame.  The "Signal" / "BKG"
+        # group headers are drawn ONCE each as ax.text above the legends
+        # (not per-legend titles) so a single "BKG" spans the middle+right
+        # pair.
+        _leg_fs = 9.1                       # was 8.3  (+10%)
+        _hdr_fs = 11.0                      # +5% (2026-09-04, user)
+        _leg_kw = dict(frameon=False, labelspacing=0.18,
+                       handlelength=1.5, borderaxespad=0.4,
+                       prop={"size": _leg_fs, "weight": "normal"})
+        _leg_y = 0.95                       # legend-box top (axes frac) -- +3%
+        _hdr_y = 0.915                      # header baseline (2026-09-04 user)
+        _hdr_x0 = 0.06                      # "Signal" x
+        _hdr_x1 = 0.77                      # "BKG" x
 
-        def _make_legend(keys, loc, anchor, title=None, title_color=None):
+        def _make_legend(keys, loc, anchor):
             pairs = [(_hmap[_leg_label(k)], _leg_label(k))
                      for k in keys if _leg_label(k) in _hmap]
             if not pairs:
                 return None
             h, l = zip(*pairs)
-            lg = ax.legend(h, l, loc=loc, bbox_to_anchor=anchor,
-                           bbox_transform=ax.transAxes, title=title,
-                           **_leg_kw)
-            if title is not None:
-                lg.get_title().set_fontsize(9.5)
-                lg.get_title().set_fontweight("bold")
-                if title_color is not None:
-                    lg.get_title().set_color(title_color)
-            return lg
+            return ax.legend(h, l, loc=loc, bbox_to_anchor=anchor,
+                             bbox_transform=ax.transAxes, **_leg_kw)
 
-        # header colours: "Signal" red, "BKG" blue (2026-09-04, user)
         _c_sig_hdr, _c_bkg_hdr = "#E42536", "#0000FF"
-        _legs = [_make_legend(k, loc, anch, ttl, tc)
-                 for k, loc, anch, ttl, tc in (
-            (_sig_keys, "upper left",   (0.03, 1.0), "Signal", _c_sig_hdr),
-            (_t_keys,   "upper center", (0.52, 1.0), "BKG",    _c_bkg_hdr),
-            (_v_keys,   "upper right",  (0.97, 1.0), "BKG",    _c_bkg_hdr))]
-        # keep every legend but the last as a persistent artist (the last one
-        # stays as ax._legend and is drawn automatically).
-        for _lg in _legs[:-1]:
-            if _lg is not None:
-                ax.add_artist(_lg)
+        _legs = [_make_legend(k, loc, anch) for k, loc, anch in (
+            (_sig_keys, "upper left",   (0.01, _leg_y)),
+            (_t_keys,   "upper center", (0.50, _leg_y)),
+            (_v_keys,   "upper right",  (1.00, _leg_y)))]
+        _created = [lg for lg in _legs if lg is not None]
+        for _lg in _created[:-1]:            # last stays as ax._legend
+            ax.add_artist(_lg)
+
+        # group headers: "Signal" once (over the left legend), "BKG" once
+        # (centred over the middle+right pair; only if any bkg line is drawn).
+        # Each carries the total expected (unscaled) event yield of its group.
+        ax.text(_hdr_x0, _hdr_y, f"Signal  {_sig_tot:.1f}{_sig_scale_txt}",
+                transform=ax.transAxes,
+                ha="left", va="bottom", fontsize=_hdr_fs, fontweight="normal",
+                color=_c_sig_hdr, clip_on=False)
+        if _legs[1] is not None or _legs[2] is not None:
+            ax.text(_hdr_x1, _hdr_y, f"BKG  {_bkg_tot:.1f}", transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=_hdr_fs,
+                    fontweight="normal", color=_c_bkg_hdr, clip_on=False)
 
         # Selection tag: shown after "Simulation" in the CMS label and appended
         # to the PNG filename so PRE / SR plot sets don't clobber each other.
@@ -4239,13 +4370,20 @@ class Plotter:
                       "JB": "jb-Region"}.get(_sel, _sel)
         if signal_only:
             _sel_label += " (signal only)"
+        # "CMS Simulation" + lumi via mplhep (no supplementary text) ...
         hep.cms.label(
-            _sel_label,
+            "",
             data=False,
             lumi=round(self.cfg.lumi, 1),   # 2017: 41.5 fb^-1, shown top-right
             ax=ax,
             fontsize=CMS_LABEL_FONTSIZE,
         )
+        # ... then the selection tag as its OWN artist: ~5% higher than the
+        # "CMS Simulation" baseline and UPRIGHT (non-italic) (2026-09-04, user).
+        ax.text(0.36, 1.065, _sel_label, transform=ax.transAxes,
+                ha="left", va="baseline", clip_on=False,
+                fontsize=CMS_LABEL_FONTSIZE * 0.85,
+                fontstyle="normal", fontweight="normal")
 
         ax.set_xlim(cfg.get("xlim", (bins[0], bins[-1])))
         if cfg.get("logx", False):
@@ -4259,11 +4397,15 @@ class Plotter:
             ax.set_xticks(_xticks)
             _xtl = cfg.get("xticklabels")
             if _xtl is not None:
-                # many narrow categories -> rotate so the labels don't collide
-                _rot = 40 if len(_xtl) > 8 else 0
-                ax_ratio.set_xticklabels(
-                    _xtl, fontsize=(10.5 if len(_xtl) > 8 else 10.5),
-                    rotation=_rot, ha=("right" if _rot else "center"))
+                # many narrow categories -> labels FULLY VERTICAL, centred
+                # directly under their bin (2026-09-04, user).
+                if len(_xtl) > 8:
+                    ax_ratio.set_xticklabels(
+                        _xtl, fontsize=10.5, rotation=90,
+                        ha="center", va="top")
+                else:
+                    ax_ratio.set_xticklabels(
+                        _xtl, fontsize=9.5, ha="center", va="top")
 
         # Optional explanatory caption (spec "caption" key): a small grey text
         # block under the lower pad.  Used by the composition / categorical
@@ -4271,9 +4413,11 @@ class Plotter:
         # the merged/resolved (parenthesis) notation.
         _cap = cfg.get("caption")
         _cap_nl = _cap.count("\n") + 1 if _cap else 0
-        _rot_pad = 0.105 if (_xticks is not None
-                             and cfg.get("xticklabels")
-                             and len(cfg["xticklabels"]) > 8) else 0.0
+        # categorical x-labels need a deeper bottom margin: a lot for the
+        # >8-bin vertical case, a little for the horizontal 3-8-bin case.
+        _rot_pad = 0.0
+        if _xticks is not None and cfg.get("xticklabels"):
+            _rot_pad = 0.17 if len(cfg["xticklabels"]) > 8 else 0.055
         fig.subplots_adjust(left=0.125, right=0.965, top=0.91,
                             bottom=(0.085 + _rot_pad + 0.033 * _cap_nl))
         if _cap:
@@ -5191,43 +5335,77 @@ def build_mat_plot_settings(sel="PRE"):
             "ratio_ylim": (0.0, 4.0),
         }
 
-    # ---- what the x<2 cut means (plain language) ---------------------------
-    # m_t is reconstructed as m(J + ONE extra AK4 jet from OUTSIDE the J
-    # cone), meant to be J(=the W) + the top's b quark.  Of the 5 AK4 jets
-    # that bring m(J+AK4) closest to 172.5 GeV, we take the first that is
-    # also ANGULARLY COMPATIBLE with a real top decay:
-    #     x  =  dR(AK4, J) * pT(J+AK4) / (2 * 172.5)
-    # For a genuine 2-body decay t -> W b the W and the b are separated by
-    # roughly  dR ~ 2*m_top / pT_top , so  x ~ dR(AK4,J) / dR_expected.
-    # x < 2  =  "within twice the opening angle a real top of this momentum
-    # would give" -- it throws out AK4 jets that are simply too far from J
-    # to be the top's b (ISR, the other top's b, pile-up).  Raised from the
-    # original 1.5 to 2.0 (env WCB_TTRECO_XMT) to also keep the wide-angle
-    # b's of lower-boost tops: ~93% of signal then gets a candidate (was
-    # ~78% at 1.5).  Events with NO compatible AK4 -> m_t = -1 (low bin).
+    # =====================================================================
+    # m_t RECONSTRUCTION  (2026-09-04, user)
+    # =====================================================================
+    # J   = the cb-candidate AK8 jet (mass = its soft-drop mass, m(J)).
+    # j*  = one AK4 jet from OUTSIDE the J cone (dR > 0.8) -- meant to be the
+    #       top's b.  Picked from the 5 AK4 with m(J+AK4) closest to 172.5,
+    #       the FIRST that also passes an angular gate (below).
     #
-    # NOTATION: `j*` is that chosen AK4 -- the first of bmk1..5 (5 best-mass
-    # AK4) that passes x < 2.  m_t = m(J + j*).  Every "..._bestm" spec
-    # (bvuds/cvuds/bcvuds) and dR_ja_mt describe j* itself.  (bmk1 = the raw
-    # best-|m-172.5| AK4 BEFORE the x window; == j* only when it passes.)
+    #   m_t = m(J + j*)   ONLY when   40 < m(J) < 130 GeV   AND a j* is found
+    #   m_t = m(J)        otherwise
+    #
+    # The m(J) window (env WCB_TTRECO_MRG_MSD_LO / _MRG_MSD, default 40/130):
+    #   m(J) < 40   -> J is a light / "Rest" jet, no W or t^2 candidate --
+    #                  do NOT reconstruct a top (would pile fakes on the
+    #                  peaks); m_t = m(J) parks them below 40.
+    #   m(J) > 130  -> J already IS the merged top; m_t = m(J).
+    #   40..130     -> J is a W / partly-merged jet: combine with j*.
+    #
+    # THE j* GATE -- two versions, kept in parallel (differ ONLY here):
+    #
+    #  (A) PRIMARY -- ttreco_mt -- fixed reference mass
+    #        keep j*  if   dR(j*,J) * pT(J+j*) / 2  <  2 * 172.5
+    #        (env WCB_TTRECO_XMT, the "2").  A TOP-MASS hypothesis test:
+    #        "is this pair arranged like the daughters of a 172.5-GeV top of
+    #        this pT?"  Kinematics: dR*pT ~ 2M for a 2-body decay, so the LHS
+    #        ~ M for a real top and "< 2*172.5" = "within 2x".  Permissive.
+    #        BEST FOR a tt sample: every event has a hadronic top, so
+    #        assuming ~172 is fine and the loose gate recovers the t^2
+    #        partial-merge topologies (m(J + b') ~ 172 even when J is only
+    #        the 2-prong W).
+    #
+    #  (B) ALT -- ttreco_mt_xself -- the pair's OWN mass as reference
+    #        keep j*  if   dR(J,j*) * pT(J+j*) / 2  <  2 * m(J+j*)
+    #        (env WCB_TTRECO_XSELF).  No 172 assumption -- the LHS ~ M and the
+    #        RHS ~ M for a genuine 2-body decay at ANY mass, so this tags a
+    #        real pairing regardless of mass; a pair too wide to be a
+    #        resonance (random / ISR / the other top's b) fails.
+    #        BEST FOR shape-based categorisation / template fits where the
+    #        m_t distribution itself carries the information.
+    #
+    # DIAGNOSTICS (all follow the PRIMARY gate's j*):
+    #   dR_ja_mt   = dR(J, j*)                 reported for any j* CANDIDATE
+    #   xself_jstar = x_self of that j*        (-1 = no candidate at all,
+    #   dRpt_jstar  = dR(J,j*)*pT(J+j*) [GeV]   lines up with the "w/o-j*"
+    #   pt_jstar    = pT(J+j*)  (reco top pT)   overlay)
+    #   xself_bmk1  = x_self of bmk1 (raw best-mass AK4, for tuning gate B)
+    #   bmk1_x      = the old x of bmk1 (fixed 172.5, for tuning gate A)
+    #   {b,c,bc}vuds_bestm / jstar_flav = ParticleNetAK4 flavour of the j*
+    #                                    that built the PRIMARY m_t
     specs = [
         # ---- top-mass reconstruction (SINGLE kept method) -------------------
         # m_t = m(J + j*), J taken with its measured soft-drop mass
         # (ak8_sdmass_0) -- NOT an m_W-constrained mass: J is not always a
         # 2-prong hadronic W (partial/full merged tops, light jets), so
         # forcing m_W would mismodel every non-W topology (2026-09-03, user).
-        # mt = mSD(J) if mSD(J) > 130 or no j* ; else m(J+j*), x<2.
-        # -1 only when mSD(J) <= 130 AND no compatible j*.
-        ("ttreco_mt",           "mt",                 -20.0, 600.0, 62, r"$m_{t}$ [GeV]   ($m_{\mathrm{SD}}(J)$ if $>130$ or no $j^{*}$, else $m(J{+}j^{*})$)", True),
-        # x of the best-|m-172.5| AK4 (bmk1) -- the top-consistency variable the
-        # m_t cut is applied to (x < 2).  The dotted "no m_t" overlay here shows
-        # whether the failing events sit just above 2 (loosenable) or far out.
-        #   x = dR(AK4, J) * pT(J+AK4) / (2 * m_top)   [m_top = 172.5 GeV]
-        # ~ dR(AK4,J) / dR_expected for a genuine 2-body t -> W b decay.
-        ("ttreco_bmk1_x",       "bmk1_x",              0.0, 5.0, 50, r"$x = \Delta R(\mathrm{AK4},J)\,p_T(J{+}\mathrm{AK4})/(2 m_t)$   (bmk1; keep $x<2$)", True),
+        # m_t = m(J+j*)  only when  m(J) in [40,130]  AND a j* is found;
+        # otherwise  m_t = m(J).  TWO versions, differing ONLY in the j* gate:
+        #   ttreco_mt        -- PRIMARY: keep j* if  dR*pT(J+j*)/2 < 2*172.5
+        #   ttreco_mt_xself  -- alt:     keep j* if  dR*pT(J+j*)/2 < 2*m(J+j*)
+        ("ttreco_mt",           "mt",                 -20.0, 600.0, 62, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.35\cdot173$;   $m(J)$ if $m(J)\notin[40,130]$ / no $j^{*}$)", True),
+        ("ttreco_mt_xself",     "mt_xself",           -20.0, 600.0, 62, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.10\,m(J{+}j^{*})$)", True),
+        ("ttreco_dRpt_jstar",   "dRpt_jstar",         -10.0, 600.0, 61, r"$\Delta R(J,j^{*})\,p_T(J{+}j^{*})/2$ [GeV]   ($\approx 172$ for $t^{2}$ \& $W$;  $-1$ = no $j^{*}$)", True),
+        ("ttreco_pt_jstar",     "pt_jstar",             0.0, 800.0, 40, r"$p_T(J{+}j^{*})$ [GeV]   (reconstructed top $p_T$)", True),
+        # tune the two gates here -- keep bmk1 if the plotted ratio is below
+        # 1.35 (fixed-173 ref) / 1.10 (self ref).
+        ("ttreco_bmk1_dRpt_173",  "bmk1_x",           0.0, 5.0, 50, r"$\Delta R\,p_T(J{+}\mathrm{bmk1})\,/\,(2\cdot173)$   (keep $<1.35$)", True),
+        # ("ttreco_bmk1_dRpt_mJj",  "xself_bmk1",       -0.1, 5.0, 51, r"$\Delta R\,p_T(J{+}\mathrm{bmk1})\,/\,(2\,m(J{+}\mathrm{bmk1}))$   (keep $<1.10$)", True),  # removed on request 2026-09-04
+        # ("ttreco_jstar_dRpt_mJj", "xself_jstar",      -0.1, 5.0, 51, r"$\Delta R\,p_T(J{+}j^{*})\,/\,(2\,m(J{+}j^{*}))$ of the used $j^{*}$   ($-1$ = none)", True),  # removed on request 2026-09-04
         # dR(J, j*), j* = the AK4 that reconstructs m_t (first of bmk1..5
-        # passing x<2).  -1 when no compatible j* (folds into the underflow
-        # bin).  Angular separation of the cb candidate from the top's b.
+        # passing x_self < 1.5).  -1 when no compatible j* (folds into the
+        # underflow bin).  Angular separation of the cb candidate from the top's b.
         ("ttreco_dR_ja_mt",     "dR_ja_mt",            0.0, 5.0, 50, r"$\Delta R(J,\,j^{*})$   ($-1$ = no $j^{*}$)", False),
         # Standalone composition plot: what J / the event IS at gen level
         # (13 bins).  ( ) = quarks merged inside the AK8 jet J; a bare
@@ -5242,12 +5420,12 @@ def build_mat_plot_settings(sel="PRE"):
         #     12 rest (incl. resolved Z -- no z_decay in the cache).
         # truth_only=True: gen-truth axis, not a cuttable observable ->
         # the S/sqrt(S+B) 1-bin window optimisation is suppressed.
-        ("ttreco_ja_truth",     "ja_truth_cat",       -0.5, 12.5, 13, r"$J$ / event gen content", False, True, False,
+        ("ttreco_ja_truth",     "ja_truth_cat",       -0.5, 13.5, 14, r"$J$ / event gen content", False, True, False,
          [r"$W(cb)$", r"$t^2(b'c)$", r"$t^2(b'b)$", r"$t^3(b'bc)$", r"$c,b,b'$ resolved",
-          r"proxy $t$", r"$t^3(b'cq)$",
+          r"$t^2(b'c)$ proxy", r"$t^2(b'q)$", r"$t^3(b'cq)$", r"$t^3(b'qq)$",
           r"$W(cq)$", r"$W(qq)$",
           r"$Z(c\bar c/b\bar b)$", r"$Z(qq)$",
-          r"resolved bkg", r"rest"]),
+          r"rest"]),
         # 4-bin categorical: ParticleNetAK4 flavour ladder of a chosen AK4.
         #   jstar_flav   = j* (the AK4 that reconstructs m_t) -- the "modified"
         #                  version of bdr1_flav (2026-09-03, user).
@@ -5256,10 +5434,10 @@ def build_mat_plot_settings(sel="PRE"):
         #   by jstar_flav.
         # ("ttreco_bdr1_flav",       "bdr1_flav",              -0.5, 3.5, 4, r"flavour of nearest AK4 to $J$", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # superseded by jstar_flav
-        ("ttreco_jstar_flav",      "jstar_flav",             -0.5, 3.5, 4, r"flavour of $j^{*}$ (AK4 used by $m_t$)", False, False, False,
-         [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),
-        ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"flavour of best-$m$ AK4 (bmk1)", False, False, False,
-         [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),
+        ("ttreco_jstar_flav",      "jstar_flav",             -1.5, 3.5, 5, r"ParticleNetAK4 tag of $j^{*}$ (AK4 used by $m_t$)", False, False, False,
+         [r"w/o $j^{*}$", r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),
+        # ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"ParticleNetAK4 tag of best-$m$ AK4 (bmk1)", False, False, False,
+        #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # commented out on request 2026-09-04
         # ("ttreco_bvuds_near",      "bvuds_near",              0.0, 1.0, 50, r"$b/(b{+}uds)$, nearest AK4", False),  # commented out on request
         # x-range starts at -0.05 (55 bins) so the -1 "no j*" pile sits in a
         # visibly detached first bin, clear of the [0,1] score range.
@@ -5275,12 +5453,18 @@ def build_mat_plot_settings(sel="PRE"):
         # m(J+j*), x<2 reco as ttreco_mt, but kept only when j*'s PNetAK4
         # score ratio passes the stated cut; -1 (same sentinel as ttreco_mt)
         # both when there is no j* and when j* fails the cut.
-        ("ttreco_mt_bjstar",   "mt_bjstar",   -20.0, 600.0, 62, r"$m_{t}$ [GeV], $j^{*}$ $b$-like ($b/(b{+}uds)>0.4$)   ($-1$ = no $j^{*}$ / fails cut)", True),
-        ("ttreco_mt_cjstar",   "mt_cjstar",   -20.0, 600.0, 62, r"$m_{t}$ [GeV], $j^{*}$ $c$-like ($c/(c{+}uds)>0.5$)   ($-1$ = no $j^{*}$ / fails cut)", True),
-        ("ttreco_mt_udsjstar", "mt_udsjstar", -20.0, 600.0, 62, r"$m_{t}$ [GeV], $j^{*}$ $uds$-like ($(b{+}c)/(b{+}c{+}uds)<0.7$)   ($-1$ = no $j^{*}$ / fails cut)", True),
-        ("ttreco_mt_bcjstar",  "mt_bcjstar",  -20.0, 600.0, 62, r"$m_{t}$ [GeV], $j^{*}$ $b$-or-$c$-like ($(b{+}c)/(b{+}c{+}uds)>0.7$)   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_bjstar",   "mt_bjstar",   -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ $b^{L}$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_cjstar",   "mt_cjstar",   -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ $c^{L}$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_udsjstar", "mt_udsjstar", -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ light/untagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_bcjstar",  "mt_bcjstar",  -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ $b^{L}$ or $c^{L}$ tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
         # hfuds_near / hfuds_bestm  (b+c)/(b+c+uds) specs removed on request.
-        # ("ttreco_dR_ja_bdr1",      "dR_ja_bdr1",              0.0, 5.0,   50, r"$\Delta R(J,\,$nearest AK4 outside cone$)$", False),  # Delta-R var, commented out on request
+        # 2026-09-04 (user): no-j* investigation.  dR_ja_bdr1 = dR(J, nearest
+        # AK4 outside the cone) -- the cleanest single tag of the "isolated
+        # boosted W-jet" no-j* population (~2.8 vs ~1.5 for a normal top).
+        # dR_ja_bL12 = dR between the 2 loose-b AK4 nearest J (bL1,bL2 seeds)
+        # -- "dR of the nearest 2 b^L jets".  -1 = no such jet / < 2 loose-b.
+        ("ttreco_dR_ja_bdr1",      "dR_ja_bdr1",              -0.2, 5.0,   52, r"$\Delta R(J,\,$nearest AK4 outside cone$)$   ($-1$ = none)", False),
+        # ("ttreco_dR_ja_bL12",      "dR_ja_bL12",              -0.2, 5.0,   52, r"$\Delta R$ of the nearest 2 $b^{L}$ AK4 (outside cone)   ($-1$ = $<2$)", False),  # removed on request 2026-09-04
         # ("ttreco_dR_ja_bL1",       "dR_ja_bL1",               0.0, 5.0,   50, r"$\Delta R(J,\,$nearest loose-$b$ AK4 outside cone$)$", True),  # Delta-R var, commented out on request
         # ("ttreco_n_bL_out_ja",     "n_bL_out_ja",            -0.5, 5.5,   6, r"# loose-$b$ AK4 jets outside the $J$ cone", False),  # commented out on request
 
@@ -5289,7 +5473,7 @@ def build_mat_plot_settings(sel="PRE"):
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
-        ("score_Dbc_jb",           "score_Dbc_jb",           0.0, 1.0, 50, r"$D_{bc}(j_b)$   (2nd-highest-$bc$-score AK8)", True),
+        # ("score_Dbc_jb",           "score_Dbc_jb",           0.0, 1.0, 50, r"$D_{bc}(j_b)$   (2nd-highest-$bc$-score AK8)", True),  # commented out on request 2026-09-04
         # ("score_Dbc_jsup1",        "score_Dbc_jsup1",        0.0, 1.0, 50, r"$D_{bc}(j^{1})$   (highest-$m_{\mathrm{SD}}$ AK8)", True),  # commented out on request
         # ("score_Dbc_jsup2",        "score_Dbc_jsup2",        0.0, 1.0, 50, r"$D_{bc}(j^{2})$   (2nd-highest-$m_{\mathrm{SD}}$ AK8)", True),  # commented out on request
         ("score_SC",               "score_SC",             1e-4, 1.0, 50, r"$S_{\mathrm{EVT}}$",            True, False, True),
@@ -5322,6 +5506,12 @@ def build_mat_plot_settings(sel="PRE"):
         ("gpt_topbw",              "ak8_gpt_topbw_0",       1e-4, 1.0, 50, r"GloParT top score ($b{+}W$ in jet)", True, False, True),
         ("gpt_topw",               "ak8_gpt_topw_0",        1e-4, 1.0, 50, r"GloParT top-$W$ score ($b$ outside jet)", True, False, True),
         # ("gpt_bqq",              "ak8_gpt_bqq_0",         1e-4, 1.0, 50, r"GloParT $bqq'$ score (3-prong $t\to bqq'$)", True, False, True),  # DROPPED 2026-09-01: ak8_gpt_bqq is identically 0.0 in every jet of every sample (dead GloParT node -- 3-prong hadronic top lives in gpt_topbw).  Branch still loaded + kept in the ratio denominators (contributes 0) in case a future ntuple fills it.
+        # finer GloParT sub-nodes from the 2final ntuples (2026-09-04, user) --
+        # ak8_gpt_<node>_0 for every node in _GPT_EXTRA_NODES.  log-x 1e-4..1.
+        *[("gpt_" + _n, "ak8_gpt_%s_0" % _n, 1e-4, 1.0, 50,
+           r"GloParT $%s$ score" % _n.replace("topbw", "t\\to bW,").replace(
+               "topw", "t\\to W,"), True, False, True)
+          for _n in _GPT_EXTRA_NODES],
 
         # ---- GloParT discriminant ratios ----------------------------------
         # ENTIRE BLOCK commented out on request 2026-09-02 (derived vars +
@@ -5357,16 +5547,16 @@ def build_mat_plot_settings(sel="PRE"):
         # SD masses: 25 bins over 0-250 GeV -> 10 GeV bins (rebinned x2 from 50).
         ("ak8_sdmass_0",           "ak8_sdmass_0",            0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  (highest-$bc$-score AK8)", False),
         ("ak8_sdmass_maxmass_0",   "ak8_sdmass_maxmass_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{1})$ [GeV]  (highest-$m_{\mathrm{SD}}$ AK8)", False),
-        ("ak8_sdmass_lead_pt_0",   "ak8_sdmass_lead_pt_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{1})$ [GeV]  (highest-$p_T$ AK8)", False),
-        ("ak8_sdmass_sub_pt_0",    "ak8_sdmass_sub_pt_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{2})$ [GeV]  (sub-leading $p_T$ AK8)", False),
+        # ("ak8_sdmass_lead_pt_0",   "ak8_sdmass_lead_pt_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{1})$ [GeV]  (highest-$p_T$ AK8)", False),  # commented out on request 2026-09-04
+        # ("ak8_sdmass_sub_pt_0",    "ak8_sdmass_sub_pt_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{2})$ [GeV]  (sub-leading $p_T$ AK8)", False),  # commented out on request 2026-09-04
         ("ak8_sdmass_sub_mass_0",  "ak8_sdmass_sub_mass_0",   0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{2})$ [GeV]  (2nd-highest-$m_{\mathrm{SD}}$ AK8)", False),
         ("ak8_sdmass_sub_bc_0",    "ak8_sdmass_sub_bc_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{b})$ [GeV]  (2nd-highest-$bc$-score AK8)", False),
         # same four SD masses but ONLY for events with >= 2 AK8 jets (value is
         # SENTINEL -> dropped when n_ak8 < 2).  Fields attached at load time by
         # DataManager._attach_runtime_fields, NOT in the parquet cache.
-        ("ak8_sdmass_ja_nj2",      "ak8_sdmass_ja_nj2",       0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; highest-$bc$-score)", False),
-        ("ak8_sdmass_jb_nj2",      "ak8_sdmass_jb_nj2",       0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{b})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; 2nd-highest-$bc$-score)", False),
-        ("ak8_sdmass_jsup1_nj2",   "ak8_sdmass_jsup1_nj2",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{1})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; highest-$m_{\mathrm{SD}}$)", False),
+        # ("ak8_sdmass_ja_nj2",      "ak8_sdmass_ja_nj2",       0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; highest-$bc$-score)", False),  # commented out on request 2026-09-04
+        # ("ak8_sdmass_jb_nj2",      "ak8_sdmass_jb_nj2",       0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{b})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; 2nd-highest-$bc$-score)", False),  # commented out on request 2026-09-04
+        # ("ak8_sdmass_jsup1_nj2",   "ak8_sdmass_jsup1_nj2",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{1})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; highest-$m_{\mathrm{SD}}$)", False),  # commented out on request 2026-09-04
         ("ak8_sdmass_jsup2_nj2",   "ak8_sdmass_jsup2_nj2",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{2})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; 2nd-highest-$m_{\mathrm{SD}}$)", False),
         # 4-bin categorical: which (mSD(J), mSD(j_b)) quadrant of the W
         # window [65,105] GeV the event sits in.  Filled for every n_ak8>=2
@@ -5379,7 +5569,7 @@ def build_mat_plot_settings(sel="PRE"):
         ("ak8_tau21_0",            "ak8_tau21_0",             0.0, 1.0,   50, r"$\tau_{21}(J)$",     False),
         ("ak8_tau32_0",            "ak8_tau32_0",             0.0, 1.0,   50, r"$\tau_{32}(J)$",     False),
         ("ak8_tau31_0",            "ak8_tau31_0",             0.0, 1.0,   50, r"$\tau_{31}(J) = \tau_{32}\,\tau_{21}$", False),
-        ("ak8_tau21_sub_bc_0",     "ak8_tau21_sub_bc_0",      0.0, 1.0,   50, r"$\tau_{21}(j_b)$   (2nd-highest-$bc$-score AK8)", False),
+        # ("ak8_tau21_sub_bc_0",     "ak8_tau21_sub_bc_0",      0.0, 1.0,   50, r"$\tau_{21}(j_b)$   (2nd-highest-$bc$-score AK8)", False),  # commented out on request 2026-09-04
         # ("ak8_nConst_0",         "ak8_nConst_0",            0.0, 120.0, 60, r"$J$ $N_{\mathrm{const}}$", False),  # dropped 2026-08-31
         # ("ak8_n_b_in_jet",         "ak8_n_b_in_jet",         -0.5, 5.5,    6, r"$N_b$ in $J$ (gen)",    False, True),  # commented out on request
         # ("ak8_n_c_in_jet",         "ak8_n_c_in_jet",         -0.5, 5.5,    6, r"$N_c$ in $J$ (gen)",    False, True),  # commented out on request
@@ -5565,6 +5755,19 @@ def run_mat_montage(figure_dir, suffix=""):
 # NB: ak8_gpt_bqq is identically 0 in these ntuples -> excluded.
 GPT_SCORE_NODES = ["bc", "bb", "cc", "cs", "bs", "qq", "qcd",
                    "topbw", "topw"]
+
+# Finer GloParT sub-nodes added by the 2final (2026-09-02) ntuples -- read,
+# stored as ak8_gpt_<node>_0, and each given a MAT spec (all verified live).
+_GPT_EXTRA_NODES = [
+    # t -> b W, split by the W decay
+    "topbwcs", "topbwqq", "topbwc", "topbwq", "topbws",
+    "topbwtauhv", "topbwev", "topbwmv", "topbwtauev", "topbwtaumv",
+    # t -> W  (b lost / merged elsewhere), split by W decay
+    "topwqq", "topwcs", "topwtauhv", "topwev", "topwmv",
+    "topwtauev", "topwtaumv",
+    # QCD sub-flavour + the missing 2-prong "ss" + di-tau
+    "qcdbb", "qcdb", "qcdcc", "qcdc", "qcdothers", "ss", "tauhtauh",
+]
 
 
 def run_gpt_score_montage(figure_dir, suffix=""):

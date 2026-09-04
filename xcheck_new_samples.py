@@ -10,16 +10,25 @@ import sys, uproot
 
 OLD = "/afs/cern.ch/user/y/youpeng/eos/RunTTH/_2017_1L/mc/scored_samples_1merged_/"
 NEW = "/afs/cern.ch/user/y/youpeng/eos/RunTTH/_2017_1L/MC/scored_samples_2final_v20260902_rerun/"
-SAMPLE = "ttbar-powheg_merged.root"       # any sample; branch list is identical across them
+OLD_SAMPLE = "ttbar-powheg_merged.root"
+NEW_SAMPLE = "ttbar-powheg_merged_Skim.root"   # 2final rerun added a _Skim suffix
 TREE = "Events"
+
+# ---- 2026-09-04 result (ttbar-powheg): ---------------------------------------
+#   OLD 336 branches, NEW 362.  MISSING in NEW: ak8_gpt_bqq only (was an
+#   all-zero dead branch -> _cand_ak8 returns 0 for it, no behaviour change).
+#   RETYPED: none.  ADDED in NEW: 24 GloParT sub-nodes + genZ_eta/phi + is_qcd
+#   (none read by the analysis).  => fully compatible; only cache_tag bump +
+#   the *_merged_Skim.root filename + MC/ path needed.
+# ----------------------------------------------------------------------------
 
 def branches(path):
     with uproot.open(path + ":" + TREE) as t:
         return {k: str(t[k].typename) for k in t.keys()}
 
 def main():
-    old_p = OLD + SAMPLE
-    new_p = NEW + (sys.argv[1] if len(sys.argv) > 1 else SAMPLE)
+    old_p = OLD + OLD_SAMPLE
+    new_p = NEW + (sys.argv[1] if len(sys.argv) > 1 else NEW_SAMPLE)
     print(f"OLD: {old_p}")
     print(f"NEW: {new_p}\n")
     bo, bn = branches(old_p), branches(new_p)
