@@ -1,0 +1,60 @@
+# ---- environments / caches -------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.claude/
+
+# ---- EOS symlinks (machine-specific, point outside the repo) --------------
+bjet_cache
+onnx
+cache_batch_parquet
+cache_shape_comparison
+score_parquet
+score_parquet_flatten
+score_parquet_swqq_bdt
+
+# ---- big data / model formats -------------------------------------------
+*.root
+*.pkl
+*.pickle
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.parquet
+*.onnx
+*.pb
+
+# ---- generated plots / outputs -----------------------------------------
+*.png
+*.pdf
+*.eps
+*.svg
+figures/
+figures_swqq_bdt/
+debug_figures/
+plots/
+shape_comparison/
+parquet/
+
+# ---- local scratch / backups -----------------------------------------
+fake_data/
+bak/
+BU/
+BU_*/
+*.bak
+*.bak_*
+*.orig
+\#*\#
+*~
+*.swp
+*.swo
+*.log
+
+# ---- OS cruft -----------------------------------------------------------
+.DS_Store
+._*
+.__afs*
