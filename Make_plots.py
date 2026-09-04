@@ -968,7 +968,8 @@ def columns_for_cache(cfg):
     try:
         mode = getattr(cfg, "plot_mode", "MAT")
         if mode.startswith("MAT"):
-            specs = build_mat_plot_settings(getattr(cfg, "mat_sel", "PRE"))
+            specs = build_mat_plot_settings(getattr(cfg, "mat_sel", "PRE"),
+                                            getattr(cfg, "signal_only", False))
         else:
             specs = build_plot_settings()
         # ROC settings share the cache; include their fields even though the
@@ -1650,7 +1651,7 @@ class DataManager:
                      "jstar_flav",
                      "bdr1_flav", "bbestm1_flav",
                      "bvuds_near", "bvuds_bestm", "cvuds_bestm",
-                     "bcvuds_bestm",
+                     "bcvuds_bestm", "cvsb_bestm",
                      "mt_bjstar", "mt_cjstar", "mt_udsjstar", "mt_bcjstar")
         if _want(*_tadr_out) and arr is not None and {"ak8_pt_0", "ak8_eta_0",
                 "ak8_phi_0", "ak8_sdmass_0", "bdr1_pt"} <= set(arr.fields):
@@ -1854,6 +1855,9 @@ class DataManager:
                 # candidate there).
                 if "bmk1_tag" in arr.fields:
                     _jf = _flav4(_tag_sel, _has_js)
+                    # merge b_L-not-b_M (2) and b_M (3) into one "b_L" bin
+                    # (2026-09-04, user) -- any b-tag, don't split by WP.
+                    _jf = np.where(_jf == 3.0, 2.0, _jf)
                     _jf = np.where(_win & (~_done), -1.0, _jf)
                     _out["jstar_flav"] = _jf
                 if "bmk1_pnb" in arr.fields:
@@ -1869,6 +1873,12 @@ class DataManager:
                         _has_js,
                         _ratio_pn(_pnb_sel + _pnc_sel,
                                   _pnb_sel + _pnc_sel + _pnu_sel, _has_js),
+                        -1.0)
+                    # c-vs-b PNetAK4 discriminant of j*:  c / (c + b).
+                    # ~0 for a b jet (real top-b), ~1 for a c jet.
+                    _out["cvsb_bestm"] = np.where(
+                        _has_js,
+                        _ratio_pn(_pnc_sel, _pnc_sel + _pnb_sel, _has_js),
                         -1.0)
                 # m_t re-drawn under a ParticleNetAK4-TAG cut on j*
                 # (2026-09-04, user; ak4_tag ladder c_L/M/T = 40/41/42,
@@ -1899,7 +1909,7 @@ class DataManager:
                                  "xself_jstar", "dRpt_jstar", "pt_jstar",
                                  "xself_bmk1",
                                  "bvuds_bestm",
-                                 "cvuds_bestm", "bcvuds_bestm",
+                                 "cvuds_bestm", "bcvuds_bestm", "cvsb_bestm",
                                  "mt_bjstar", "mt_cjstar", "mt_udsjstar",
                                  "mt_bcjstar"):
                         _dflt = -1.0
@@ -2324,8 +2334,10 @@ class DataManager:
             return np.asarray(ak.fill_none(picked, default), dtype=np.float32)
 
         ak8_sdmass_maxmass_0  = nth_by("ak8_sdmass", "ak8_sdmass", 0)   # j^1
-        ak8_sdmass_lead_pt_0  = nth_by("ak8_pt",     "ak8_sdmass", 0)   # j_1 (pT-leading; J == ak8_sdmass_0)
-        ak8_sdmass_sub_pt_0   = nth_by("ak8_pt",     "ak8_sdmass", 1)   # j_2
+        # pT-ordered j_1 / j_2 soft-drop masses -- specs commented out
+        # 2026-09-04 (user), derivation disabled too.
+        # ak8_sdmass_lead_pt_0  = nth_by("ak8_pt",     "ak8_sdmass", 0)   # j_1 (pT-leading; J == ak8_sdmass_0)
+        # ak8_sdmass_sub_pt_0   = nth_by("ak8_pt",     "ak8_sdmass", 1)   # j_2
         ak8_sdmass_sub_mass_0 = nth_by("ak8_sdmass", "ak8_sdmass", 1)   # j^2
         ak8_sdmass_sub_bc_0   = nth_by("ak8_gpt_bc", "ak8_sdmass", 1)   # j_b
         ak8_tau21_sub_bc_0    = nth_by("ak8_gpt_bc", "ak8_tau21",  1)   # tau21 of j_b
@@ -3022,8 +3034,7 @@ class DataManager:
             "ak8_tau31_0": ak8_tau31_0,
             "ak8_nConst_0": ak8_nConst_0,
             "ak8_sdmass_maxmass_0": ak8_sdmass_maxmass_0,
-            "ak8_sdmass_lead_pt_0": ak8_sdmass_lead_pt_0,
-            "ak8_sdmass_sub_pt_0": ak8_sdmass_sub_pt_0,
+            # "ak8_sdmass_lead_pt_0" / "ak8_sdmass_sub_pt_0": commented out 2026-09-04 (user)
             "ak8_sdmass_sub_mass_0": ak8_sdmass_sub_mass_0,
             "ak8_sdmass_sub_bc_0": ak8_sdmass_sub_bc_0,
             "ak8_tau21_sub_bc_0": ak8_tau21_sub_bc_0,
@@ -5207,7 +5218,7 @@ def build_plot_settings():
     return plot_settings
 
 
-def build_mat_plot_settings(sel="PRE"):
+def build_mat_plot_settings(sel="PRE", signal_only=False):
     """
     Truth-matched cb-candidate-AK8 overlay (--MAT mode). Step histograms,
     driven by `mat_cat` (built in build_derived_array).  The candidate jet is
@@ -5281,23 +5292,28 @@ def build_mat_plot_settings(sel="PRE"):
       ALL THREE also carry the common preselection block:
         0 < tau21(J) < 0.65       (2-prong-ness of the cb candidate;
                                      relaxed 0.6 -> 0.65 2026-09-03)
-        dR(lepton, J) > 1.0       (lepton clear of the fat jet;
-                                     relaxed 1.5 -> 1.0 2026-09-03)
-        (the former mSD(j^2) < 110 GeV 2nd-heavy-AK8 veto was removed
-         2026-09-03, user -- "for the moment".)
+        dR(lepton, J) > 1.2       (lepton clear of the fat jet;
+                                     1.5 -> 1.0 2026-09-03, -> 1.5 same day,
+                                     -> 1.2 2026-09-04 user)
+
+      PRE and SR (NOT JB) additionally carry (2026-09-04, user):
+        m(J)   > 40 GeV           (the cb-candidate AK8 -- ak8_sdmass_0)
+        m(j^2) < 100 GeV          (2nd-heaviest AK8 -- ak8_sdmass_sub_mass_0;
+                                     = -999 when n_ak8 < 2, so the veto only
+                                     fires on a genuine 2nd heavy AK8)
     """
     # Common preselection applied to ALL three selections.
     # tau21(J) is guarded with > 0 so SENTINEL (-999) jets are not let
     # through by the "< 0.6" test.
-    # NOTE (2026-09-03, user): the (ak8_sdmass_sub_mass_0 < 110) clause --
-    # a veto on a 2nd heavy AK8 (j^2 = 2nd-highest-mSD AK8) -- is removed
-    # "for the moment".  To restore it, append
-    #   " and (ak8_sdmass_sub_mass_0 < 110)"  to _COMMON.
     _COMMON = ("(ak8_tau21_0 > 0) and (ak8_tau21_0 < 0.65) and "
-               "(dR_lep_ak8 > 1.5)")
+               "(dR_lep_ak8 > 1.2)")
+    # PRE and SR only (2026-09-04, user):
+    #   m(J) > 40  (cb-candidate AK8)   AND   m(j^2) < 100  (2nd-heaviest AK8).
+    _MJ12 = "(ak8_sdmass_0 > 40) and (ak8_sdmass_sub_mass_0 < 100)"
     _SELECTIONS = {
-        "PRE": "(ak8_pt[0] > 200) and " + _COMMON,
-        "SR":     "(ak8_pt[0] > 200) and (score_Dbc > 0.9) and " + _COMMON,
+        "PRE": "(ak8_pt[0] > 200) and " + _MJ12 + " and " + _COMMON,
+        "SR":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
+                   + _MJ12 + " and " + _COMMON),
         "JB":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
                    "(score_SC > 0.05) and " + _COMMON),
     }
@@ -5394,13 +5410,13 @@ def build_mat_plot_settings(sel="PRE"):
         # otherwise  m_t = m(J).  TWO versions, differing ONLY in the j* gate:
         #   ttreco_mt        -- PRIMARY: keep j* if  dR*pT(J+j*)/2 < 2*172.5
         #   ttreco_mt_xself  -- alt:     keep j* if  dR*pT(J+j*)/2 < 2*m(J+j*)
-        ("ttreco_mt",           "mt",                 -20.0, 600.0, 62, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.35\cdot173$;   $m(J)$ if $m(J)\notin[40,130]$ / no $j^{*}$)", True),
-        ("ttreco_mt_xself",     "mt_xself",           -20.0, 600.0, 62, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.10\,m(J{+}j^{*})$)", True),
+        ("ttreco_mt",           "mt",                 -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.35\cdot173$, else $m(J)$)", True),
+        ("ttreco_mt_xself",     "mt_xself",           -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.10\,m(J{+}j^{*})$, else $m(J)$)", True),
         ("ttreco_dRpt_jstar",   "dRpt_jstar",         -10.0, 600.0, 61, r"$\Delta R(J,j^{*})\,p_T(J{+}j^{*})/2$ [GeV]   ($\approx 172$ for $t^{2}$ \& $W$;  $-1$ = no $j^{*}$)", True),
         ("ttreco_pt_jstar",     "pt_jstar",             0.0, 800.0, 40, r"$p_T(J{+}j^{*})$ [GeV]   (reconstructed top $p_T$)", True),
         # tune the two gates here -- keep bmk1 if the plotted ratio is below
         # 1.35 (fixed-173 ref) / 1.10 (self ref).
-        ("ttreco_bmk1_dRpt_173",  "bmk1_x",           0.0, 5.0, 50, r"$\Delta R\,p_T(J{+}\mathrm{bmk1})\,/\,(2\cdot173)$   (keep $<1.35$)", True),
+        ("ttreco_bmk1_dRpt_173",  "bmk1_x",           0.0, 4.0, 40, r"$\Delta R\,p_T(J{+}\mathrm{best}\text{-}m_t\ \mathrm{AK4})\,/\,(2\cdot173)$   (keep $<1.35$)", True),
         # ("ttreco_bmk1_dRpt_mJj",  "xself_bmk1",       -0.1, 5.0, 51, r"$\Delta R\,p_T(J{+}\mathrm{bmk1})\,/\,(2\,m(J{+}\mathrm{bmk1}))$   (keep $<1.10$)", True),  # removed on request 2026-09-04
         # ("ttreco_jstar_dRpt_mJj", "xself_jstar",      -0.1, 5.0, 51, r"$\Delta R\,p_T(J{+}j^{*})\,/\,(2\,m(J{+}j^{*}))$ of the used $j^{*}$   ($-1$ = none)", True),  # removed on request 2026-09-04
         # dR(J, j*), j* = the AK4 that reconstructs m_t (first of bmk1..5
@@ -5434,8 +5450,8 @@ def build_mat_plot_settings(sel="PRE"):
         #   by jstar_flav.
         # ("ttreco_bdr1_flav",       "bdr1_flav",              -0.5, 3.5, 4, r"flavour of nearest AK4 to $J$", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # superseded by jstar_flav
-        ("ttreco_jstar_flav",      "jstar_flav",             -1.5, 3.5, 5, r"ParticleNetAK4 tag of $j^{*}$ (AK4 used by $m_t$)", False, False, False,
-         [r"w/o $j^{*}$", r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),
+        ("ttreco_jstar_flav",      "jstar_flav",             -1.5, 2.5, 4, r"ParticleNetAK4 tag of $j^{*}$ (AK4 used by $m_t$)", False, False, False,
+         [r"w/o $j^{*}$", r"non-$b/c_L$-tagged", r"$c_L$", r"$b_L$"]),
         # ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"ParticleNetAK4 tag of best-$m$ AK4 (bmk1)", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # commented out on request 2026-09-04
         # ("ttreco_bvuds_near",      "bvuds_near",              0.0, 1.0, 50, r"$b/(b{+}uds)$, nearest AK4", False),  # commented out on request
@@ -5445,18 +5461,20 @@ def build_mat_plot_settings(sel="PRE"):
         # Same jet j* (the one m_t uses), other PNetAK4 score ratios:
         #   cvuds_bestm  = c / (c + uds)          -- is it a c jet?
         #   bcvuds_bestm = (b + c) / (b + c + uds) -- heavy-flavour vs light
-        # For a real top-b j* should be b-like (bvuds high, cvuds low);
-        # the (b+c) combo tags it as "not a light-quark / gluon jet".
+        #   cvsb_bestm   = c / (c + b)            -- c-vs-b discriminant
+        # For a real top-b j* should be b-like (bvuds high, cvuds low,
+        # cvsb low); the (b+c) combo tags it as "not a light / gluon jet".
         ("ttreco_cvuds_bestm",     "cvuds_bestm",           -0.05, 1.0, 55, r"$c/(c{+}uds)$ of $j^{*}$ ($-1$ = no $j^{*}$)", True),
         ("ttreco_bcvuds_bestm",    "bcvuds_bestm",          -0.05, 1.0, 55, r"$(b{+}c)/(b{+}c{+}uds)$ of $j^{*}$ ($-1$ = no $j^{*}$)", True),
+        ("ttreco_cvsb_bestm",      "cvsb_bestm",            -0.05, 1.0, 55, r"$c/(c{+}b)$ of $j^{*}$ (PNetAK4 c-vs-b;  $-1$ = no $j^{*}$)", True),
         # m_t re-drawn under a flavour cut on j* (2026-09-04, user): same
         # m(J+j*), x<2 reco as ttreco_mt, but kept only when j*'s PNetAK4
         # score ratio passes the stated cut; -1 (same sentinel as ttreco_mt)
         # both when there is no j* and when j* fails the cut.
-        ("ttreco_mt_bjstar",   "mt_bjstar",   -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ $b^{L}$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
-        ("ttreco_mt_cjstar",   "mt_cjstar",   -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ $c^{L}$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
-        ("ttreco_mt_udsjstar", "mt_udsjstar", -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ light/untagged   ($-1$ = no $j^{*}$ / fails cut)", True),
-        ("ttreco_mt_bcjstar",  "mt_bcjstar",  -20.0, 600.0, 62, r"$m_{t}$ [GeV],  $j^{*}$ $b^{L}$ or $c^{L}$ tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_bjstar",   "mt_bjstar",   -20.0, 300.0, 32, r"$m_{t}$ [GeV],  $j^{*}$ $b^{L}$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_cjstar",   "mt_cjstar",   -20.0, 300.0, 32, r"$m_{t}$ [GeV],  $j^{*}$ $c^{L}$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_udsjstar", "mt_udsjstar", -20.0, 300.0, 32, r"$m_{t}$ [GeV],  $j^{*}$ non-$b/c_L$-tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
+        ("ttreco_mt_bcjstar",  "mt_bcjstar",  -20.0, 300.0, 32, r"$m_{t}$ [GeV],  $j^{*}$ $b^{L}$ or $c^{L}$ tagged   ($-1$ = no $j^{*}$ / fails cut)", True),
         # hfuds_near / hfuds_bestm  (b+c)/(b+c+uds) specs removed on request.
         # 2026-09-04 (user): no-j* investigation.  dR_ja_bdr1 = dR(J, nearest
         # AK4 outside the cone) -- the cleanest single tag of the "isolated
@@ -5508,10 +5526,14 @@ def build_mat_plot_settings(sel="PRE"):
         # ("gpt_bqq",              "ak8_gpt_bqq_0",         1e-4, 1.0, 50, r"GloParT $bqq'$ score (3-prong $t\to bqq'$)", True, False, True),  # DROPPED 2026-09-01: ak8_gpt_bqq is identically 0.0 in every jet of every sample (dead GloParT node -- 3-prong hadronic top lives in gpt_topbw).  Branch still loaded + kept in the ratio denominators (contributes 0) in case a future ntuple fills it.
         # finer GloParT sub-nodes from the 2final ntuples (2026-09-04, user) --
         # ak8_gpt_<node>_0 for every node in _GPT_EXTRA_NODES.  log-x 1e-4..1.
-        *[("gpt_" + _n, "ak8_gpt_%s_0" % _n, 1e-4, 1.0, 50,
-           r"GloParT $%s$ score" % _n.replace("topbw", "t\\to bW,").replace(
-               "topw", "t\\to W,"), True, False, True)
-          for _n in _GPT_EXTRA_NODES],
+        # ONLY in MAT-SIGNAL (1 sample) or with WCB_MAT_GPT_EXTRA=1 -- loading
+        # all 24 extra columns for the 17-sample MAT run OOMs the cgroup.
+        *([("gpt_" + _n, "ak8_gpt_%s_0" % _n, 1e-4, 1.0, 50,
+            r"GloParT $%s$ score" % _n.replace("topbw", "t\\to bW,").replace(
+                "topw", "t\\to W,"), True, False, True)
+           for _n in _GPT_EXTRA_NODES]
+          if (signal_only or os.environ.get("WCB_MAT_GPT_EXTRA"))
+          else []),
 
         # ---- GloParT discriminant ratios ----------------------------------
         # ENTIRE BLOCK commented out on request 2026-09-02 (derived vars +
@@ -5563,8 +5585,8 @@ def build_mat_plot_settings(sel="PRE"):
         # event (all truth classes incl. signal), so the overlay shows where
         # each class lands.  value = [ mSD(j_b) in [65,105] ]  (0 = out, 1 = in),
         # filled only when mSD(J) is ALSO in the window.
-        ("sdwin_tag_nj2",          "sdwin_tag_nj2",          -0.5, 1.5, 2, r"$m_{\mathrm{SD}}(j_b)$ in $W$-window [65,105] GeV  ($N_{\mathrm{AK8}}\!\geq\!2$, $m_{\mathrm{SD}}(J)$ in window)", True, False, False,
-         [r"$j_b$ out", r"$j_b$ in"]),
+        # ("sdwin_tag_nj2",          "sdwin_tag_nj2",          -0.5, 1.5, 2, r"$m_{\mathrm{SD}}(j_b)$ in $W$-window [65,105] GeV  ($N_{\mathrm{AK8}}\!\geq\!2$, $m_{\mathrm{SD}}(J)$ in window)", True, False, False,
+        #  [r"$j_b$ out", r"$j_b$ in"]),  # commented out on request 2026-09-04
         # ("ak8_rawFactor_0",        "ak8_rawFactor_0",         0.0, 1.0,   50, r"$J$ raw factor",      False),
         ("ak8_tau21_0",            "ak8_tau21_0",             0.0, 1.0,   50, r"$\tau_{21}(J)$",     False),
         ("ak8_tau32_0",            "ak8_tau32_0",             0.0, 1.0,   50, r"$\tau_{32}(J)$",     False),
@@ -5874,7 +5896,7 @@ def main():
 
     # ------- MAT mode: matching-truth overlay only ----------
     if args.mode in ("MAT", "MAT-SIGNAL"):
-        mat_settings = build_mat_plot_settings(args.sel)
+        mat_settings = build_mat_plot_settings(args.sel, cfg.signal_only)
         mat_cut = mat_settings[0]["cut"] if mat_settings else "1"
         _normalize = (args.norm == "NORM")
         print(f"[INFO] MAT selection: {args.sel}   (cut: {mat_cut})")
