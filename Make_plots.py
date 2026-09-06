@@ -932,8 +932,9 @@ _CACHE_ALWAYS_COLUMNS = frozenset({
     #   bbestm1 = best-|m_t| AK4              -> bbestm1_flav
     #   bmk1..5 = top-5 best-|m_t| AK4 + x/pnb/pnc/pnuds -> mt (x<2 window,
     #             plot time, env WCB_TTRECO_XMT), {b,c,bc}vuds_bestm, jstar_flav
-    #   (btt*/bL*/bdr2/blite1/bnb1 seeds stay in the parquet but are no longer
-    #    read -- their 2-top / ptasym / mt1-6 specs are all removed.)
+    #   (btt*/bdr2/blite1/bnb1 seeds stay in the parquet but are no longer
+    #    read -- their 2-top / ptasym_tt/dr/bestm / mt1-6 specs are removed;
+    #    superseded by ptasym_jstar, see below.)
     "ak8_pt_0", "ak8_eta_0", "ak8_phi_0",
     "v_pt", "v_eta", "v_phi", "v_mass",
     "bdr1_pt", "bdr1_eta", "bdr1_phi", "bdr1_m", "bdr1_tag",
@@ -941,6 +942,9 @@ _CACHE_ALWAYS_COLUMNS = frozenset({
     "bdr1_pnuds", "bdr1_pnb",
     # dR_ja_bL12 (2026-09-04): dR of the 2 loose-b AK4 nearest J
     "bL1_pt", "bL1_eta", "bL1_phi", "bL2_pt", "bL2_eta", "bL2_phi",
+    # ptasym_jstar (2026-09-04): leptonic side b_l = loose-b AK4 (bL1..3)
+    # nearest W(lv) in dR; needs the masses too + the 3rd seed.
+    "bL1_m", "bL2_m", "bL3_pt", "bL3_eta", "bL3_phi", "bL3_m",
     "bmk1_pt", "bmk1_eta", "bmk1_phi", "bmk1_m", "bmk1_x", "bmk1_tag", "bmk1_pnb", "bmk1_pnc", "bmk1_pnuds",
     "bmk2_pt", "bmk2_eta", "bmk2_phi", "bmk2_m", "bmk2_x", "bmk2_tag", "bmk2_pnb", "bmk2_pnc", "bmk2_pnuds",
     "bmk3_pt", "bmk3_eta", "bmk3_phi", "bmk3_m", "bmk3_x", "bmk3_tag", "bmk3_pnb", "bmk3_pnc", "bmk3_pnuds",
@@ -1652,7 +1656,8 @@ class DataManager:
                      "bdr1_flav", "bbestm1_flav",
                      "bvuds_near", "bvuds_bestm", "cvuds_bestm",
                      "bcvuds_bestm", "cvsb_bestm",
-                     "mt_bjstar", "mt_cjstar", "mt_udsjstar", "mt_bcjstar")
+                     "mt_bjstar", "mt_cjstar", "mt_udsjstar", "mt_bcjstar",
+                     "tophad_phi")
         if _want(*_tadr_out) and arr is not None and {"ak8_pt_0", "ak8_eta_0",
                 "ak8_phi_0", "ak8_sdmass_0", "bdr1_pt"} <= set(arr.fields):
 
@@ -1785,6 +1790,8 @@ class DataManager:
                 _pnb_sel = np.full(_N, -1.0)
                 _pnc_sel = np.full(_N, -1.0)
                 _pnu_sel = np.full(_N, -1.0)
+                _px_sel = np.zeros(_N)   # px/py(J+j*) of the PRIMARY-gate j* --
+                _py_sel = np.zeros(_N)   # feeds tophad_phi (dphi_tlep_thad).
                 _done  = np.zeros(_N, dtype=bool)   # found a j* (primary gate)
                 _done2 = np.zeros(_N, dtype=bool)   # found a j* (x_self gate)
                 for _k in range(1, 6):
@@ -1806,6 +1813,13 @@ class DataManager:
                     _xs_sel = np.where(_take, _xself_k, _xs_sel)
                     _drpt_sel = np.where(_take, 0.5 * _drpt_k, _drpt_sel)
                     _pt_sel = np.where(_take, _ptk, _pt_sel)
+                    _phi_k = _g(_kb + "_phi")
+                    _pxk = (_g("ak8_pt_0") * np.cos(_g("ak8_phi_0"))
+                            + _g(_kb + "_pt") * np.cos(_phi_k))
+                    _pyk = (_g("ak8_pt_0") * np.sin(_g("ak8_phi_0"))
+                            + _g(_kb + "_pt") * np.sin(_phi_k))
+                    _px_sel = np.where(_take, _pxk, _px_sel)
+                    _py_sel = np.where(_take, _pyk, _py_sel)
                     if _kb + "_tag" in arr.fields:
                         _tag_sel = np.where(_take, _g(_kb + "_tag"), _tag_sel)
                     if _kb + "_pnb" in arr.fields:
@@ -1832,9 +1846,22 @@ class DataManager:
                 _out["mt_xself"] = _mres2
                 # j* actually used to build the PRIMARY m_t
                 _has_js = _win & _done
+                # direction (phi) of the SAME object mt is built from: J+j*
+                # when a j* was used (_has_js), else J alone -- feeds
+                # dphi_tlep_thad (2026-09-06, user).
+                _out["tophad_phi"] = np.where(
+                    _has_js, np.arctan2(_py_sel, _px_sel), _g("ak8_phi_0"))
                 # "no j* candidate" flag (primary gate) -> the dotted
                 # "J w/o-j*" overlay (Wcb_nomt / Cat_Top_bc_nomt).
-                _out["mt_nojs"] = (~_done).astype(np.float64)
+                # MUST be gated by _win (2026-09-06, user): outside the
+                # [40,130] window mt is mSD(J) BY DESIGN (merged-top
+                # exception) regardless of whether any bmk1..5 candidate
+                # happened to pass the gate -- ungated, those events were
+                # being mislabeled "w/o-j*" purely because no bmk passed a
+                # combination that was never attempted, leaking a fake
+                # w/o-j* tail into mt > 130 (should be j*-gate-free by
+                # construction: mt = mSD(J) there always).
+                _out["mt_nojs"] = (_win & (~_done)).astype(np.float64)
                 # dR / x_self / dR*pT / pT of the j* CANDIDATE -- reported
                 # whenever a candidate was found (`_done`), i.e. the -1 /
                 # underflow bin means strictly "no j* candidate" and lines up
@@ -1917,6 +1944,144 @@ class DataManager:
                         _dflt = SENTINEL
                     arr = ak.with_field(
                         arr, np.full(_N, _dflt, dtype=np.float32), _nm)
+
+        # ---- top pT-asymmetry, CURRENT reco (PLOT-TIME) --------------------
+        #   t_had = (J + j*)   -- the pt_jstar field from the t_a-ONLY block
+        #                         above (vector-sum pT; falls back to pT(J)
+        #                         when no j* was used).
+        #   t_lep = W(lv) + b_l  -- b_l = loose-b AK4 seed (bL1/bL2/bL3)
+        #                         nearest W(lv) in dR (no attempt to exclude
+        #                         a seed that happens to coincide with j*).
+        #   ptasym_jstar = |pT(t_had) - pT(t_lep)| / (pT(t_had)+pT(t_lep))
+        # Needs pt_jstar already in arr (2026-09-04, user).
+        _paj_in = {"pt_jstar", "v_pt", "v_eta", "v_phi", "v_mass", "bL1_pt"}
+        _paj_out = ("ptasym_jstar", "toplep_phi")
+        if _want(*_paj_out) and arr is not None and _paj_in <= set(arr.fields):
+            def _fj(name):
+                return ak.to_numpy(arr[name]).astype(np.float64)
+
+            def _p4j(pt, eta, phi, m):
+                px = pt * np.cos(phi)
+                py = pt * np.sin(phi)
+                pz = pt * np.sinh(np.clip(eta, -10.0, 10.0))
+                E = np.sqrt(px * px + py * py + pz * pz
+                            + np.maximum(m, 0.0) ** 2)
+                return np.stack([px, py, pz, E])
+
+            def _ptj(a):
+                return np.hypot(a[0], a[1])
+
+            def _phij(a):
+                return np.arctan2(a[1], a[0])
+
+            def _dRj(e1, p1, e2, p2):
+                d = np.abs(p1 - p2)
+                d = np.where(d > np.pi, 2.0 * np.pi - d, d)
+                return np.hypot(e1 - e2, d)
+
+            _wv = _p4j(_fj("v_pt"), _fj("v_eta"), _fj("v_phi"), _fj("v_mass"))
+            _we, _wp = _fj("v_eta"), _fj("v_phi")
+
+            _NNj = len(arr)
+            _bl_ok = np.zeros(_NNj, dtype=bool)
+            _bl_dR = np.full(_NNj, np.inf)
+            _bl_pt = np.full(_NNj, SENTINEL)
+            _bl_phi = np.full(_NNj, SENTINEL)   # phi(t_lep) -> toplep_phi
+            for _s in ("bL1", "bL2", "bL3"):
+                if _s + "_pt" not in arr.fields:
+                    continue
+                _e, _p = _fj(_s + "_eta"), _fj(_s + "_phi")
+                _pf = _p4j(_fj(_s + "_pt"), _e, _p, _fj(_s + "_m"))
+                _ok_s = _fj(_s + "_pt") > 0.0
+                _dr_s = _dRj(_e, _p, _we, _wp)
+                _tb_s = _ptj(_wv + _pf)
+                _tphi_s = _phij(_wv + _pf)
+                _better = _ok_s & (_dr_s < _bl_dR)
+                _bl_dR = np.where(_better, _dr_s, _bl_dR)
+                _bl_pt = np.where(_better, _tb_s, _bl_pt)
+                _bl_phi = np.where(_better, _tphi_s, _bl_phi)
+                _bl_ok = _bl_ok | _ok_s
+                del _e, _p, _pf, _ok_s, _dr_s, _tb_s, _tphi_s, _better
+
+            _pt_ja = _fj("pt_jstar")
+            _s_sum = _pt_ja + _bl_pt
+            _asym_j = np.where(_bl_ok & (_s_sum > 0.0),
+                                np.abs(_pt_ja - _bl_pt) / np.maximum(_s_sum, 1e-9),
+                                SENTINEL)
+            arr = ak.with_field(arr, _asym_j.astype(np.float32), "ptasym_jstar")
+            # direction (phi) of t_lep = W(lv) + nearest-in-dR loose-b AK4 --
+            # feeds dphi_tlep_thad (2026-09-06, user).
+            arr = ak.with_field(
+                arr, np.where(_bl_ok, _bl_phi, SENTINEL).astype(np.float32),
+                "toplep_phi")
+            del _wv, _we, _wp, _bl_ok, _bl_dR, _bl_pt, _bl_phi, _pt_ja, _s_sum, _asym_j
+            gc.collect()
+        elif _want(*_paj_out) and arr is not None:
+            for _nm in _paj_out:
+                if _nm not in arr.fields:
+                    arr = ak.with_field(
+                        arr, np.full(_N, SENTINEL, dtype=np.float32), _nm)
+
+        # ---- Dphi(t_lep, t_had), CURRENT reco (PLOT-TIME) -------------------
+        #   t_had = tophad_phi  (J + j*, same object as `mt`; falls back to J
+        #                        alone when no j* was used -- t_a-ONLY block).
+        #   t_lep = toplep_phi  (l + MET [= W(lv), v_phi/v_eta] + the loose-b
+        #                        AK4 nearest that l+MET direction -- the
+        #                        ptasym_jstar t_lep, above).
+        #   dphi_tlep_thad = |phi(t_lep) - phi(t_had)|, wrapped to [0, pi].
+        #   SENTINEL when either side has no candidate (2026-09-06, user).
+        _dpp_in = {"tophad_phi", "toplep_phi"}
+        _dpp_out = ("dphi_tlep_thad",)
+        if _want(*_dpp_out) and arr is not None and _dpp_in <= set(arr.fields):
+            _ph_had = ak.to_numpy(arr["tophad_phi"]).astype(np.float64)
+            _ph_lep = ak.to_numpy(arr["toplep_phi"]).astype(np.float64)
+            _ok_dpp = (_ph_had > SENTINEL_CUT) & (_ph_lep > SENTINEL_CUT)
+            _d_dpp = np.abs(_ph_had - _ph_lep)
+            _d_dpp = np.where(_d_dpp > np.pi, 2.0 * np.pi - _d_dpp, _d_dpp)
+            arr = ak.with_field(
+                arr, np.where(_ok_dpp, _d_dpp, SENTINEL).astype(np.float32),
+                "dphi_tlep_thad")
+            del _ph_had, _ph_lep, _ok_dpp, _d_dpp
+        elif _want(*_dpp_out) and arr is not None:
+            for _nm in _dpp_out:
+                if _nm not in arr.fields:
+                    arr = ak.with_field(
+                        arr, np.full(_N, SENTINEL, dtype=np.float32), _nm)
+
+        # ---- composite m(J) x j*-flavour, 21-bin (PLOT-TIME) ----------------
+        #   Single-axis composite (2026-09-06, user):
+        #     bins  1-5  : m(J) in [60,110), j* = b_L        (jstar_flav==2)
+        #     bins  6-10 : m(J) in [60,110), j* = c_L        (jstar_flav==1)
+        #     bins 11-15 : m(J) in [60,110), j* light/untag. (jstar_flav==0)
+        #     bins 16-20 : m(J) in [60,110), no j* found     (jstar_flav==-1)
+        #     bin  21    : m(J) OUTSIDE [60,110)             (any/no category)
+        #   Composite coordinate: 50*block + (m(J)-60) inside the window (5
+        #   bins of 10 GeV per block, 4 blocks -> 0..200); one extra 10-wide
+        #   bin [200,210) holds every event with m(J) outside the window,
+        #   regardless of j* category.  SENTINEL only when J itself is
+        #   missing (mSD(J) <= 0).
+        _mjc_in = {"ak8_sdmass_0", "jstar_flav"}
+        _mjc_out = ("mJ_jstar_cat21",)
+        if _want(*_mjc_out) and arr is not None and _mjc_in <= set(arr.fields):
+            _mJ = ak.to_numpy(arr["ak8_sdmass_0"]).astype(np.float64)
+            _jf = ak.to_numpy(arr["jstar_flav"]).astype(np.float64)
+            _mJ_ok = _mJ > 0.0
+            _inwin = _mJ_ok & (_mJ >= 60.0) & (_mJ < 110.0)
+            _block = np.select(
+                [_jf == 2.0, _jf == 1.0, _jf == 0.0, _jf == -1.0],
+                [0.0, 1.0, 2.0, 3.0], default=-1.0)
+            _composite = np.where(
+                _inwin & (_block >= 0.0), 50.0 * _block + (_mJ - 60.0),
+                np.where(_mJ_ok, 205.0, SENTINEL))
+            arr = ak.with_field(
+                arr, _composite.astype(np.float32), "mJ_jstar_cat21")
+            del _mJ, _jf, _mJ_ok, _inwin, _block, _composite
+        elif _want(*_mjc_out) and arr is not None:
+            for _nm in _mjc_out:
+                if _nm not in arr.fields:
+                    arr = ak.with_field(
+                        arr, np.full(_N, SENTINEL, dtype=np.float32), _nm)
+
         gc.collect()
         return arr
 
@@ -4106,6 +4271,25 @@ class Plotter:
                 **style,
             )
 
+        # Total signal = sum of the 5 W->cb topologies (drawn values, i.e.
+        # *SIGNAL_SCALE already applied like the individual lines) -- one
+        # solid black line on top of the colour breakdown (2026-09-06, user).
+        _sig_drawn = [draw_hists[k] for k in SIGNAL_KEYS if k in draw_hists]
+        if _sig_drawn:
+            _tot_sig_h = sum(_sig_drawn[1:], start=_sig_drawn[0].copy())
+            mat_labels.setdefault("Wcb_total", r"Total signal")
+            hep.histplot(
+                _tot_sig_h,
+                bins=bins,
+                histtype="step",
+                label=_leg_label("Wcb_total"),
+                ax=ax,
+                color="black",
+                linestyle="-",
+                linewidth=2.2,
+                zorder=11,
+            )
+
         # -------- lower pad ----------------------------------------------
         if signal_only:
             # MAT-SIGNAL: no background -> no significance.  Show the per-bin
@@ -4323,7 +4507,7 @@ class Plotter:
         #   right  = the hadronic-V background (green) + Rest
         # Kept as distinct artists so each packs tightly to its width.
         _sig_keys = ["Wcb", "Wcb_tmrg_bc", "Wcb_tmrg_bb", "Cat_Top_bbc",
-                     "Wcb_res", "Wcb_nomt"]
+                     "Wcb_res", "Wcb_total", "Wcb_nomt"]
         _t_keys   = ["Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq"]
         _v_keys   = ["Wcq", "Wqq_light", "Zhf", "Zlight", "Rest"]
@@ -4390,8 +4574,9 @@ class Plotter:
             fontsize=CMS_LABEL_FONTSIZE,
         )
         # ... then the selection tag as its OWN artist: ~5% higher than the
-        # "CMS Simulation" baseline and UPRIGHT (non-italic) (2026-09-04, user).
-        ax.text(0.36, 1.065, _sel_label, transform=ax.transAxes,
+        # "CMS Simulation" baseline and UPRIGHT (non-italic) (2026-09-04, user;
+        # +1% higher 2026-09-06, user).
+        ax.text(0.36, 1.075, _sel_label, transform=ax.transAxes,
                 ha="left", va="baseline", clip_on=False,
                 fontsize=CMS_LABEL_FONTSIZE * 0.85,
                 fontstyle="normal", fontweight="normal")
@@ -5292,9 +5477,10 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
       ALL THREE also carry the common preselection block:
         0 < tau21(J) < 0.65       (2-prong-ness of the cb candidate;
                                      relaxed 0.6 -> 0.65 2026-09-03)
-        dR(lepton, J) > 1.2       (lepton clear of the fat jet;
+        dR(lepton, J) > 1.3       (lepton clear of the fat jet;
                                      1.5 -> 1.0 2026-09-03, -> 1.5 same day,
-                                     -> 1.2 2026-09-04 user)
+                                     -> 1.2 -> 1.4 2026-09-04 user,
+                                     -> 1.3 2026-09-06 user)
 
       PRE and SR (NOT JB) additionally carry (2026-09-04, user):
         m(J)   > 40 GeV           (the cb-candidate AK8 -- ak8_sdmass_0)
@@ -5306,7 +5492,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     # tau21(J) is guarded with > 0 so SENTINEL (-999) jets are not let
     # through by the "< 0.6" test.
     _COMMON = ("(ak8_tau21_0 > 0) and (ak8_tau21_0 < 0.65) and "
-               "(dR_lep_ak8 > 1.2)")
+               "(dR_lep_ak8 > 1.3)")
     # PRE and SR only (2026-09-04, user):
     #   m(J) > 40  (cb-candidate AK8)   AND   m(j^2) < 100  (2nd-heaviest AK8).
     _MJ12 = "(ak8_sdmass_0 > 40) and (ak8_sdmass_sub_mass_0 < 100)"
@@ -5410,13 +5596,16 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # otherwise  m_t = m(J).  TWO versions, differing ONLY in the j* gate:
         #   ttreco_mt        -- PRIMARY: keep j* if  dR*pT(J+j*)/2 < 2*172.5
         #   ttreco_mt_xself  -- alt:     keep j* if  dR*pT(J+j*)/2 < 2*m(J+j*)
-        ("ttreco_mt",           "mt",                 -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.35\cdot173$, else $m(J)$)", True),
+        ("ttreco_mt",           "mt",                 -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.35\cdot172$, else $m(J)$)", True),
         ("ttreco_mt_xself",     "mt_xself",           -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.10\,m(J{+}j^{*})$, else $m(J)$)", True),
         ("ttreco_dRpt_jstar",   "dRpt_jstar",         -10.0, 600.0, 61, r"$\Delta R(J,j^{*})\,p_T(J{+}j^{*})/2$ [GeV]   ($\approx 172$ for $t^{2}$ \& $W$;  $-1$ = no $j^{*}$)", True),
         ("ttreco_pt_jstar",     "pt_jstar",             0.0, 800.0, 40, r"$p_T(J{+}j^{*})$ [GeV]   (reconstructed top $p_T$)", True),
+        # Dphi(t_lep, t_had): t_had = J+j* (same object as m_t), t_lep =
+        # l+MET+nearest-in-dR loose-b AK4 (2026-09-06, user).
+        ("ttreco_dphi_tlep_thad", "dphi_tlep_thad",     0.0, PI,     40, r"$\Delta\phi(t_{\ell},\,t_{had})$   [$t_{had}=J{+}j^{*}$, $t_{\ell}=\ell{+}p_T^{\mathrm{miss}}{+}b_L$]", True),
         # tune the two gates here -- keep bmk1 if the plotted ratio is below
         # 1.35 (fixed-173 ref) / 1.10 (self ref).
-        ("ttreco_bmk1_dRpt_173",  "bmk1_x",           0.0, 4.0, 40, r"$\Delta R\,p_T(J{+}\mathrm{best}\text{-}m_t\ \mathrm{AK4})\,/\,(2\cdot173)$   (keep $<1.35$)", True),
+        ("ttreco_bmk1_dRpt_173",  "bmk1_x",           0.0, 4.0, 40, r"$\Delta R\,p_T(J{+}\mathrm{best}\text{-}m_t\ \mathrm{AK4})\,/\,(2\cdot172)$   (keep $<1.35$)", True),
         # ("ttreco_bmk1_dRpt_mJj",  "xself_bmk1",       -0.1, 5.0, 51, r"$\Delta R\,p_T(J{+}\mathrm{bmk1})\,/\,(2\,m(J{+}\mathrm{bmk1}))$   (keep $<1.10$)", True),  # removed on request 2026-09-04
         # ("ttreco_jstar_dRpt_mJj", "xself_jstar",      -0.1, 5.0, 51, r"$\Delta R\,p_T(J{+}j^{*})\,/\,(2\,m(J{+}j^{*}))$ of the used $j^{*}$   ($-1$ = none)", True),  # removed on request 2026-09-04
         # dR(J, j*), j* = the AK4 that reconstructs m_t (first of bmk1..5
@@ -5452,6 +5641,22 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # superseded by jstar_flav
         ("ttreco_jstar_flav",      "jstar_flav",             -1.5, 2.5, 4, r"ParticleNetAK4 tag of $j^{*}$ (AK4 used by $m_t$)", False, False, False,
          [r"w/o $j^{*}$", r"non-$b/c_L$-tagged", r"$c_L$", r"$b_L$"]),
+        # 21-bin composite (2026-09-06, user): m(J) in [60,110) GeV, split
+        # into 4 blocks of 5 (10-GeV-wide) bins by j* flavour -- b_L / c_L /
+        # light / w/o-j* -- then ONE extra bin catching every event with
+        # m(J) outside [60,110), regardless of j* category.
+        ("ttreco_mJ_jstar_cat21",  "mJ_jstar_cat21",          0.0, 210.0, 21,
+         r"$m(J)$ [GeV] by $j^{*}$ flavour  (composite -- see caption)",
+         False, False, False,
+         ([""] * 2 + [r"$j^{*}=b_L$"] + [""] * 2
+          + [""] * 2 + [r"$j^{*}=c_L$"] + [""] * 2
+          + [""] * 2 + [r"$j^{*}$ light"] + [""] * 2
+          + [""] * 2 + [r"w/o $j^{*}$"] + [""] * 2
+          + [r"$m(J)\notin[60,110)$"]),
+         ("$m(J)$, 10 GeV bins, 60-110 GeV: bins 1-5 $j^{*}=b_L$, 6-10 "
+          "$j^{*}=c_L$, 11-15 $j^{*}$ light/untag., 16-20 no $j^{*}$ found "
+          "(all within the [40,130] merge window); bin 21 = every event "
+          "with $m(J)$ outside [60,110), any category.")),
         # ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"ParticleNetAK4 tag of best-$m$ AK4 (bmk1)", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # commented out on request 2026-09-04
         # ("ttreco_bvuds_near",      "bvuds_near",              0.0, 1.0, 50, r"$b/(b{+}uds)$, nearest AK4", False),  # commented out on request
@@ -5666,6 +5871,10 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("ttreco_ptasym",          "ptasym_tt",               0.0, 1.0,   40, r"top $p_T$ asymmetry   ($b$-score seeds $+$ $\Delta R$/$p_T$-balance)", False),  # commented out on request
         # ("ttreco_ptasym_dr",       "ptasym_dr",               0.0, 1.0,   40, r"top $p_T$ asymmetry   ($b$ = loose-$b$ AK4 nearest $J$ in $\Delta R$)", False),  # commented out on request
         # ("ttreco_ptasym_bestm",    "ptasym_bestm",            0.0, 1.0,   40, r"top $p_T$ asymmetry   ($b$ = loose-$b$ AK4 giving $m_{t}$ closest to 172.5 GeV)", False),  # removed on request
+        #   ptasym_jstar : CURRENT reco (2026-09-04, user) -- hadronic top is
+        #                  pT(J+j*) (= pt_jstar, the exact system m_t uses),
+        #                  leptonic top is W(lv) + nearest-in-dR loose-b AK4.
+        ("ttreco_ptasym_jstar",    "ptasym_jstar",            0.0, 1.0,   40, r"top $p_T$ asymmetry   ($t_{\mathrm{had}}=J{+}j^{*}$ vs $t_{\mathrm{lep}}=W(\ell\nu){+}b_l$)", False),
 
         # ---- event activity -------------------------------------------
         # ("ht",                     "ht",                      0.0, 2000.0, 50, r"$H_T$ [GeV]",               True),  # commented out on request
