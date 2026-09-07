@@ -4504,7 +4504,7 @@ class Plotter:
             "Wcb_tmrg_bc": r"$t^2(b'c)$",
             "Wcb_tmrg_bb": r"$t^2(b'b)$",
             "Cat_Top_bbc": r"$t^3(b'bc)$",
-            "Wcb_res":     r"$c,b,b'$ resolved",
+            "Wcb_res":     r"$c,b,b'$ rsvd",
             "Wcb_nomt": r"$J$ w/o-$j^{*}$",
             "Cat_Top_bc_nomt": r"$t^2(b'c)$ w/o-$j^{*}$",
             # W background -- 2 darkest of the green V ramp
@@ -5036,7 +5036,7 @@ class Plotter:
         _leg_y = 0.95                       # legend-box top (axes frac) -- +3%
         _hdr_y = 0.915                      # header baseline (2026-09-04 user)
         _hdr_x0 = 0.06                      # "Signal" x
-        _hdr_x1 = 0.77                      # "BKG" x
+        _hdr_x1 = 0.62                      # "BKG" x  (-15%, 2026-09-07 user)
 
         def _make_legend(keys, loc, anchor):
             pairs = [(_hmap[_leg_label(k)], _leg_label(k))
@@ -5050,7 +5050,7 @@ class Plotter:
         _c_sig_hdr, _c_bkg_hdr = "#E42536", "#0000FF"
         _legs = [_make_legend(k, loc, anch) for k, loc, anch in (
             (_sig_keys, "upper left",   (0.01, _leg_y)),
-            (_t_keys,   "upper center", (0.50, _leg_y)),
+            (_t_keys,   "upper center", (0.47, _leg_y)),   # -3% (2026-09-07, user)
             (_v_keys,   "upper right",  (1.00, _leg_y)))]
         _created = [lg for lg in _legs if lg is not None]
         for _lg in _created[:-1]:            # last stays as ax._legend
@@ -5147,13 +5147,12 @@ class Plotter:
             for _i, _bl in enumerate(_blabels):
                 _bx, _btxt = _bl[0], _bl[1]
                 _by = _bl[2] if len(_bl) > 2 else (0.60 if _i % 2 == 0 else 0.82)
-                # block labels are a crowded 7-across row -> only a modest
-                # bump even when the rest of the pad text is doubled
-                # (2026-09-07, user).
+                # block labels are a crowded 7-across row, so a modest bump only
+                # -- 9 pt, ~30% over the old 7 pt (2026-09-07, user).
                 ax_ratio.text(_bx, _by, _btxt,
                               transform=ax_ratio.get_xaxis_transform(),
                               ha="center", va="center",
-                              fontsize=(9.0 if _lp2x else 7.0),
+                              fontsize=(11.0 if _lp2x else 9.0),
                               color="0.20", clip_on=False)
 
         # Optional explanatory caption (spec "caption" key): a small grey text
