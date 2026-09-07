@@ -214,7 +214,7 @@ class Config:
         # v18 (2026-09-04): + the 25 finer GloParT sub-nodes from the 2final
         #   ntuples (_GPT_EXTRA_NODES -> ak8_gpt_<node>_0).  New cached
         #   fields -> full re-derive.
-        self.cache_tag = "derived_v18_gptnodes_v1"
+        self.cache_tag = "derived_v20_bake_v1"   # runtime fields baked into the parquet; chi2 reco off by default (2026-09-07)
 
         # ------------------------------------------------------------------
         # Switches
@@ -241,8 +241,12 @@ class Config:
         # ------------------------------------------------------------------
         self.signal_groups = ["Wcb"]
         # MAT-SIGNAL mode: load only the signal_groups samples, draw only the
-        # signal MAT lines.  Set from the CLI mode token in main().
+        # signal MAT lines.  MAT-BKG mode: load everything EXCEPT the
+        # signal_groups samples, draw only the background MAT lines.  Both
+        # replace the lower pad with per-bin component fractions.  Set from
+        # the CLI mode token in main().
         self.signal_only = False
+        self.bkg_only = False
 
         self.catalog_sample = {
             "Wcb": ["ttbar-powheg"],
@@ -909,24 +913,50 @@ def scatter_hist_by_category(values, weights, category, bins, codes):
 # ======================================================================================
 
 # Event-level parquet columns that must ALWAYS be read from the cache,
-# independent of which plot specs are active:
-#   * infra   -- weights / truth codes consumed by event_context, mat_report,
-#                the true/mixed draw paths and the MAT significance split.
-#   * runtime -- the inputs DataManager._attach_runtime_fields reads to rebuild
-#                the plot-time-only fields (m_ta*, m_ta_dr/drb/bestm, the three
-#                gpt_bc_vs_* ratios, sdwin_tag_nj2, ...).  Each block there is
-#                guarded by `<inputs> <= set(arr.fields)`, so a pruned input
-#                would SILENTLY drop the derived field and its plot.
+# independent of which plot specs are active: weights / truth codes / jet
+# multiplicities consumed by event_context, mat_report, the true/mixed draw
+# paths and the MAT significance split, plus mt / mt_nojs (read unconditionally
+# by get_values_weights_for_plot for the dotted "J w/o-j*" overlay, invisible to
+# the cut/var regex scan in columns_for_cache).
 _CACHE_ALWAYS_COLUMNS = frozenset({
-    # --- infra ---
-    "weights", "true_cat", "mat_cat", "is_signal", "is_qcd", "n_ak8",
+    "weights", "true_cat", "mat_cat", "is_signal", "is_qcd", "n_ak8", "n_ak4",
     "ak8_type", "ak8_n_b_in_jet", "ak8_n_c_in_jet",
+    "mt", "mt_nojs",
+})
+
+
+def _cache_tag_bakes_runtime(tag):
+    """v20+ cache tags carry the settled _attach_runtime_fields outputs baked
+    into the parquet (the derive calls _attach_runtime_fields(need=None) before
+    writing, so every block's output is a real column).  On such a cache hit
+    _want() skips every already-present block, so the ~120 runtime *input*
+    columns below need not be read at all.  Older tags still recompute the
+    blocks on load and need every input pinned.
+
+    Extracts the leading ``v<N>`` from the tag (``derived_v20_bake_v1`` -> 20).
+    """
+    m = re.search(r"v(\d+)", tag or "")
+    return bool(m) and int(m.group(1)) >= 20
+
+
+# _attach_runtime_fields INPUT columns -- only needed when a runtime block will
+# actually recompute on load: a pre-v20 cache tag, WCB_RECOMPUTE_RUNTIME=1, or
+# the WCB_CACHE_SAFETY_COLS escape hatch (pin them for a freshly-added, not-yet-
+# baked runtime field).  Each _attach_runtime_fields block is guarded by
+# `<inputs> <= set(arr.fields)`, so a missing input SILENTLY drops the derived
+# field and its plot -- hence keep the full set here, gated in columns_for_cache.
+_CACHE_RUNTIME_INPUT_COLUMNS = frozenset({
     # --- _attach_runtime_fields inputs: SD masses / EC & GloParT scores ---
     "ak8_sdmass_0", "ak8_sdmass_sub_bc_0",
     "ak8_sdmass_maxmass_0", "ak8_sdmass_sub_mass_0",
     "score_cata_top_bq_norm", "score_cata_top_bqq_norm",
     "ak8_gpt_bc_0", "ak8_gpt_cc_0", "ak8_gpt_bb_0",
     "ak8_gpt_bs_0", "ak8_gpt_cs_0", "ak8_gpt_qq_0",
+    # gpt_qcd_sum5 (5 QCD sub-nodes) + gpt_t_btaunu (3 b'Wtaunu sub-nodes)
+    # runtime sums (2026-09-07, user) -- tiny float32 scalars.
+    "ak8_gpt_qcdbb_0", "ak8_gpt_qcdb_0", "ak8_gpt_qcdcc_0",
+    "ak8_gpt_qcdc_0", "ak8_gpt_qcdothers_0",
+    "ak8_gpt_topbwtauhv_0", "ak8_gpt_topbwtauev_0", "ak8_gpt_topbwtaumv_0",
     # --- _attach_runtime_fields inputs: t_a top-mass reco (mt) + AK4 diags ---
     #   bdr1    = dR-closest AK4 to J       -> bdr1_flav, bvuds_near
     #   bbestm1 = best-|m_t| AK4              -> bbestm1_flav
@@ -969,6 +999,13 @@ def columns_for_cache(cfg):
         return None
 
     keep = set(_CACHE_ALWAYS_COLUMNS)
+    # The ~120 runtime-input columns are dead weight on a v20+ cache hit (the
+    # outputs are baked; _want() skips the blocks).  Pin them only when a block
+    # will really recompute: pre-v20 tag, forced recompute, or the escape hatch.
+    if (os.environ.get("WCB_RECOMPUTE_RUNTIME")
+            or os.environ.get("WCB_CACHE_SAFETY_COLS")
+            or not _cache_tag_bakes_runtime(getattr(cfg, "cache_tag", ""))):
+        keep |= set(_CACHE_RUNTIME_INPUT_COLUMNS)
     try:
         mode = getattr(cfg, "plot_mode", "MAT")
         if mode.startswith("MAT"):
@@ -982,14 +1019,40 @@ def columns_for_cache(cfg):
             specs = list(specs) + build_roc_settings() + build_dbc_roc_settings()
         except Exception:
             pass
+        # WCB_MAT_SPECS (comma-sep name substrings) also prunes the LOAD:
+        # keep only the vars of the specs that will actually be drawn, so a
+        # single-plot iteration reads a handful of columns and skips every
+        # _attach_runtime_fields block whose output nobody wants (the block
+        # guards are `_want(out) and <inputs> <= arr.fields`, and _want reads
+        # this keep set).  The selection CUT columns are always kept (every
+        # spec shares the cut).  (2026-09-07, user -- iteration was still
+        # doing the full ~116-col read + all runtime blocks.)
+        _filt = [s.strip() for s in os.environ.get("WCB_MAT_SPECS", "").split(",")
+                 if s.strip()]
+        _var_specs = ([p for p in specs
+                       if any(s in p.get("name", "") for s in _filt)]
+                      if (_filt and mode.startswith("MAT")) else specs)
         for p in specs:
+            keep |= set(re.findall(
+                r"[A-Za-z_][A-Za-z0-9_]*",
+                normalize_cut_expr(p.get("cut", "1"))))
+        for p in _var_specs:
             for k in ("var", "bin_var", "score"):
                 v = p.get(k)
                 if v:
                     keep.add(v)
-            keep |= set(re.findall(
-                r"[A-Za-z_][A-Za-z0-9_]*",
-                normalize_cut_expr(p.get("cut", "1"))))
+        # a few runtime fields are built FROM other runtime fields -- when a
+        # filtered spec asks for one, also request its prereqs so the earlier
+        # _attach_runtime_fields block is not skipped and the plot goes empty.
+        _RUNTIME_PREREQS = {
+            "dphi_tlep_thad": ("tophad_phi", "toplep_phi"),
+            "ptasym_jstar":   ("pt_jstar",),
+            "toplep_phi":     ("pt_jstar",),
+            "toplep_pt":      ("pt_jstar",),
+            "mJ_jstar_cat":   ("jstar_flav", "jstar_flav_nowin"),
+        }
+        for _k in list(keep):
+            keep |= set(_RUNTIME_PREREQS.get(_k, ()))
     except Exception as e:
         print(f"[WARN] cache-column introspection failed ({e}); "
               f"loading all columns")
@@ -1037,7 +1100,16 @@ class DataManager:
         return ak.from_parquet(cache_file, columns=want)
 
     def load_all(self):
-        samples = []
+        """Resolve the sample list WITHOUT reading any array.
+
+        Returns a list of lightweight metadata dicts
+        ``{"name", "group", "is_data", "path"}``.  Call ``materialize(meta)`` to
+        read one sample's array on demand -- the draw phase streams them one at
+        a time so peak RSS is a single sample, not all 17 at once (tt-semi's
+        cache alone is 13 GB on disk).  Use ``materialize_all()`` for the few
+        code paths that still need every array resident (ROC).
+        """
+        metas = []
 
         try:
             mc_files = [
@@ -1070,33 +1142,22 @@ class DataManager:
 
         print(f"[INFO] Found {len(mc_files)} MC files in {self.cfg.mc_path}")
 
-        for i, path in enumerate(mc_files):
+        for path in mc_files:
             group = get_sample_group(path, self.cfg.catalog_sample)
 
             # MAT-SIGNAL: skip every non-signal sample at load time.
             if self.cfg.signal_only and group not in self.cfg.signal_groups:
                 continue
+            # MAT-BKG: skip the signal sample(s) at load time.
+            if self.cfg.bkg_only and group in self.cfg.signal_groups:
+                continue
 
-            print(
-                f"\r[LOAD] MC {i + 1}/{len(mc_files)} | "
-                f"group={group:<10} | Mem={get_memory_mb():.1f} MB",
-                end="",
-            )
-
-            arr = self.load_one_file(path, is_data=False, sample_group=group)
-
-            if arr is not None:
-                samples.append({
-                    "name": os.path.basename(path),
-                    "group": group,
-                    "is_data": False,
-                    "array": arr,
-                })
-
-            if i % 10 == 0:
-                gc.collect()
-
-        print("")
+            metas.append({
+                "name": os.path.basename(path),
+                "group": group,
+                "is_data": False,
+                "path": path,
+            })
 
         if self.cfg.enable_data:
             if not os.path.exists(self.cfg.data_path):
@@ -1107,32 +1168,42 @@ class DataManager:
                     for f in os.listdir(self.cfg.data_path)
                     if f.endswith(".root")
                 ]
-
                 print(f"[INFO] Found {len(data_files)} Data files in {self.cfg.data_path}")
+                for path in data_files:
+                    metas.append({
+                        "name": os.path.basename(path),
+                        "group": "Data",
+                        "is_data": True,
+                        "path": path,
+                    })
 
-                for i, path in enumerate(data_files):
-                    print(
-                        f"\r[LOAD] Data {i + 1}/{len(data_files)} | "
-                        f"Mem={get_memory_mb():.1f} MB",
-                        end="",
-                    )
+        return metas
 
-                    arr = self.load_one_file(path, is_data=True, sample_group="Data")
+    def materialize(self, meta):
+        """Read one sample's array from meta.  Returns a sample dict
+        ``{"name", "group", "is_data", "array"}`` or ``None`` if the file could
+        not be read."""
+        arr = self.load_one_file(meta["path"],
+                                 is_data=meta["is_data"],
+                                 sample_group=meta["group"])
+        if arr is None:
+            return None
+        return {"name": meta["name"], "group": meta["group"],
+                "is_data": meta["is_data"], "array": arr}
 
-                    if arr is not None:
-                        samples.append({
-                            "name": os.path.basename(path),
-                            "group": "Data",
-                            "is_data": True,
-                            "array": arr,
-                        })
-
-                    if i % 10 == 0:
-                        gc.collect()
-
-                print("")
-
-        return samples
+    def materialize_all(self, metas):
+        """Eagerly read every sample (ROC / any all-resident consumer)."""
+        out = []
+        for i, meta in enumerate(metas):
+            print(f"\r[LOAD] {i + 1}/{len(metas)} | group={meta['group']:<10} "
+                  f"| Mem={get_memory_mb():.1f} MB", end="")
+            s = self.materialize(meta)
+            if s is not None:
+                out.append(s)
+            if i % 10 == 0:
+                gc.collect()
+        print("")
+        return out
 
     def load_one_file(self, root_path, is_data=False, sample_group="Other"):
         basename = os.path.basename(root_path)
@@ -1147,12 +1218,32 @@ class DataManager:
                 print(f"\n[WARN] Broken cache: {cache_file}")
                 print(f"[WARN] {e}")
                 print("[WARN] Reloading from ROOT.")
+                # drop the corrupt file so a failed rebuild can't leave the
+                # run hitting this same exception forever (2026-09-07).
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
 
         # Read + derive in entry chunks: a single tree.arrays() over a big
         # tree (tt-semi is ~4 GB) blows the lxplus per-job memory cgroup.
-        # build_derived_array is fully per-event vectorised, so deriving each
-        # chunk and concatenating the (much smaller) derived output is
-        # equivalent and keeps the peak RSS bounded by one chunk of raw.
+        # build_derived_array is fully per-event vectorised, so we derive one
+        # chunk at a time and *stream* it straight into the parquet cache as a
+        # row group (pq.ParquetWriter) -- the full derived array is NEVER
+        # resident, so a rebuild peaks at ~one chunk regardless of sample size
+        # (the old ak.concatenate(parts) + ak.to_parquet(arr) held 2x the
+        # whole derived tt-semi -> OOM, 2026-09-07).  The write goes to a
+        # ``.tmp`` sibling and is atomically renamed on success, so a killed
+        # rebuild leaves the old cache (or nothing) rather than a truncated
+        # file that forces the same OOM re-derive on every later run.
+        # When caching is off we fall back to accumulate + concatenate.
+        import pyarrow.parquet as _pq
+
+        _tmp_cache = f"{cache_file}.tmp{os.getpid()}"
+        _writer = None
+        _wschema = None
+        _wrote_rows = 0
+        parts = []
         try:
             with uproot.open(root_path) as f:
                 tree = f[self.cfg.tree_name]
@@ -1175,7 +1266,6 @@ class DataManager:
 
                 branches = existing_branches(tree, branches)
 
-                parts = []
                 for raw in tree.iterate(
                     branches,
                     library="ak",
@@ -1183,20 +1273,77 @@ class DataManager:
                 ):
                     if len(raw) == 0:
                         continue
-                    parts.append(self.build_derived_array(
+                    _der = self.build_derived_array(
                         raw=raw,
                         is_data=is_data,
                         sample_group=sample_group,
                         filename=basename,
                         met_pt_branch=met_pt_branch,
                         met_phi_branch=met_phi_branch,
-                    ))
+                    )
                     del raw
+                    # BAKE the plot-time runtime fields into the parquet
+                    # (2026-09-07, user -- was recomputed on every load; the
+                    # _tadr / ptasym / chi2 blocks each churn several GB of
+                    # float64 temporaries per file on 15 M-event tt-semi).
+                    # _attach_runtime_fields is per-event vectorised so it is
+                    # correct chunk-by-chunk; on later loads _want() sees the
+                    # fields already present and skips the recompute.
+                    _der = self._attach_runtime_fields(_der, need=None)
+                    if self.cfg.use_cache:
+                        _tbl = ak.to_arrow_table(_der)
+                        if _writer is None:
+                            _wschema = _tbl.schema
+                            _writer = _pq.ParquetWriter(_tmp_cache, _wschema,
+                                                        compression="zstd")
+                        elif not _tbl.schema.equals(_wschema):
+                            _tbl = _tbl.cast(_wschema)
+                        _writer.write_table(_tbl)
+                        _wrote_rows += _tbl.num_rows
+                        del _tbl
+                    else:
+                        parts.append(_der)
+                    del _der
                     gc.collect()
 
         except Exception as e:
             print(f"\n[WARN] Cannot read {root_path}: {e}")
+            if _writer is not None:
+                try:
+                    _writer.close()
+                except Exception:
+                    pass
+            if os.path.exists(_tmp_cache):
+                try:
+                    os.remove(_tmp_cache)
+                except OSError:
+                    pass
             return None
+
+        if _writer is not None:
+            _writer.close()
+            if _wrote_rows > 0:
+                try:
+                    os.replace(_tmp_cache, cache_file)
+                    print(f"[CACHE] wrote {_wrote_rows} rows -> "
+                          f"{os.path.basename(cache_file)}")
+                except OSError as e:
+                    print(f"\n[WARN] Could not finalise cache {cache_file}: {e}")
+                    print("[WARN] Continuing without caching this file "
+                          "(set $WCB_CACHE_DIR to a writable path).")
+                    try:
+                        os.remove(_tmp_cache)
+                    except OSError:
+                        pass
+            else:
+                try:
+                    os.remove(_tmp_cache)
+                except OSError:
+                    pass
+            if os.path.exists(cache_file):
+                # re-read (column-pruned) instead of keeping the full array
+                return self._attach_runtime_fields(
+                    self._read_cache_array(cache_file), self._keep_cols)
 
         if not parts:
             return None
@@ -1243,8 +1390,18 @@ class DataManager:
         # its outputs are needed -- keeps the load-phase RSS bounded (the tt /
         # t_a reco + ptasym blocks each allocate several GB of temporaries per
         # file).  need is None => compute everything (WCB_LOAD_ALL_COLS).
+        # ALSO skipped when every output of a block is ALREADY a field of arr
+        # -- i.e. it was baked into the parquet during the derive (2026-09-07,
+        # user).  WCB_RECOMPUTE_RUNTIME=1 forces recompute (retuning a gate).
+        _force_rt = bool(os.environ.get("WCB_RECOMPUTE_RUNTIME"))
+        _have = set(arr.fields)
+
         def _want(*names):
-            return need is None or not set(names).isdisjoint(need)
+            if need is not None and set(names).isdisjoint(need):
+                return False
+            if (not _force_rt) and names and _have.issuperset(names):
+                return False
+            return True
 
         # ja_truth_cat : 14-bin categorical of what J / the event is at gen
         # level, from the RAW cached mat_cat + true_cat + ak8_n_c_in_jet (the
@@ -1387,6 +1544,38 @@ class DataManager:
             arr = ak.with_field(arr, _rat5.astype(np.float32),
                                 "gpt_bc_vs_hf2prong")
             del _gbc5, _den5, _rat5
+
+        # ---- cc / (cc + bc)  GloParT ratio (PLOT-TIME; no re-derive) -------
+        # cc resonance vs W(cb): fraction of the (cc,bc) 2-prong probability
+        # that is cc.  ~1 for a genuine cc jet, ~0 for W->cb (2026-09-07,
+        # user).  0 when neither node fires.
+        if _want("gpt_cc_vs_bc") and {"ak8_gpt_cc_0", "ak8_gpt_bc_0"} \
+                <= set(arr.fields):
+            _gcc2 = ak.to_numpy(arr["ak8_gpt_cc_0"]).astype(np.float64)
+            _gbc2 = ak.to_numpy(arr["ak8_gpt_bc_0"]).astype(np.float64)
+            _den2 = _gcc2 + _gbc2
+            _rat2 = np.where(_den2 > 0.0, _gcc2 / np.maximum(_den2, 1e-12), 0.0)
+            arr = ak.with_field(arr, _rat2.astype(np.float32), "gpt_cc_vs_bc")
+            del _gcc2, _gbc2, _den2, _rat2
+
+        # ---- raw GloParT node SUMS (PLOT-TIME; no re-derive) --------------
+        # gpt_qcd_sum5   = sum of the 5 QCD sub-nodes (bb,b,cc,c,others).
+        # gpt_t_btaunu   = sum of the 3 t->b'W->b',tau,nu sub-nodes
+        #                  (tau_h / tau->e / tau->mu), b' in the jet.
+        # (2026-09-07, user -- inputs pinned in _CACHE_ALWAYS_COLUMNS.)
+        for _sum_name, _sum_src in (
+            ("gpt_qcd_sum5", ("ak8_gpt_qcdbb_0", "ak8_gpt_qcdb_0",
+                              "ak8_gpt_qcdcc_0", "ak8_gpt_qcdc_0",
+                              "ak8_gpt_qcdothers_0")),
+            ("gpt_t_btaunu", ("ak8_gpt_topbwtauhv_0", "ak8_gpt_topbwtauev_0",
+                              "ak8_gpt_topbwtaumv_0")),
+        ):
+            if _want(_sum_name) and set(_sum_src) <= set(arr.fields):
+                _acc = np.zeros(len(arr), dtype=np.float64)
+                for _sn in _sum_src:
+                    _acc = _acc + ak.to_numpy(arr[_sn]).astype(np.float64)
+                arr = ak.with_field(arr, _acc.astype(np.float32), _sum_name)
+                del _acc
         gc.collect()
 
         # ---- tt reconstruction (PLOT-TIME; retunable with NO re-derive) ----
@@ -1652,13 +1841,17 @@ class DataManager:
         _tadr_out = ("mt", "mt_xself", "mt_nojs",
                      "dR_ja_mt", "dR_ja_bdr1", "dR_ja_bL12",
                      "xself_jstar", "dRpt_jstar", "pt_jstar", "xself_bmk1",
-                     "jstar_flav",
+                     "jstar_flav", "jstar_flav_nowin",
                      "bdr1_flav", "bbestm1_flav",
                      "bvuds_near", "bvuds_bestm", "cvuds_bestm",
                      "bcvuds_bestm", "cvsb_bestm",
                      "mt_bjstar", "mt_cjstar", "mt_udsjstar", "mt_bcjstar",
                      "tophad_phi")
-        if _want(*_tadr_out) and arr is not None and {"ak8_pt_0", "ak8_eta_0",
+        # the mJ_jstar_cat composite (built further down) needs jstar_flav +
+        # jstar_flav_nowin from this block -- pull it in whenever that
+        # composite is wanted, even if the plain ttreco_jstar_flav spec is off.
+        if (_want(*_tadr_out) or _want("mJ_jstar_cat")) \
+                and arr is not None and {"ak8_pt_0", "ak8_eta_0",
                 "ak8_phi_0", "ak8_sdmass_0", "bdr1_pt"} <= set(arr.fields):
 
             def _g(name):   # float64: invariant-mass precision (see _f above)
@@ -1887,6 +2080,18 @@ class DataManager:
                     _jf = np.where(_jf == 3.0, 2.0, _jf)
                     _jf = np.where(_win & (~_done), -1.0, _jf)
                     _out["jstar_flav"] = _jf
+                    # SAME categorical but WITHOUT the m(J) merge-window
+                    # gate -- "was a bmk1..5 candidate found (any m(J)),
+                    # and what flavour" -- feeds the m(J) 130-200 GeV
+                    # blocks of the mJ_jstar_cat composite (2026-09-06,
+                    # user): -1 = no candidate passed the primary gate,
+                    # 0/1/2 = light/c_L/b_L of the candidate that did.
+                    # _done itself is computed regardless of m(J), so this
+                    # is defined for EVERY event (no SENTINEL).
+                    _jfnw = _flav4(_tag_sel, _done)
+                    _jfnw = np.where(_jfnw == 3.0, 2.0, _jfnw)
+                    _jfnw = np.where(~_done, -1.0, _jfnw)
+                    _out["jstar_flav_nowin"] = _jfnw
                 if "bmk1_pnb" in arr.fields:
                     _out["bvuds_bestm"] = np.where(
                         _has_js, _ratio_pn(_pnb_sel, _pnb_sel + _pnu_sel, _has_js),
@@ -1955,7 +2160,11 @@ class DataManager:
         #   ptasym_jstar = |pT(t_had) - pT(t_lep)| / (pT(t_had)+pT(t_lep))
         # Needs pt_jstar already in arr (2026-09-04, user).
         _paj_in = {"pt_jstar", "v_pt", "v_eta", "v_phi", "v_mass", "bL1_pt"}
-        _paj_out = ("ptasym_jstar", "toplep_phi")
+        # toplep_pt (2026-09-07, user): pT of the leptonic top t_lep =
+        #   W(lv) + b_l, the SAME object whose phi is toplep_phi and whose
+        #   pT already feeds ptasym_jstar -- just exposed as its own field
+        #   for the kinematics pack.  SENTINEL when no loose-b seed.
+        _paj_out = ("ptasym_jstar", "toplep_phi", "toplep_pt")
         if _want(*_paj_out) and arr is not None and _paj_in <= set(arr.fields):
             def _fj(name):
                 return ak.to_numpy(arr[name]).astype(np.float64)
@@ -2014,6 +2223,10 @@ class DataManager:
             arr = ak.with_field(
                 arr, np.where(_bl_ok, _bl_phi, SENTINEL).astype(np.float32),
                 "toplep_phi")
+            # pT(t_lep) = pT(W(lv) + b_l) of the same nearest-in-dR seed.
+            arr = ak.with_field(
+                arr, np.where(_bl_ok, _bl_pt, SENTINEL).astype(np.float32),
+                "toplep_pt")
             del _wv, _we, _wp, _bl_ok, _bl_dR, _bl_pt, _bl_phi, _pt_ja, _s_sum, _asym_j
             gc.collect()
         elif _want(*_paj_out) and arr is not None:
@@ -2048,34 +2261,86 @@ class DataManager:
                     arr = ak.with_field(
                         arr, np.full(_N, SENTINEL, dtype=np.float32), _nm)
 
-        # ---- composite m(J) x j*-flavour, 21-bin (PLOT-TIME) ----------------
+        # ---- 2-top chi2 reco: plot-time gated m_t + derived diags -----------
+        #   dm_chi2      = sqrt(chi2_2top)  (the combined |m_top - 172.5|
+        #                 "distance", in GeV; -1 when no j*).
+        #   mt_chi2_q    = m(J+j*) from the chi2 pick ONLY when the 2-top fit
+        #                 is good (dm_chi2 < WCB_TTRECO_CHI2MAX, default 60
+        #                 GeV, i.e. both tops within ~42 GeV of 172.5);
+        #                 else m(J)  -> the "no clean j*" fallback.  This is
+        #                 the plot-time-tunable version of `mt_chi2`.
+        #   mtlep_chi2_q = m(v + b_lep) when the fit is good, else -1.
+        _c2q_out = ("dm_chi2", "mt_chi2_q", "mtlep_chi2_q")
+        if _want(*_c2q_out) and arr is not None and \
+                {"chi2_2top", "mt_chi2", "ak8_sdmass_0"} <= set(arr.fields):
+            _c2v = ak.to_numpy(arr["chi2_2top"]).astype(np.float64)
+            _dmc = np.where(_c2v >= 0.0, np.sqrt(np.maximum(_c2v, 0.0)), -1.0)
+            _c2max = float(os.environ.get("WCB_TTRECO_CHI2MAX", "60"))
+            _good = (_c2v >= 0.0) & (_dmc < _c2max)
+            _msd = ak.to_numpy(arr["ak8_sdmass_0"]).astype(np.float64)
+            _mtc = ak.to_numpy(arr["mt_chi2"]).astype(np.float64)
+            _mtl = (ak.to_numpy(arr["mtlep_chi2"]).astype(np.float64)
+                    if "mtlep_chi2" in arr.fields else np.full(_N, -1.0))
+            arr = ak.with_field(arr, _dmc.astype(np.float32), "dm_chi2")
+            arr = ak.with_field(
+                arr, np.where(_good, _mtc,
+                              np.where(_msd > 0, _msd, -1.0)).astype(np.float32),
+                "mt_chi2_q")
+            arr = ak.with_field(
+                arr, np.where(_good, _mtl, -1.0).astype(np.float32), "mtlep_chi2_q")
+            del _c2v, _dmc, _good, _msd, _mtc, _mtl
+        elif _want(*_c2q_out) and arr is not None:
+            for _nm in _c2q_out:
+                if _nm not in arr.fields:
+                    arr = ak.with_field(
+                        arr, np.full(_N, SENTINEL, dtype=np.float32), _nm)
+
+        # ---- composite m(J) x j*-case, 53-bin (PLOT-TIME) ------------------
         #   Single-axis composite (2026-09-06, user):
-        #     bins  1-5  : m(J) in [60,110), j* = b_L        (jstar_flav==2)
-        #     bins  6-10 : m(J) in [60,110), j* = c_L        (jstar_flav==1)
-        #     bins 11-15 : m(J) in [60,110), j* light/untag. (jstar_flav==0)
-        #     bins 16-20 : m(J) in [60,110), no j* found     (jstar_flav==-1)
-        #     bin  21    : m(J) OUTSIDE [60,110)             (any/no category)
-        #   Composite coordinate: 50*block + (m(J)-60) inside the window (5
-        #   bins of 10 GeV per block, 4 blocks -> 0..200); one extra 10-wide
-        #   bin [200,210) holds every event with m(J) outside the window,
-        #   regardless of j* category.  SENTINEL only when J itself is
-        #   missing (mSD(J) <= 0).
-        _mjc_in = {"ak8_sdmass_0", "jstar_flav"}
-        _mjc_out = ("mJ_jstar_cat21",)
+        #     LOW  m(J) in [50,130) -- 4 blocks of 8 (10-GeV) bins, split by
+        #          the j* ParticleNetAK4 flavour (jstar_flav, merge-window
+        #          gated):
+        #       bins  1- 8 : j* = b_L                    (jstar_flav==2)
+        #       bins  9-16 : j* light/untag. (q, not b_L/c_L)   (jstar_flav==0)
+        #       bins 17-24 : j* = c_L                    (jstar_flav==1)
+        #       bins 25-32 : no j* found (N/A)           (jstar_flav==-1)
+        #     HIGH m(J) in [130,230) -- 2 blocks of 10 (10-GeV) bins, split
+        #          ONLY by whether a j* candidate exists (any flavour), via
+        #          the merge-window-FREE jstar_flav_nowin (jstar_flav itself
+        #          is -1 / undefined out here by construction):
+        #       bins 33-42 : w/o j*                      (jstar_flav_nowin==-1)
+        #       bins 43-52 : with j* (any flavour)       (jstar_flav_nowin>=0)
+        #     bin 53       : residual -- m(J) > 0 but m(J) < 50 or m(J) >= 230.
+        #   Composite x: 80*blk_lo + (m(J)-50)          for the 4 low blocks
+        #                  -> [0,320);
+        #                320 + 100*blk_hi + (m(J)-130)  for the 2 high blocks
+        #                  -> [320,520);
+        #                525                            for the residual bin.
+        #   SENTINEL only when J itself is missing (mSD(J) <= 0).
+        _mjc_in = {"ak8_sdmass_0", "jstar_flav", "jstar_flav_nowin"}
+        _mjc_out = ("mJ_jstar_cat",)
         if _want(*_mjc_out) and arr is not None and _mjc_in <= set(arr.fields):
             _mJ = ak.to_numpy(arr["ak8_sdmass_0"]).astype(np.float64)
             _jf = ak.to_numpy(arr["jstar_flav"]).astype(np.float64)
+            _jfnw = ak.to_numpy(arr["jstar_flav_nowin"]).astype(np.float64)
             _mJ_ok = _mJ > 0.0
-            _inwin = _mJ_ok & (_mJ >= 60.0) & (_mJ < 110.0)
-            _block = np.select(
-                [_jf == 2.0, _jf == 1.0, _jf == 0.0, _jf == -1.0],
+            # LOW: m(J) in [50,130), split by j* flavour (4 blocks)
+            _in_lo = _mJ_ok & (_mJ >= 50.0) & (_mJ < 130.0)
+            _blk_lo = np.select(
+                [_jf == 2.0, _jf == 0.0, _jf == 1.0, _jf == -1.0],
                 [0.0, 1.0, 2.0, 3.0], default=-1.0)
+            _take_lo = _in_lo & (_blk_lo >= 0.0)
+            # HIGH: m(J) in [130,230), split by has-j* only (window-free)
+            _in_hi = _mJ_ok & (_mJ >= 130.0) & (_mJ < 230.0)
+            _blk_hi = np.where(_jfnw >= 0.0, 1.0, 0.0)
             _composite = np.where(
-                _inwin & (_block >= 0.0), 50.0 * _block + (_mJ - 60.0),
-                np.where(_mJ_ok, 205.0, SENTINEL))
+                _take_lo, 80.0 * _blk_lo + (_mJ - 50.0),
+                np.where(_in_hi, 320.0 + 100.0 * _blk_hi + (_mJ - 130.0),
+                         np.where(_mJ_ok, 525.0, SENTINEL)))
             arr = ak.with_field(
-                arr, _composite.astype(np.float32), "mJ_jstar_cat21")
-            del _mJ, _jf, _mJ_ok, _inwin, _block, _composite
+                arr, _composite.astype(np.float32), "mJ_jstar_cat")
+            del (_mJ, _jf, _jfnw, _mJ_ok, _in_lo, _blk_lo, _take_lo,
+                 _in_hi, _blk_hi, _composite)
         elif _want(*_mjc_out) and arr is not None:
             for _nm in _mjc_out:
                 if _nm not in arr.fields:
@@ -3132,12 +3397,179 @@ class DataManager:
                 for _s in ("tag", "pnb", "pnuds", "pnc"):
                     _bmk[f"bmk{_k + 1}_{_s}"] = np.full(n, -1.0, np.float32)
 
+        # ==================================================================
+        # 2-TOP chi2 RECONSTRUCTION  +  per-AK4 j*/b_lep flag  (2026-09-06, user)
+        # ------------------------------------------------------------------
+        # Semileptonic t-tbar, W_had -> cb merged into J:
+        #   t_had = J + b_had        (b_had = j*)
+        #   t_lep = W(l,nu) + b_lep  (W with m_W-constrained pz_nu)
+        # Selection (the leptonic chi2 term does NOT help the j* pick --
+        # verified -- so j* is chosen on the hadronic mass alone, b_lep on
+        # the leptonic mass among the remaining tagged AK4):
+        #   j*    = argmin |m(J + AK4) - M_top|  over  {AK4 outside J, tag>=40}
+        #   b_lep = argmin |m(v + AK4) - M_top|  over  {same, minus j*}
+        # (fallback to any AK4 outside J when the event has no tagged one).
+        # chi2_2top = (m(J+j*)-M_top)^2 + (m(v+b_lep)-M_top)^2  is stored as a
+        # quality variable (cut at plot time).  m_W solution: smaller-|pz_nu|
+        # root; real part when the discriminant is negative (~32% of events).
+        # OUTPUTS: flat mt_chi2 / mtlep_chi2 / chi2_2top / mlv_solved /
+        # nu_disc_neg / has_jstar_chi2 / dR_ja_jstar_chi2 / jstar_chi2_tag,
+        # and the JAGGED int8 ak4_chi2_flag (+1 at j*, -1 at b_lep, 0 else).
+        # ==================================================================
+        _MT_C = float(os.environ.get("WCB_TTRECO_MTOP", "172.5"))
+        _c2_need = {"ak4_pt", "ak4_eta", "ak4_phi", "ak4_mass", "ak4_tag"}
+        # 2-top chi2 reco is OFF by default (2026-09-07, user -- not in use
+        # and the m_W-solve + per-AK4 combinatorics is a chunk of the derive
+        # time).  Set WCB_CHI2_RECO=1 to compute it; the else-branch fills
+        # mt_chi2 = mSD(J), chi2_2top = 0, ak4_chi2_flag = zeros.
+        if os.environ.get("WCB_CHI2_RECO") and _c2_need <= set(raw.fields):
+            # ---- leptonic W: pz_nu from m(l,nu) = m_W (smaller-|pz| root) ----
+            # float64 throughout -- the discriminant is a difference of ~1e7
+            # terms and float32 gives ~90% spurious "disc<0" (2026-09-06).
+            _MW = 80.379
+            _f8 = lambda x: np.asarray(x, dtype=np.float64)
+            _lpt, _leta, _lph = _f8(lep1_pt), _f8(lep1_eta), _f8(lep1_phi)
+            _mett, _metp = _f8(met), _f8(met_phi)
+            _lok = (_lpt > 0) & (_mett >= 0)
+            _lx = _lpt * np.cos(_lph)
+            _ly = _lpt * np.sin(_lph)
+            _lz = _lpt * np.sinh(np.clip(_leta, -6.0, 6.0))
+            _lE = np.sqrt(_lx ** 2 + _ly ** 2 + _lz ** 2)         # lepton ~massless
+            _nx = _mett * np.cos(_metp)
+            _ny = _mett * np.sin(_metp)
+            _muk = _MW ** 2 / 2.0 + _lx * _nx + _ly * _ny
+            _Ak = _lE ** 2 - _lz ** 2
+            _Aks = np.where(np.abs(_Ak) > 1e-9, _Ak, 1e-9)
+            _Bk = _muk * _lz
+            _Ck = _lE ** 2 * (_nx ** 2 + _ny ** 2) - _muk ** 2
+            _disc = _Bk ** 2 - _Ak * _Ck
+            _sq = np.sqrt(np.maximum(_disc, 0.0))
+            _pzp = (_Bk + _sq) / _Aks
+            _pzm = (_Bk - _sq) / _Aks
+            _pz_nu = np.where(
+                _disc >= 0.0,
+                np.where(np.abs(_pzp) <= np.abs(_pzm), _pzp, _pzm),
+                _Bk / _Aks)
+            nu_disc_neg = np.where(_lok, (_disc < 0.0).astype(np.float32), -1.0)
+            _wx, _wy, _wz = _lx + _nx, _ly + _ny, _lz + _pz_nu
+            _wE = _lE + np.sqrt(_nx ** 2 + _ny ** 2 + _pz_nu ** 2)
+            mlv_solved = np.where(_lok, np.sqrt(np.maximum(
+                _wE ** 2 - _wx ** 2 - _wy ** 2 - _wz ** 2, 0.0)), -1.0
+                ).astype(np.float32)
+
+            # ---- per-AK4 m(J+AK4) and m(v+AK4)  (float64: invariant mass) ----
+            _cphi = ak.values_astype(raw["ak4_phi"], np.float64)
+            _ceta = ak.values_astype(raw["ak4_eta"], np.float64)
+            _cpt_ = ak.values_astype(raw["ak4_pt"], np.float64)
+            _cm_ = ak.values_astype(raw["ak4_mass"], np.float64)
+            _je0, _jp0 = _f8(ak8_eta_0), _f8(ak8_phi_0)
+            _jpt0, _jsd0 = _f8(ak8_pt_0), _f8(ak8_sdmass_0)
+            _cdphi = np.abs(_cphi - _jp0)
+            _cdphi = ak.where(_cdphi > np.pi, 2.0 * np.pi - _cdphi, _cdphi)
+            _cdRj = np.sqrt((_ceta - _je0) ** 2 + _cdphi ** 2)
+            _cout = _cdRj > 0.8
+            _cpx = _cpt_ * np.cos(_cphi)
+            _cpy = _cpt_ * np.sin(_cphi)
+            _cpz = _cpt_ * np.sinh(_ceta)
+            _cE = np.sqrt(_cpx ** 2 + _cpy ** 2 + _cpz ** 2
+                          + ak.where(_cm_ > 0, _cm_, 0.0) ** 2)
+            _Jpx = _jpt0 * np.cos(_jp0)
+            _Jpy = _jpt0 * np.sin(_jp0)
+            _Jpz = _jpt0 * np.sinh(np.clip(_je0, -10.0, 10.0))
+            _JE = np.sqrt(_Jpx ** 2 + _Jpy ** 2 + _Jpz ** 2
+                          + np.maximum(_jsd0, 0.0) ** 2)
+            _mh2 = ((_JE + _cE) ** 2 - (_Jpx + _cpx) ** 2
+                    - (_Jpy + _cpy) ** 2 - (_Jpz + _cpz) ** 2)
+            _mJc = np.sqrt(ak.where(_mh2 > 0, _mh2, 0.0))          # m(J + AK4_i)
+            _ml2 = ((_wE + _cE) ** 2 - (_wx + _cpx) ** 2
+                    - (_wy + _cpy) ** 2 - (_wz + _cpz) ** 2)
+            _mVc = np.sqrt(ak.where(_ml2 > 0, _ml2, 0.0))          # m(v + AK4_i)
+
+            # ---- candidate mask: outside J, tag>=40 ; fall back to any-out ---
+            _tagc = _cout & (raw["ak4_tag"] >= 40.0)
+            _has_tag = ak.to_numpy(ak.sum(_tagc, axis=1)) > 0
+            _cmask = _tagc | (_cout & (~ak.Array(_has_tag)))
+            _n_cand = ak.to_numpy(ak.sum(_cmask, axis=1)).astype(np.int16)
+
+            _li = ak.local_index(raw["ak4_pt"])
+            # j* = min |m(J+AK4) - M_top|
+            _penh = ak.where(_cmask, np.abs(_mJc - _MT_C), 1.0e18)
+            _ji = ak.to_numpy(ak.fill_none(
+                ak.firsts(ak.argmin(_penh, axis=1, keepdims=True)), -1))
+            _has_j = _n_cand >= 1
+            jstar_chi2_idx = np.where(_has_j, _ji, -1).astype(np.int32)
+            # b_lep = min |m(v+AK4) - M_top|  among candidates != j*
+            _cmask_l = _cmask & (_li != ak.Array(jstar_chi2_idx))
+            _penl = ak.where(_cmask_l, np.abs(_mVc - _MT_C), 1.0e18)
+            _bi = ak.to_numpy(ak.fill_none(
+                ak.firsts(ak.argmin(_penl, axis=1, keepdims=True)), -1))
+            _has_l = ak.to_numpy(ak.sum(_cmask_l, axis=1)) >= 1
+            blep_chi2_idx = np.where(_has_l, _bi, -1).astype(np.int32)
+
+            _c2_cnt = ak.to_numpy(ak.num(raw["ak4_pt"])).astype(np.int64)
+            _c2_st = np.concatenate([[0], np.cumsum(_c2_cnt)[:-1]])
+
+            def _at(col_jag, idx, dflt):
+                _flat = ak.to_numpy(ak.flatten(col_jag)).astype(np.float64)
+                _ok = idx >= 0
+                _o = np.full(n, dflt, dtype=np.float64)
+                _o[_ok] = _flat[_c2_st[_ok] + idx[_ok]]
+                return _o.astype(np.float32)
+
+            _mt_had = _at(_mJc, jstar_chi2_idx, -1.0)
+            _mt_lep = _at(_mVc, blep_chi2_idx, -1.0)
+            # mt_chi2: m(J+j*) when a j* was found, else m(J) (matches mt's
+            # fallback convention; -1 only when J itself is missing).
+            mt_chi2 = np.where(_has_j, _mt_had,
+                               np.where(ak8_sdmass_0 > 0, ak8_sdmass_0, -1.0)
+                               ).astype(np.float32)
+            mtlep_chi2 = _mt_lep.astype(np.float32)
+            has_jstar_chi2 = _has_j.astype(np.float32)
+            dR_ja_jstar_chi2 = _at(_cdRj, jstar_chi2_idx, -1.0)
+            jstar_chi2_tag = _at(raw["ak4_tag"], jstar_chi2_idx, -1.0)
+            _c2h = np.where(_has_j, _mt_had - _MT_C, 0.0)
+            _c2l = np.where(_has_l, _mt_lep - _MT_C, 0.0)
+            chi2_2top = np.where(_has_j, _c2h ** 2 + _c2l ** 2, -1.0
+                                 ).astype(np.float32)
+
+            # ---- JAGGED per-AK4 flag: +1 at j*, -1 at b_lep, 0 elsewhere ----
+            _fj = ak.where(_li == ak.Array(jstar_chi2_idx), np.int8(1), np.int8(0))
+            ak4_chi2_flag = ak.values_astype(
+                ak.where(_li == ak.Array(blep_chi2_idx), np.int8(-1), _fj),
+                np.int8)
+        else:
+            # chi2 reco disabled (default) -- cheap defaults, no per-event
+            # Python loop.  mt_chi2 falls back to mSD(J).
+            _zc = np.full(n, -1.0, dtype=np.float32)
+            mt_chi2 = np.where(ak8_sdmass_0 > 0, ak8_sdmass_0, -1.0).astype(np.float32)
+            mtlep_chi2 = chi2_2top = mlv_solved = _zc
+            nu_disc_neg = np.zeros(n, dtype=np.float32)
+            has_jstar_chi2 = np.zeros(n, dtype=np.float32)
+            dR_ja_jstar_chi2 = jstar_chi2_tag = _zc
+            jstar_chi2_idx = blep_chi2_idx = np.full(n, -1, dtype=np.int32)
+            # all-empty jagged int8 (vectorised -- no list comprehension)
+            ak4_chi2_flag = ak.values_astype(
+                ak.unflatten(np.zeros(0, dtype=np.int8),
+                             np.zeros(n, dtype=np.int64)), np.int8)
+
         # ------------------------------------------------------------------
         # Return awkward array.
         # Important: no object dtype.
         # ------------------------------------------------------------------
         return ak.Array({
             "weights": weights,
+            # --- 2-top chi2 reco (2026-09-06, user) ---
+            "mt_chi2": mt_chi2,
+            "mtlep_chi2": mtlep_chi2,
+            "chi2_2top": chi2_2top,
+            "mlv_solved": mlv_solved,
+            "nu_disc_neg": nu_disc_neg,
+            "has_jstar_chi2": has_jstar_chi2,
+            "dR_ja_jstar_chi2": dR_ja_jstar_chi2,
+            "jstar_chi2_tag": jstar_chi2_tag,
+            "jstar_chi2_idx": jstar_chi2_idx,
+            "blep_chi2_idx": blep_chi2_idx,
+            "ak4_chi2_flag": ak4_chi2_flag,
 
             # event variables
             "n_ak8": n_ak8,
@@ -3373,6 +3805,13 @@ class Histogrammer:
         # sample set, so this turns 73x re-evaluation into one pass.
         self._ctx_cache = {}
 
+    def clear_context_cache(self):
+        """Drop the (id(arr), cut) cache.  MUST be called whenever an array is
+        about to be freed: CPython reuses id() once the object is gone, so a
+        stale entry would be a silent wrong-sample hit (the streaming draw path
+        frees each sample's array right after use)."""
+        self._ctx_cache.clear()
+
     def event_context(self, arr, cut, is_data):
         """Cut mask + masked weights / true_cat / mat_cat for one array, cached."""
         key = (id(arr), cut)
@@ -3446,27 +3885,31 @@ class Histogrammer:
                   (13, "Z->qq' merged"), (14, "Z->cc merged"), (15, "Z->bb merged"),
                   (3, "rest")]
 
-    def mat_report(self, samples, cut):
-        """One-pass summary printed before the MAT draw loop: per-sample event
-        yields after the cut, and the global leading-AK8 truth-category
-        breakdown. Side effect: warms self._ctx_cache for every sample."""
-        cat_n = {c: 0 for c, _ in self._MAT_CODES}
-        cat_w = {c: 0.0 for c, _ in self._MAT_CODES}
-        rows = []
-        for s in samples:
-            if s["is_data"]:
-                continue
-            arr = s["array"]
-            ctx = self.event_context(arr, cut, False)
-            m, w, mc = ctx["mask"], ctx["weights"], ctx["mat_cat"]
-            rows.append((s["name"], s["group"], len(arr),
-                         int(m.sum()), float(w.sum())))
-            if mc is not None:
-                for c, _ in self._MAT_CODES:
-                    sel = mc == c
-                    cat_n[c] += int(sel.sum())
-                    cat_w[c] += float(w[sel].sum())
+    def mat_report_acc(self):
+        """Fresh accumulator for the streaming MAT summary (see mat_report_add /
+        mat_report_print)."""
+        return {"cat_n": {c: 0 for c, _ in self._MAT_CODES},
+                "cat_w": {c: 0.0 for c, _ in self._MAT_CODES},
+                "rows": []}
 
+    def mat_report_add(self, acc, sample, cut):
+        """Fold one materialized sample into the MAT summary accumulator."""
+        if sample["is_data"]:
+            return
+        arr = sample["array"]
+        ctx = self.event_context(arr, cut, False)
+        m, w, mc = ctx["mask"], ctx["weights"], ctx["mat_cat"]
+        acc["rows"].append((sample["name"], sample["group"], len(arr),
+                            int(m.sum()), float(w.sum())))
+        if mc is not None:
+            for c, _ in self._MAT_CODES:
+                sel = mc == c
+                acc["cat_n"][c] += int(sel.sum())
+                acc["cat_w"][c] += float(w[sel].sum())
+
+    def mat_report_print(self, acc, cut):
+        """Print the MAT summary from a filled accumulator."""
+        cat_n, cat_w, rows = acc["cat_n"], acc["cat_w"], acc["rows"]
         print("=" * 100)
         print(f"[MAT] Sample event yields   (cut: {cut})")
         print(f"  {'sample':<30}{'group':<11}{'N raw':>13}{'N cut':>13}{'sum(w)':>15}")
@@ -3482,6 +3925,14 @@ class Histogrammer:
                   f"{100.0 * cat_w[c] / tot_w:>9.2f}%")
         print(f"  {'TOTAL':<18}{tot_n:>14,}{tot_w:>15.3f}{100.0:>9.2f}%")
         print("=" * 100)
+
+    def mat_report(self, samples, cut):
+        """One-pass MAT summary over an all-resident sample list (compat entry;
+        the streaming path uses mat_report_acc / _add / _print directly)."""
+        acc = self.mat_report_acc()
+        for s in samples:
+            self.mat_report_add(acc, s, cut)
+        self.mat_report_print(acc, cut)
 
     def get_values_weights_for_plot(self, arr, plot_cfg, is_data):
         var = plot_cfg["var"]
@@ -3683,6 +4134,18 @@ class Histogrammer:
                 raise ValueError(f"Unknown histogram mode: {mode}")
 
         return hist_data, hist_var
+
+    def accumulate_sample(self, sample, plot_cfg, hist_data, hist_var):
+        """Fold ONE sample's events into the (hist_data, hist_var) dicts in
+        place.  Lets the draw phase stream samples one at a time -- peak RSS is
+        a single sample's array, not all of them at once.  The per-sample
+        histograms are tiny, so building them via make_histograms([sample]) and
+        merging costs nothing."""
+        hd, hv = self.make_histograms([sample], plot_cfg)
+        for k, c in hd.items():
+            hist_data[k] = hist_data.get(k, 0) + c
+        for k, v in hv.items():
+            hist_var[k] = hist_var.get(k, 0) + v
 
 
 # ======================================================================================
@@ -4077,12 +4540,22 @@ class Plotter:
         SIGNAL_KEYS = _SIG5
         SCALED_KEYS = _SIG5 + ("Wcb_nomt",)   # *SIGNAL_SCALE
         PROXY_KEY = "Cat_Top_bc"
+        # the 9 background MAT lines (all of key_order that is neither signal
+        # nor a dotted subset) -- the composition shown by MAT-BKG.
+        BKG_KEYS = tuple(k for k in key_order
+                         if k not in _SIG5 and k not in _SUBSET_KEYS)
         normalize = bool(cfg.get("_normalize", False))
         signal_only = bool(cfg.get("_signal_only", False))
+        bkg_only = bool(cfg.get("_bkg_only", False))
+        _compo = signal_only or bkg_only        # single-group composition mode
         # MAT-SIGNAL: keep only the 5 red W->cb lines (+ their _nomt subset).
         if signal_only:
             key_order = [k for k in key_order
                          if k in SIGNAL_KEYS or k == "Wcb_nomt"]
+        # MAT-BKG: keep only the background lines (+ the blue _nomt subset).
+        elif bkg_only:
+            key_order = [k for k in key_order
+                         if k in BKG_KEYS or k == "Cat_Top_bc_nomt"]
 
         hist_var = hist_var or {}
         raw_tot = {}
@@ -4106,8 +4579,12 @@ class Plotter:
                 shape_hists[key] = counts
                 shape_errs[key] = np.zeros_like(counts)
 
-        if "Wcb" not in shape_hists or (not signal_only
-                                        and "Cat_Top_bc" not in shape_hists):
+        if bkg_only:
+            if not any(k in shape_hists for k in BKG_KEYS):
+                print(f"[WARN] No background lines for matching plot {name}, skip.")
+                return
+        elif "Wcb" not in shape_hists or (not signal_only
+                                          and "Cat_Top_bc" not in shape_hists):
             print(f"[WARN] Missing Wcb or Cat_Top_bc for matching plot {name}, skip.")
             return
 
@@ -4273,9 +4750,12 @@ class Plotter:
 
         # Total signal = sum of the 5 W->cb topologies (drawn values, i.e.
         # *SIGNAL_SCALE already applied like the individual lines) -- one
-        # solid black line on top of the colour breakdown (2026-09-06, user).
+        # dotted black line on top of the colour breakdown (2026-09-06, user).
+        # MAT-SIGNAL (signal_only): the dotted total is dropped from the upper
+        # pad -- the lower pad already carries the full per-component
+        # composition (2026-09-07, user).
         _sig_drawn = [draw_hists[k] for k in SIGNAL_KEYS if k in draw_hists]
-        if _sig_drawn:
+        if _sig_drawn and not cfg.get("hide_total_signal") and not signal_only:
             _tot_sig_h = sum(_sig_drawn[1:], start=_sig_drawn[0].copy())
             mat_labels.setdefault("Wcb_total", r"Total signal")
             hep.histplot(
@@ -4285,29 +4765,47 @@ class Plotter:
                 label=_leg_label("Wcb_total"),
                 ax=ax,
                 color="black",
-                linestyle="-",
+                linestyle=":",
                 linewidth=2.2,
                 zorder=11,
             )
 
         # -------- lower pad ----------------------------------------------
-        if signal_only:
-            # MAT-SIGNAL: no background -> no significance.  Show the per-bin
-            # fraction of the signal that is the clean 2-prong (cb) image of J
-            # (i.e. Wcb / sum of all 5 red lines).
+        # Composite block-label plots (ttreco_mJ_jstar_cat): lower-pad text is
+        # kept at the SAME size as the upper pad -- the earlier 2x bump made the
+        # ratio-pad titles / labels overpower the panels in the 2x2 montage
+        # (panel2x2_MAT_ttreco_mJ_jstar_cat), so match the top pad instead
+        # (2026-09-07, user).
+        _lp2x = False
+        _lp_fs = (lambda s: s)
+        if _compo:
+            # MAT-SIGNAL / MAT-BKG: no significance.  Lower pad = the per-bin
+            # composition of the drawn group: one curve per component =
+            # (that component) / (sum of all components), each coloured to
+            # match its upper-pad line so the top legend doubles as the key
+            # (2026-09-07, user).
+            _compo_keys = SIGNAL_KEYS if signal_only else BKG_KEYS
+            _compo_col = (lambda k: _c_sig.get(k, "black")) if signal_only \
+                else (lambda k: style_overrides.get(k, {}).get("color", "black"))
             _z = np.zeros(len(bins) - 1)
-            _tot = sum((abs_hists[k] for k in SIGNAL_KEYS if k in abs_hists),
+            _tot = sum((abs_hists[k] for k in _compo_keys if k in abs_hists),
                        start=_z.copy())
-            _cb = abs_hists.get("Wcb", _z)
             valid = _tot > 0
-            frac = np.full(len(_tot), np.nan)
-            frac[valid] = _cb[valid] / _tot[valid]
-            ax_ratio.plot(np.repeat(bins, 2)[1:-1],
-                          _stepify(np.where(valid, frac, np.nan)),
-                          color="black", linewidth=1.3)
+            _xstep = np.repeat(bins, 2)[1:-1]
+            for _ck in _compo_keys:
+                if _ck not in abs_hists:
+                    continue
+                _comp = np.asarray(abs_hists[_ck], dtype=np.float64)
+                _f = np.full(len(_tot), np.nan)
+                _f[valid] = _comp[valid] / _tot[valid]
+                ax_ratio.plot(_xstep, _stepify(np.where(valid, _f, np.nan)),
+                              color=_compo_col(_ck), linewidth=1.4,
+                              solid_joinstyle="miter")
             ax_ratio.axhline(1.0, color="0.6", linestyle=":", linewidth=1)
-            ax_ratio.set_ylim(0.0, 1.05)
-            ax_ratio.set_ylabel(r"$(cb)$ / all signal", fontsize=10, labelpad=2)
+            ax_ratio.set_ylim(0.0, cfg.get("sigonly_ymax") or 1.05)
+            ax_ratio.set_ylabel(
+                r"component / total " + ("signal" if signal_only else "bkg"),
+                fontsize=_lp_fs(10), labelpad=2)
         elif normalize:
             # NORM: shape ratio  (W->cb =J) / (t->bc), both unit-area
             wcb, top = shape_hists["Wcb"], shape_hists["Cat_Top_bc"]
@@ -4334,7 +4832,8 @@ class Plotter:
                           drawstyle="steps-mid", color="black", linewidth=1.3)
             ax_ratio.axhline(1.0, color="red", linestyle="--", linewidth=1)
             ax_ratio.set_ylim(cfg.get("ratio_ylim", (0.0, 4.0)))
-            ax_ratio.set_ylabel(r"$W\to cb$ (merged) / $t\to(cb)$", fontsize=10, labelpad=2)
+            ax_ratio.set_ylabel(r"$W\to cb$ (merged) / $t\to(cb)$",
+                                fontsize=_lp_fs(10), labelpad=2)
         else:
             # ABS: per-bin significance  S_i / sqrt(S_i + B_i).
             #   S = every W->cb topology (SIGNAL_KEYS: Wcb merged 2-prong +
@@ -4381,9 +4880,11 @@ class Plotter:
                          color="black", linewidth=1.3, ax=ax_ratio)
 
             # Fixed y-axis for the S/sqrt(S+B) pad -- constant across every MAT
-            # plot so the significance is comparable by eye between observables.
-            ax_ratio.set_ylim(0.0, 0.5)
-            ax_ratio.set_ylabel(r"$S/\sqrt{S+B}$", fontsize=12, labelpad=2)
+            # plot so the significance is comparable by eye between observables
+            # (per-spec `sig_ymax` override for the composite plots).
+            ax_ratio.set_ylim(0.0, cfg.get("sig_ymax") or 0.5)
+            ax_ratio.set_ylabel(r"$S/\sqrt{S+B}$", fontsize=_lp_fs(12),
+                                labelpad=2)
 
             if cfg.get("truth_only"):
                 # gen-truth variable -- either the branch is unfilled (-1) for
@@ -4403,10 +4904,14 @@ class Plotter:
             else:
               # quadrature combination of the per-bin values drawn above
               _z_quad = float(np.sqrt(np.nansum(metric[valid] ** 2)))
-              ax_ratio.text(0.055, 0.90,
-                            rf"$\sqrt{{\sum_i S_i^2/(S_i+B_i)}} = {_z_quad:.3f}$"
-                            "\n" r"($S$: all $W\!\to\!cb$ (merged, $b'$-mrg, $t\!\to\!(bbc)$);   $B$: rest)",
-                            transform=ax_ratio.transAxes, fontsize=9.5,
+              # composite plots fill the pad's top band with grey block labels
+              # -> drop the quad-sum annotation into the low-curve mid-body
+              # (2026-09-06, user).
+              _qx, _qy, _qfs = ((0.42, 0.80, 8.0) if cfg.get("block_labels")
+                                else (0.055, 0.90, 9.5))
+              ax_ratio.text(_qx, _qy,
+                            rf"$\sqrt{{\sum_i S_i^2/(S_i+B_i)}} = {_z_quad:.3f}$",
+                            transform=ax_ratio.transAxes, fontsize=_qfs,
                             va="top", ha="left", linespacing=1.6)
 
               # 1-bin optimisation (Root_plot.py optimize_n_bins(1)): the
@@ -4439,11 +4944,15 @@ class Plotter:
                   for _x in (_x_lo, _x_hi):
                       ax_ratio.axvline(_x, ymin=0.0, ymax=0.42, color="magenta",
                                        linewidth=1.6, zorder=5)
-                  ax_ratio.text(0.94, 0.88,
+                  # block-label plots: top band is taken -> magenta opt readout
+                  # drops to the low-curve right side (2026-09-06, user).
+                  _my1, _my2 = ((0.66, 0.50) if cfg.get("block_labels")
+                                else (0.88, 0.72))
+                  ax_ratio.text(0.94, _my1,
                                 rf"$S/\sqrt{{S+B}}={_sig_opt:.3f}$ (+{_gain:.0f}%)",
                                 transform=ax_ratio.transAxes, fontsize=9.0,
                                 va="top", ha="right", color="magenta")
-                  ax_ratio.text(0.94, 0.72,
+                  ax_ratio.text(0.94, _my2,
                                 rf"$\varepsilon_S={_eff_s*100:.0f}\%$" "\n"
                                 rf"$1-\varepsilon_B={_rej_b*100:.1f}\%$",
                                 transform=ax_ratio.transAxes, fontsize=9.0,
@@ -4454,12 +4963,13 @@ class Plotter:
                         f"{_gain:+.0f}%)  effS={_eff_s*100:.1f}%  "
                         f"rej(1-effB)={_rej_b*100:.2f}%")
 
-        ax_ratio.set_xlabel(cfg.get("xlabel", cfg.get("var", "")), labelpad=1)
+        ax_ratio.set_xlabel(cfg.get("xlabel", cfg.get("var", "")), labelpad=1,
+                            **({"fontsize": _lp_fs(11)} if _lp2x else {}))
         # force round 1/2/5-style ticks (0.01, 0.02, 0.05, 0.10 ...) so the
         # labels stay 2-decimal and short -- no 0.015 / 0.045.
         ax_ratio.yaxis.set_major_locator(
             plt.MaxNLocator(nbins=4, steps=[1, 2, 5, 10], prune="both"))
-        ax_ratio.tick_params(labelsize=10)
+        ax_ratio.tick_params(labelsize=_lp_fs(10))
 
         ax.set_ylabel("Normalized to unity" if normalize else
                       "Events / bin  (lumi-weighted)")
@@ -4488,7 +4998,7 @@ class Plotter:
                 # (2026-09-04, user).
                 # top: 100x the tallest drawn bin (incl. the scaled signal) --
                 # 2 clear decades of headroom for the in-axes legends.
-                ax.set_ylim(0.1 if signal_only else 1.0, 100.0 * _pos.max())
+                ax.set_ylim(0.1 if _compo else 1.0, 100.0 * _pos.max())
         else:
             _ymax = max((float(np.max(h)) for h in _all_h
                          if h is not None and len(h)), default=1.0)
@@ -4549,10 +5059,11 @@ class Plotter:
         # group headers: "Signal" once (over the left legend), "BKG" once
         # (centred over the middle+right pair; only if any bkg line is drawn).
         # Each carries the total expected (unscaled) event yield of its group.
-        ax.text(_hdr_x0, _hdr_y, f"Signal  {_sig_tot:.1f}{_sig_scale_txt}",
-                transform=ax.transAxes,
-                ha="left", va="bottom", fontsize=_hdr_fs, fontweight="normal",
-                color=_c_sig_hdr, clip_on=False)
+        if not bkg_only:
+            ax.text(_hdr_x0, _hdr_y, f"Signal  {_sig_tot:.1f}{_sig_scale_txt}",
+                    transform=ax.transAxes,
+                    ha="left", va="bottom", fontsize=_hdr_fs, fontweight="normal",
+                    color=_c_sig_hdr, clip_on=False)
         if _legs[1] is not None or _legs[2] is not None:
             ax.text(_hdr_x1, _hdr_y, f"BKG  {_bkg_tot:.1f}", transform=ax.transAxes,
                     ha="center", va="bottom", fontsize=_hdr_fs,
@@ -4565,6 +5076,8 @@ class Plotter:
                       "JB": "jb-Region"}.get(_sel, _sel)
         if signal_only:
             _sel_label += " (signal only)"
+        elif bkg_only:
+            _sel_label += " (bkg only)"
         # "CMS Simulation" + lumi via mplhep (no supplementary text) ...
         hep.cms.label(
             "",
@@ -4589,19 +5102,59 @@ class Plotter:
         # optional categorical x-tick labels (e.g. the sdwin_tag_nj2 4-bin
         # in/out plot).  sharex -> set positions once; label the bottom pad.
         _xticks = cfg.get("xticks")
+        _xrot, _xfs = 0, 9.5
         if _xticks is not None:
             ax.set_xticks(_xticks)
             _xtl = cfg.get("xticklabels")
             if _xtl is not None:
-                # many narrow categories -> labels FULLY VERTICAL, centred
-                # directly under their bin (2026-09-04, user).
-                if len(_xtl) > 8:
-                    ax_ratio.set_xticklabels(
-                        _xtl, fontsize=10.5, rotation=90,
-                        ha="center", va="top")
-                else:
-                    ax_ratio.set_xticklabels(
-                        _xtl, fontsize=9.5, ha="center", va="top")
+                # spec "xtick_rotation" forces the rotation (e.g. the
+                # composite m(J)-by-j* plot: real mass numbers, horizontal
+                # -- 2026-09-06, user); default: many narrow categories ->
+                # labels FULLY VERTICAL, centred directly under their bin
+                # (2026-09-04, user).
+                _fr = cfg.get("xtick_rotation")
+                _xrot = _fr if _fr is not None else (90 if len(_xtl) > 8 else 0)
+                _xfs = _lp_fs(10.5 if _xrot == 90 else 9.5)
+                ax_ratio.set_xticklabels(
+                    _xtl, fontsize=_xfs, rotation=_xrot,
+                    ha="center", va="top")
+
+        # Optional dashed vertical separators between the sub-blocks of a
+        # composite x-axis (spec "vlines" key, data-coord positions) --
+        # SHORT tick-like marks confined to the bottom quarter of each pad
+        # (ymin/ymax in axes-fraction), so they read as sub-range dividers
+        # without cutting across the histogram lines/legends above
+        # (2026-09-06, user).
+        _vlines = cfg.get("vlines")
+        if _vlines:
+            for _vx in _vlines:
+                ax.axvline(_vx, ymin=0.0, ymax=0.25, color="0.35",
+                           linestyle=(0, (4, 3)), linewidth=1.1, zorder=1)
+                ax_ratio.axvline(_vx, ymin=0.0, ymax=0.25, color="0.35",
+                                 linestyle=(0, (4, 3)), linewidth=1.1, zorder=1)
+
+        # Optional per-block condition labels (spec "block_labels" key:
+        # [(x_data, text), ...]) -- spells out the j* condition defining
+        # each block of bins, annotated in the bottom quarter of the ratio
+        # panel (normally empty space, next to the short vline separators
+        # above -- 2026-09-06, user).
+        # each entry is (x_data, text) or (x_data, text, y_axesfrac); small
+        # grey font, placed in the upper band of the pad so they clear the
+        # S/sqrt(S+B) step curve.  Per-entry y lets crowded / tall-curve
+        # blocks dodge the annotations individually (2026-09-06, user).
+        _blabels = cfg.get("block_labels")
+        if _blabels:
+            for _i, _bl in enumerate(_blabels):
+                _bx, _btxt = _bl[0], _bl[1]
+                _by = _bl[2] if len(_bl) > 2 else (0.60 if _i % 2 == 0 else 0.82)
+                # block labels are a crowded 7-across row -> only a modest
+                # bump even when the rest of the pad text is doubled
+                # (2026-09-07, user).
+                ax_ratio.text(_bx, _by, _btxt,
+                              transform=ax_ratio.get_xaxis_transform(),
+                              ha="center", va="center",
+                              fontsize=(9.0 if _lp2x else 7.0),
+                              color="0.20", clip_on=False)
 
         # Optional explanatory caption (spec "caption" key): a small grey text
         # block under the lower pad.  Used by the composition / categorical
@@ -4610,10 +5163,10 @@ class Plotter:
         _cap = cfg.get("caption")
         _cap_nl = _cap.count("\n") + 1 if _cap else 0
         # categorical x-labels need a deeper bottom margin: a lot for the
-        # >8-bin vertical case, a little for the horizontal 3-8-bin case.
+        # vertical (90 deg) case, a little for the horizontal case.
         _rot_pad = 0.0
         if _xticks is not None and cfg.get("xticklabels"):
-            _rot_pad = 0.17 if len(cfg["xticklabels"]) > 8 else 0.055
+            _rot_pad = 0.17 if _xrot == 90 else 0.055
         fig.subplots_adjust(left=0.125, right=0.965, top=0.91,
                             bottom=(0.085 + _rot_pad + 0.033 * _cap_nl))
         if _cap:
@@ -4624,7 +5177,9 @@ class Plotter:
         # region) so the two plot sets never clobber each other; "_norm" for
         # NORM-mode so it doesn't clobber the ABS-mode PNG of the same observable.
         _sel_suffix = {"PRE": "_PRE", "SR": "_SR", "JB": "_JB"}.get(_sel, "")
-        _suffix = _sel_suffix + ("_sig" if signal_only else "") + ("_norm" if normalize else "")
+        _suffix = (_sel_suffix + ("_sig" if signal_only else "")
+                   + ("_bkg" if bkg_only else "")
+                   + ("_norm" if normalize else ""))
         outbase = os.path.join(self.cfg.figure_path, name + _suffix)
         self._save_and_show(fig, outbase, tag=cfg.get("_progress", "MAT"))
 
@@ -5507,10 +6062,21 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     PI = float(np.pi)
 
     def m(name, var, lo, hi, nb, xlabel, logy, truth_only=False, logx=False,
-          xticklabels=None, caption=None):
+          xticklabels=None, caption=None, vlines=None, block_labels=None,
+          xticks=None, xtick_rotation=None, hide_total_signal=False,
+          sig_ymax=None, sigonly_ymax=None):
         # logx: log-spaced bin edges + log x-axis (lo must be > 0).
-        # xticklabels: list of nb strings -> categorical x-axis (ticks placed
-        # at the bin centres, bottom pad labelled with these).
+        # xticklabels: list of strings -> categorical x-axis.  Ticks default
+        # to the bin centres (one label per bin); pass `xticks` (data-coord
+        # positions) to override with a sparser/custom set instead (e.g. a
+        # few real values per block of a composite axis, 2026-09-06, user).
+        # xtick_rotation: force the tick-label rotation (deg); default is
+        # the length-based auto-choice in draw_matching (0 if <=8 labels,
+        # else 90).
+        # vlines: data-coord x positions -> dashed vertical separators drawn
+        #   on both panels (composite/multi-block x-axes, 2026-09-06, user).
+        # block_labels: [(x_data, text), ...] -> the defining condition of
+        #   each block, annotated in the ratio panel.
         _bins = (np.logspace(np.log10(lo), np.log10(hi), nb + 1)
                  if logx else np.linspace(lo, hi, nb + 1))
         _ctr = 0.5 * (_bins[1:] + _bins[:-1])
@@ -5523,9 +6089,13 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
             "logx": logx,
             "xlabel": xlabel,
             "xlim": (lo, hi),
-            "xticks": (list(_ctr) if xticklabels is not None else None),
+            "xticks": (xticks if xticks is not None
+                       else (list(_ctr) if xticklabels is not None else None)),
             "xticklabels": xticklabels,
+            "xtick_rotation": xtick_rotation,
             "caption": caption,
+            "vlines": vlines,
+            "block_labels": block_labels,
             "cut": CUT,
             "logy": logy,
             # gen-level jet-content: the branch is only filled for W/top-matched
@@ -5535,6 +6105,14 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
             "ylim_bottom": 5e-4,
             "ylim_top": 4.0,
             "ratio_ylim": (0.0, 4.0),
+            # hide_total_signal: drop the dotted "Total signal" overlay.
+            # sig_ymax / sigonly_ymax: override the lower-pad y-max in the
+            # ABS significance / MAT-SIGNAL (cb)/all-signal panels resp.
+            # (2026-09-06, user -- composite plot needs headroom for the
+            # grey block labels).
+            "hide_total_signal": hide_total_signal,
+            "sig_ymax": sig_ymax,
+            "sigonly_ymax": sigonly_ymax,
         }
 
     # =====================================================================
@@ -5598,6 +6176,19 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         #   ttreco_mt_xself  -- alt:     keep j* if  dR*pT(J+j*)/2 < 2*m(J+j*)
         ("ttreco_mt",           "mt",                 -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.35\cdot172$, else $m(J)$)", True),
         ("ttreco_mt_xself",     "mt_xself",           -20.0, 300.0, 32, r"$m_{t}$ [GeV]   ($\Delta R\,p_T(J{+}j^{*})/2<1.10\,m(J{+}j^{*})$, else $m(J)$)", True),
+        # ---- 2-top chi2 reconstruction -- OFF (2026-09-07, user) -----------
+        # The chi2 reco (m_W pz-solve + per-AK4 j*/b_lep combinatorics) is
+        # disabled by default: set WCB_CHI2_RECO=1 in build_derived_array and
+        # un-comment these 7 specs.  mt_chi2 currently falls back to mSD(J).
+        # ("ttreco_mt_chi2",      "mt_chi2",            -20.0, 400.0, 42, r"$m_{t}$ [GeV]  (2-top $\chi^2$ $j^{*}$; $m(J)$ if none)", True),
+        # ("ttreco_mt_chi2_q",    "mt_chi2_q",          -20.0, 400.0, 42, r"$m_{t}$ [GeV]  (2-top $\chi^2$, gated $\sqrt{\chi^2}<60$; else $m(J)$)", True),
+        # ("ttreco_dm_chi2",      "dm_chi2",            -10.0, 300.0, 62, r"$\sqrt{\chi^2_{2\mathrm{top}}}$ [GeV]  ($\sum|m_{t}-172.5|^2$; $-1$ = no $j^{*}$)", True),
+        # ("ttreco_mtlep_chi2",   "mtlep_chi2",         -20.0, 500.0, 52, r"$m(t_{\ell})=m(\nu{+}b_{\ell})$ [GeV]  (2-top $\chi^2$; $-1$ = none)", True),
+        # ("ttreco_mlv_solved",   "mlv_solved",          0.0, 260.0, 52, r"$m(\ell,\nu)$ [GeV]  ($m_W$-constrained $p_z^\nu$, smaller-$|p_z|$ root)", True),
+        # ("ttreco_chi2_jstar_tag", "jstar_chi2_tag",   -1.5, 2.5, 4, r"ParticleNetAK4 tag of the 2-top $\chi^2$ $j^{*}$", False, False, False,
+        #  [r"w/o $j^{*}$", r"$q$, $\neg b_L\neg c_L$", r"$c_L$", r"$b_L$"]),
+        # ("ttreco_nu_disc_neg",  "nu_disc_neg",         -1.5, 1.5, 3, r"$\nu$ $p_z$ discriminant $<0$  ($m_W$ solution has no real root)", False, False, False,
+        #  [r"n/a", r"real root", r"$\Delta<0$ (real part used)"]),
         ("ttreco_dRpt_jstar",   "dRpt_jstar",         -10.0, 600.0, 61, r"$\Delta R(J,j^{*})\,p_T(J{+}j^{*})/2$ [GeV]   ($\approx 172$ for $t^{2}$ \& $W$;  $-1$ = no $j^{*}$)", True),
         ("ttreco_pt_jstar",     "pt_jstar",             0.0, 800.0, 40, r"$p_T(J{+}j^{*})$ [GeV]   (reconstructed top $p_T$)", True),
         # Dphi(t_lep, t_had): t_had = J+j* (same object as m_t), t_lep =
@@ -5641,22 +6232,51 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # superseded by jstar_flav
         ("ttreco_jstar_flav",      "jstar_flav",             -1.5, 2.5, 4, r"ParticleNetAK4 tag of $j^{*}$ (AK4 used by $m_t$)", False, False, False,
          [r"w/o $j^{*}$", r"non-$b/c_L$-tagged", r"$c_L$", r"$b_L$"]),
-        # 21-bin composite (2026-09-06, user): m(J) in [60,110) GeV, split
-        # into 4 blocks of 5 (10-GeV-wide) bins by j* flavour -- b_L / c_L /
-        # light / w/o-j* -- then ONE extra bin catching every event with
-        # m(J) outside [60,110), regardless of j* category.
-        ("ttreco_mJ_jstar_cat21",  "mJ_jstar_cat21",          0.0, 210.0, 21,
-         r"$m(J)$ [GeV] by $j^{*}$ flavour  (composite -- see caption)",
+        # 53-bin composite (2026-09-06, user): m(J) by j* case.
+        #   LOW  m(J) in [50,130) -- 4 blocks x 8 (10-GeV) bins by the j*
+        #        ParticleNetAK4 flavour: b_L / (q, not b_L/c_L) / c_L / N/A.
+        #   HIGH m(J) in [130,230) -- 2 blocks x 10 (10-GeV) bins split ONLY
+        #        by whether a j* candidate exists (any flavour), using the
+        #        merge-window-free jstar_flav_nowin: j* N/A / with j*.
+        #   bin 53 : residual -- m(J) > 0 but m(J) < 50 or m(J) >= 230.
+        ("ttreco_mJ_jstar_cat",    "mJ_jstar_cat",            0.0, 530.0, 53,
+         r"$m(J)$ per $j^{*}$ case [GeV]",
          False, False, False,
-         ([""] * 2 + [r"$j^{*}=b_L$"] + [""] * 2
-          + [""] * 2 + [r"$j^{*}=c_L$"] + [""] * 2
-          + [""] * 2 + [r"$j^{*}$ light"] + [""] * 2
-          + [""] * 2 + [r"w/o $j^{*}$"] + [""] * 2
-          + [r"$m(J)\notin[60,110)$"]),
-         ("$m(J)$, 10 GeV bins, 60-110 GeV: bins 1-5 $j^{*}=b_L$, 6-10 "
-          "$j^{*}=c_L$, 11-15 $j^{*}$ light/untag., 16-20 no $j^{*}$ found "
-          "(all within the [40,130] merge window); bin 21 = every event "
-          "with $m(J)$ outside [60,110), any category.")),
+         # x-axis: sparse, NON-rotated real-mass ticks per block -- 70/90/110
+         # for the 4 low blocks (m(J) 50-130), 150/170/190/210 for the 2
+         # high blocks (m(J) 130-230) (2026-09-06, user); see the matching
+         # `xticks` composite positions.
+         (["70", "90", "110"] * 4
+          + ["150", "170", "190", "210"] * 2
+          + ["resid."]),
+         None,   # caption removed (2026-09-06, user) -- see block_labels
+         # dashed separators between the 6 blocks and before the residual bin.
+         [80.0, 160.0, 240.0, 320.0, 420.0, 520.0],
+         # per-block defining condition; (x, text, y_axesfrac) -- all on ONE
+         # row at the top of the ratio pad (2026-09-06, user).
+         # 4th block was a bare "N/A" -- unclear (2026-09-07, user): it is the
+         # low-m(J) sub-sample where NO AK4 j* was found, so m_t falls back to
+         # m(J).  Blocks 5/6 are the high-m(J) ("merged" top) regime where
+         # m_t == m(J) by construction, split by whether a j* AK4 exists.
+         # y staggered (0.93 / 0.80) so wide neighbouring labels don't collide.
+         [(40.0,  r"$j^{*}{=}b_L$",                     0.93),
+          (120.0, r"$j^{*}$: 0$b_L$,0$c_L$",            0.80),
+          (200.0, r"$j^{*}{=}c_L$",                     0.93),
+          (280.0, r"no $j^{*}$ ($m_t{=}m_J$)",          0.80),
+          (370.0, r"merged, no $j^{*}$",                0.93),
+          (470.0, r"merged, $j^{*}$ found",             0.80),
+          (525.0, r"resid.",                            0.93)],
+         # custom tick positions -- composite x = 80*blk + (m(J)-50) for the
+         # 4 low blocks (base m(J)=50); 320 + 100*blk + (m(J)-130) for the 2
+         # high blocks (base m(J)=130); 525 = the residual bin centre.
+         [20.0, 40.0, 60.0, 100.0, 120.0, 140.0, 180.0, 200.0, 220.0,
+          260.0, 280.0, 300.0, 340.0, 360.0, 380.0, 400.0,
+          440.0, 460.0, 480.0, 500.0, 525.0],
+         0,          # xtick_rotation: horizontal
+         # 2026-09-06 (user): positional -> hide_total_signal, sig_ymax,
+         # sigonly_ymax.  Drop the dotted "Total signal" overlay; lower-pad
+         # y-max 0.65 for MAT (signal+bkg), 1.2 for MAT-SIGNAL.
+         True, 0.65, 1.2),
         # ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"ParticleNetAK4 tag of best-$m$ AK4 (bmk1)", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # commented out on request 2026-09-04
         # ("ttreco_bvuds_near",      "bvuds_near",              0.0, 1.0, 50, r"$b/(b{+}uds)$, nearest AK4", False),  # commented out on request
@@ -5719,26 +6339,58 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ---- leading-AK8 GloParT raw scores --------------------------------
         # 9 live GloParT node scores of J (gpt_bqq is a dead node -> stays
         # off).  Re-enabled 2026-09-03 on request.
-        ("gpt_bc",                 "ak8_gpt_bc_0",            0.0, 1.0, 50, r"GloParT $bc$",                  True),
-        ("gpt_bb",                 "ak8_gpt_bb_0",            0.0, 1.0, 50, r"GloParT $bb$",                  True),
-        ("gpt_cc",                 "ak8_gpt_cc_0",          1e-4, 1.0, 50, r"GloParT $cc$",                  True, False, True),
-        ("gpt_cs",                 "ak8_gpt_cs_0",          1e-4, 1.0, 50, r"GloParT $cs$",                  True, False, True),
-        ("gpt_bs",                 "ak8_gpt_bs_0",          1e-4, 1.0, 50, r"GloParT $bs$",                  True, False, True),
-        ("gpt_qq",                 "ak8_gpt_qq_0",          1e-6, 1.0, 50, r"GloParT $qq$",                  True, False, True),
-        ("gpt_qcd",                "ak8_gpt_qcd_0",         1e-3, 1.0, 50, r"GloParT QCD",                   True, False, True),
-        ("gpt_topbw",              "ak8_gpt_topbw_0",       1e-4, 1.0, 50, r"GloParT top score ($b{+}W$ in jet)", True, False, True),
-        ("gpt_topw",               "ak8_gpt_topw_0",        1e-4, 1.0, 50, r"GloParT top-$W$ score ($b$ outside jet)", True, False, True),
+        # ENTIRE BLOCK commented out on request 2026-09-06 (simplicity) --
+        # derived vars + cache entries + _attach_runtime_fields all stay;
+        # just no MAT plots for the raw GloParT node scores.
+        # ("gpt_bc",                 "ak8_gpt_bc_0",            0.0, 1.0, 50, r"GloParT $bc$",                  True),
+        # ("gpt_bb",                 "ak8_gpt_bb_0",            0.0, 1.0, 50, r"GloParT $bb$",                  True),
+        # ("gpt_cc",                 "ak8_gpt_cc_0",          1e-4, 1.0, 50, r"GloParT $cc$",                  True, False, True),
+        # ("gpt_cs",                 "ak8_gpt_cs_0",          1e-4, 1.0, 50, r"GloParT $cs$",                  True, False, True),
+        # ("gpt_bs",                 "ak8_gpt_bs_0",          1e-4, 1.0, 50, r"GloParT $bs$",                  True, False, True),
+        # ("gpt_qq",                 "ak8_gpt_qq_0",          1e-6, 1.0, 50, r"GloParT $qq$",                  True, False, True),
+        # ("gpt_qcd",                "ak8_gpt_qcd_0",         1e-3, 1.0, 50, r"GloParT QCD",                   True, False, True),
+        # ("gpt_topbw",              "ak8_gpt_topbw_0",       1e-4, 1.0, 50, r"GloParT top score ($b{+}W$ in jet)", True, False, True),
+        # ("gpt_topw",               "ak8_gpt_topw_0",        1e-4, 1.0, 50, r"GloParT top-$W$ score ($b$ outside jet)", True, False, True),
         # ("gpt_bqq",              "ak8_gpt_bqq_0",         1e-4, 1.0, 50, r"GloParT $bqq'$ score (3-prong $t\to bqq'$)", True, False, True),  # DROPPED 2026-09-01: ak8_gpt_bqq is identically 0.0 in every jet of every sample (dead GloParT node -- 3-prong hadronic top lives in gpt_topbw).  Branch still loaded + kept in the ratio denominators (contributes 0) in case a future ntuple fills it.
         # finer GloParT sub-nodes from the 2final ntuples (2026-09-04, user) --
         # ak8_gpt_<node>_0 for every node in _GPT_EXTRA_NODES.  log-x 1e-4..1.
         # ONLY in MAT-SIGNAL (1 sample) or with WCB_MAT_GPT_EXTRA=1 -- loading
         # all 24 extra columns for the 17-sample MAT run OOMs the cgroup.
-        *([("gpt_" + _n, "ak8_gpt_%s_0" % _n, 1e-4, 1.0, 50,
-            r"GloParT $%s$ score" % _n.replace("topbw", "t\\to bW,").replace(
-                "topw", "t\\to W,"), True, False, True)
-           for _n in _GPT_EXTRA_NODES]
-          if (signal_only or os.environ.get("WCB_MAT_GPT_EXTRA"))
-          else []),
+        # *([("gpt_" + _n, "ak8_gpt_%s_0" % _n, 1e-4, 1.0, 50,
+        #     _GPT_EXTRA_LABELS.get(_n, r"GloParT $%s$ score" % _n.replace(
+        #         "topbw", "t\\to bW,").replace("topw", "t\\to W,")),
+        #     True, False, True)
+        #    for _n in _GPT_EXTRA_NODES]
+        #   if (signal_only or os.environ.get("WCB_MAT_GPT_EXTRA"))
+        #   else []),
+
+        # ---- raw GloParT node scores of J -- explicit set (2026-09-07, user)
+        # notation = the plot's own: V(..) = merged 2-prong resonance;
+        # t^2(..) = partly-merged top (b' + one W prong); t^3(..) = fully-
+        # merged top (b' + both W prongs).  cq == the cs node, bq == bs.
+        # If a full 17-sample MAT run gets memory-tight, iterate these with
+        # env WCB_MAT_SPECS=gpt_ (or gate this block like _GPT_EXTRA_NODES).
+        ("gpt_bc",       "ak8_gpt_bc_0",       0.0,  1.0, 50, r"GloParT $V(cb)$ score", True),
+        ("gpt_bb",       "ak8_gpt_bb_0",       0.0,  1.0, 50, r"GloParT $V(bb)$ score", True),
+        ("gpt_cc",       "ak8_gpt_cc_0",      1e-4, 1.0, 50, r"GloParT $V(cc)$ score", True, False, True),
+        ("gpt_cs",       "ak8_gpt_cs_0",      1e-4, 1.0, 50, r"GloParT $V(cs)$ score  ($\equiv$ cq)", True, False, True),
+        ("gpt_bs",       "ak8_gpt_bs_0",      1e-4, 1.0, 50, r"GloParT $V(bs)$ score  ($\equiv$ bq)", True, False, True),
+        ("gpt_qq",       "ak8_gpt_qq_0",      1e-6, 1.0, 50, r"GloParT $V(qq)$ score", True, False, True),
+        # partly-merged top (b' + one W prong): topbwc / topbwq
+        ("gpt_t2_cq",    "ak8_gpt_topbwc_0",  1e-4, 1.0, 50, r"GloParT $t^{2}(b'c)$ score  (partial merge, $W\to cs$)", True, False, True),
+        ("gpt_t2_bq",    "ak8_gpt_topbwq_0",  1e-4, 1.0, 50, r"GloParT $t^{2}(b'q)$ score  (partial merge, $W\to qq'$)", True, False, True),
+        # fully-merged hadronic top (b' + both W prongs): TopbWcs / TopbWqq
+        ("gpt_t3_bcq",   "ak8_gpt_topbwcs_0", 1e-4, 1.0, 50, r"GloParT $t^{3}(b'cs)$ score  (full merge, $W\to cs$)", True, False, True),
+        ("gpt_t3_bqq",   "ak8_gpt_topbwqq_0", 1e-4, 1.0, 50, r"GloParT $t^{3}(b'qq')$ score  (full merge, $W\to qq'$)", True, False, True),
+        # QCD: sum of the 5 sub-nodes + each sub-node
+        ("gpt_qcd_sum5", "gpt_qcd_sum5",      1e-3, 1.0, 50, r"GloParT QCD score  ($\sum$ 5 nodes: $b\bar b,b,c\bar c,c,\mathrm{others}$)", True, False, True),
+        ("gpt_qcd_bb",   "ak8_gpt_qcdbb_0",   1e-4, 1.0, 50, r"GloParT QCD$(b\bar b)$ score", True, False, True),
+        ("gpt_qcd_cc",   "ak8_gpt_qcdcc_0",   1e-4, 1.0, 50, r"GloParT QCD$(c\bar c)$ score", True, False, True),
+        ("gpt_qcd_b",    "ak8_gpt_qcdb_0",    1e-4, 1.0, 50, r"GloParT QCD$(b)$ score", True, False, True),
+        ("gpt_qcd_c",    "ak8_gpt_qcdc_0",    1e-4, 1.0, 50, r"GloParT QCD$(c)$ score", True, False, True),
+        ("gpt_qcd_light","ak8_gpt_qcdothers_0",1e-4,1.0, 50, r"GloParT QCD$_{\mathrm{others}}$ score  (raw node: QCD jet, no $b/c$)", True, False, True),
+        # t -> b' W -> b', tau, nu  (b' in jet), summed over tau_h/e/mu
+        ("gpt_t_btaunu", "gpt_t_btaunu",      1e-4, 1.0, 50, r"GloParT $t\to b'\tau\nu$ score  ($\sum$: $\tau_h,\tau_e,\tau_\mu$)", True, False, True),
 
         # ---- GloParT discriminant ratios ----------------------------------
         # ENTIRE BLOCK commented out on request 2026-09-02 (derived vars +
@@ -5752,6 +6404,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("gpt_bc_vs_ccbb",         "gpt_bc_vs_ccbb",          0.0, 1.0, 50, r"$bc/(bc+cc+bb)$",               True),
         # ("gpt_hfmix_vs_2prong",    "gpt_hfmix_vs_2prong",     0.0, 1.0, 50, r"$(bc{+}bs{+}cs)/(bc{+}bs{+}cs{+}cc{+}bb{+}qq)$", True),
         # ("gpt_bc_vs_hf2prong",     "gpt_bc_vs_hf2prong",      0.0, 1.0, 50, r"$bc/(bc{+}bs{+}cs{+}cc{+}bb)$", True),
+        ("gpt_cc_vs_bc",           "gpt_cc_vs_bc",            0.0, 1.0, 50, r"GloParT $cc/(cc+cb)$", False),
         # ("gpt_bc_vs_bb",           "gpt_bc_vs_bb",            0.0, 1.0, 50, r"$bc/(bc+bb)$",                  False),  # commented out on request
         # ("gpt_bc_vs_qq",           "gpt_bc_vs_qq",            0.0, 1.0, 50, r"$bc/(bc+qq)$",                  True),
         # ("gpt_cs_vs_qq",         "gpt_cs_vs_qq",            0.0, 1.0, 50, r"$cs/(cs+qq)$",                  False),  # dropped 2026-08-31
@@ -5773,18 +6426,22 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("ak8_phi_0",              "ak8_phi_0",             -PI,   PI,    50, r"$J$ $\phi$",          False),
         # SD masses: 25 bins over 0-250 GeV -> 10 GeV bins (rebinned x2 from 50).
         ("ak8_sdmass_0",           "ak8_sdmass_0",            0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  (highest-$bc$-score AK8)", False),
-        ("ak8_sdmass_maxmass_0",   "ak8_sdmass_maxmass_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{1})$ [GeV]  (highest-$m_{\mathrm{SD}}$ AK8)", False),
+        # m(J_b) / m(J^1) / m(J^2) re-enabled 2026-09-07 (user).  J_b =
+        # 2nd-highest $bc$-score AK8;  J^1 / J^2 = highest / 2nd-highest
+        # $m_{\mathrm{SD}}$ AK8.  Raw cached columns (nth_by) -- the sub-
+        # leading slots are SENTINEL (dropped) for n_ak8 < 2.
+        ("ak8_sdmass_sub_bc_0",    "ak8_sdmass_sub_bc_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J_{b})$ [GeV]  (2nd-highest-$bc$-score AK8)", False),
+        ("ak8_sdmass_maxmass_0",   "ak8_sdmass_maxmass_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J^{1})$ [GeV]  (highest-$m_{\mathrm{SD}}$ AK8)", False),
+        ("ak8_sdmass_sub_mass_0",  "ak8_sdmass_sub_mass_0",   0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J^{2})$ [GeV]  (2nd-highest-$m_{\mathrm{SD}}$ AK8)", False),
         # ("ak8_sdmass_lead_pt_0",   "ak8_sdmass_lead_pt_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{1})$ [GeV]  (highest-$p_T$ AK8)", False),  # commented out on request 2026-09-04
         # ("ak8_sdmass_sub_pt_0",    "ak8_sdmass_sub_pt_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{2})$ [GeV]  (sub-leading $p_T$ AK8)", False),  # commented out on request 2026-09-04
-        ("ak8_sdmass_sub_mass_0",  "ak8_sdmass_sub_mass_0",   0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{2})$ [GeV]  (2nd-highest-$m_{\mathrm{SD}}$ AK8)", False),
-        ("ak8_sdmass_sub_bc_0",    "ak8_sdmass_sub_bc_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{b})$ [GeV]  (2nd-highest-$bc$-score AK8)", False),
         # same four SD masses but ONLY for events with >= 2 AK8 jets (value is
         # SENTINEL -> dropped when n_ak8 < 2).  Fields attached at load time by
         # DataManager._attach_runtime_fields, NOT in the parquet cache.
         # ("ak8_sdmass_ja_nj2",      "ak8_sdmass_ja_nj2",       0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; highest-$bc$-score)", False),  # commented out on request 2026-09-04
         # ("ak8_sdmass_jb_nj2",      "ak8_sdmass_jb_nj2",       0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{b})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; 2nd-highest-$bc$-score)", False),  # commented out on request 2026-09-04
         # ("ak8_sdmass_jsup1_nj2",   "ak8_sdmass_jsup1_nj2",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{1})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; highest-$m_{\mathrm{SD}}$)", False),  # commented out on request 2026-09-04
-        ("ak8_sdmass_jsup2_nj2",   "ak8_sdmass_jsup2_nj2",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{2})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; 2nd-highest-$m_{\mathrm{SD}}$)", False),
+        # ("ak8_sdmass_jsup2_nj2",   "ak8_sdmass_jsup2_nj2",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j^{2})$ [GeV]  ($N_{\mathrm{AK8}}\!\geq\!2$; 2nd-highest-$m_{\mathrm{SD}}$)", False),  # commented out on request 2026-09-06
         # 4-bin categorical: which (mSD(J), mSD(j_b)) quadrant of the W
         # window [65,105] GeV the event sits in.  Filled for every n_ak8>=2
         # event (all truth classes incl. signal), so the overlay shows where
@@ -5814,10 +6471,10 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         #   differences carry little separation on top of the Delta-R /
         #   Delta-eta pairs kept below, and phi itself is detector-frame flat.
         # Delta-eta / Delta-phi / Delta-R angular-separation vars -- all commented out on request:
-        ("dR_lep_ak8",             "dR_lep_ak8",              0.0, 5.0,   50, r"$\Delta R(\ell,\,J)$",        False),  # re-enabled: m_t=-1 study
+        # ("dR_lep_ak8",             "dR_lep_ak8",              0.0, 5.0,   50, r"$\Delta R(\ell,\,J)$",        False),  # commented out on request 2026-09-06 (still a _COMMON cut variable)
         # ("dphi_lep_ak8",           "dphi_lep_ak8",            0.0, PI,    40, r"$\Delta\phi(\ell,\,J)$",                  False),
         # ("dphi_w_ak8",             "dphi_w_ak8",              0.0, PI,    40, r"$\Delta\phi(W(\ell\nu),\,J)$   [$W$ = $\ell+p_T^{\mathrm{miss}}$]", True),
-        ("dR_w_ak8",               "dR_w_ak8",                0.0, 5.0,   50, r"$\Delta R(W(\ell\nu),\,J)$   [$W$ = $\ell+p_T^{\mathrm{miss}}$]", False),  # re-enabled: m_t=-1 study
+        # ("dR_w_ak8",               "dR_w_ak8",                0.0, 5.0,   50, r"$\Delta R(W(\ell\nu),\,J)$   [$W$ = $\ell+p_T^{\mathrm{miss}}$]", False),  # commented out on request 2026-09-06
         # ("deta_lep_ak8",           "deta_lep_ak8",            0.0, 5.0,   50, r"$\Delta\eta(\ell,\,J)$",      False),
         # ("dphi_met_ak8",           "dphi_met_ak8",            0.0, PI,    40, r"$\Delta\phi(p_T^{\mathrm{miss}},\,J)$",   False),
         # ("dphi_lep_met",           "dphi_lep_met",            0.0, PI,    40, r"$\Delta\phi(\ell,\,p_T^{\mathrm{miss}})$",  False),
@@ -5892,10 +6549,19 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("n_ctag",                 "n_ctag",                 -0.5, 8.5,     9, r"$N_{c^{L}}$  (# ParticleNetAK4 loose-$c$-tagged AK4)",   False),  # commented out on request
         # ("n_ctagM",                "n_ctagM",                -0.5, 8.5,     9, r"$N_{c^{M}}$  (# ParticleNetAK4 medium-$c$-tagged AK4)",  False),  # commented out on request
         # ("n_ctagT",                "n_ctagT",                -0.5, 8.5,     9, r"$N_{c^{T}}$  (# ParticleNetAK4 tight-$c$-tagged AK4)",   False),  # commented out on request
-        # ("met",                    "met",                     0.0, 400.0,  40, r"$p_T^{\mathrm{miss}}$ [GeV]", False),
-        # ("mTW",                    "mTW",                     0.0, 250.0,  50, r"$m_T^W$ [GeV]",             False),  # commented out on request
+        # ---- leptonic-side kinematics pack (2026-09-07, user) --------------
+        #   MET / dR(W,J) / pT(W_lep) / pT(t_lep) / pT(t_had) / mT(MET,l).
+        #   W_lep  = l + p_T^miss  (the ntuple v-vector: v_pt/eta/phi/mass).
+        #   t_lep  = W(lv) + b_l   (b_l = loose-b AK4 nearest W(lv) in dR;
+        #                           SENTINEL underflow when no seed).
+        #   t_had  = J + j*        (= pt_jstar, the exact system m_t uses).
+        ("met",                    "met",                     0.0, 400.0,  40, r"$p_T^{\mathrm{miss}}$ [GeV]", False),
+        ("dR_w_ak8",               "dR_w_ak8",                0.0, 5.0,    50, r"$\Delta R(W(\ell\nu),\,J)$   [$W(\ell\nu)=\ell{+}p_T^{\mathrm{miss}}$]", False),
+        ("pt_wlep",                "v_pt",                    0.0, 600.0,  50, r"$p_T(W_{\ell})=p_T(\ell{+}p_T^{\mathrm{miss}})$ [GeV]", False),
+        ("pt_tlep",                "toplep_pt",               0.0, 800.0,  40, r"$p_T(t_{\ell})$ [GeV]   [$t_{\ell}=W(\ell\nu){+}b_l$;  $-999$ = no $b_l$]", False),
+        ("pt_thad",                "pt_jstar",                0.0, 800.0,  40, r"$p_T(t_{had})=p_T(J{+}j^{*})$ [GeV]", False),
+        ("mt_metl",                "mTW",                     0.0, 250.0,  50, r"$m_T(p_T^{\mathrm{miss}},\,\ell)$ [GeV]", False),
         # ("w_mass",                 "w_mass",                  0.0, 400.0,  50, r"$m(\ell,\,p_T^{\mathrm{miss}})$, $p_z^{\nu}\!=\!0$ [GeV]", False),
-        # ("v_pt",                   "v_pt",                    0.0, 600.0,  50, r"$p_T(\ell + p_T^{\mathrm{miss}})$ [GeV]",  False),
         # v_mass dropped: the ntuple's v_{pt,eta,phi,mass} vector is literally
         # (lepton + (met_x, met_y, 0)), so v_mass is bit-identical to the
         # inline w_mass above (verified: corr 0.9999999, same percentiles).
@@ -6000,6 +6666,43 @@ _GPT_EXTRA_NODES = [
     "qcdbb", "qcdb", "qcdcc", "qcdc", "qcdothers", "ss", "tauhtauh",
 ]
 
+# Human-readable x-axis labels for every _GPT_EXTRA_NODES entry -- spells
+# out the full decay chain instead of the raw node name (2026-09-06, user:
+# "gpt_qcdc" -> "QCD-c-quark score"; "gpt_topbwtauhv" -> full
+# t->b'W->b',tau_h,nu chain).  tau_h/tau_e/tau_mu = the VISIBLE tau decay
+# product (hadronic / electron / muon); nu = the accompanying neutrino(s).
+# Any node NOT listed here would fall back to the raw "GloParT $name$ score"
+# (kept only as a safety net -- every current node has an explicit entry).
+_GPT_EXTRA_LABELS = {
+    # t -> b'W -> b' + visible W-decay products (b' = the top's b, in jet)
+    "topbwcs":    r"GloParT $t\to b'W\to b',c,s$ score",
+    "topbwqq":    r"GloParT $t\to b'W\to b',q,q'$ score",
+    "topbwc":     r"GloParT $t\to b'W\to b',c$ score",
+    "topbwq":     r"GloParT $t\to b'W\to b',q$ score",
+    "topbws":     r"GloParT $t\to b'W\to b',s$ score",
+    "topbwtauhv": r"GloParT $t\to b'W\to b',\tau_h,\nu$ score",
+    "topbwev":    r"GloParT $t\to b'W\to b',e,\nu$ score",
+    "topbwmv":    r"GloParT $t\to b'W\to b',\mu,\nu$ score",
+    "topbwtauev": r"GloParT $t\to b'W\to b',\tau_e,\nu$ score",
+    "topbwtaumv": r"GloParT $t\to b'W\to b',\tau_\mu,\nu$ score",
+    # t -> W (b' lost / merged elsewhere -- no b' in the visible jet)
+    "topwqq":     r"GloParT $t\to W\to q,q'$ score",
+    "topwcs":     r"GloParT $t\to W\to c,s$ score",
+    "topwtauhv":  r"GloParT $t\to W\to \tau_h,\nu$ score",
+    "topwev":     r"GloParT $t\to W\to e,\nu$ score",
+    "topwmv":     r"GloParT $t\to W\to \mu,\nu$ score",
+    "topwtauev":  r"GloParT $t\to W\to \tau_e,\nu$ score",
+    "topwtaumv":  r"GloParT $t\to W\to \tau_\mu,\nu$ score",
+    # QCD sub-flavour + the missing 2-prong "ss" + di-tau
+    "qcdbb":     r"QCD-$b\bar b$ score",
+    "qcdb":      r"QCD-b-quark score",
+    "qcdcc":     r"QCD-$c\bar c$ score",
+    "qcdc":      r"QCD-c-quark score",
+    "qcdothers": r"QCD-other score",
+    "ss":        r"$s\bar s$ score",
+    "tauhtauh":  r"$\tau_h\tau_h$ score",
+}
+
 
 def run_gpt_score_montage(figure_dir, suffix=""):
     """End-of-MAT-run summary panel of ALL raw GloParT score plots
@@ -6035,12 +6738,15 @@ def parse_args():
         nargs="?",
         default="ALL",
         type=str.upper,
-        choices=["ALL", "MAT", "MAT-SIGNAL"],
+        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG"],
         help="ALL (default): run the normal Data/MC batch plots. "
              "MAT: matching-truth overlay only (Wcb vs Cat_Top_bc vs Rest, "
              "with a ratio panel).  "
              "MAT-SIGNAL: same overlay but the SIGNAL sample only -- draws "
-             "just the 5 red W->cb lines (loads only ttbar-powheg, fast).",
+             "just the 5 red W->cb lines (loads only ttbar-powheg, fast).  "
+             "MAT-BKG: the mirror -- loads every sample EXCEPT ttbar-powheg, "
+             "draws just the background lines, lower pad = per-bin component "
+             "fraction (PNG suffix _bkg).",
     )
     # 2nd/3rd positional tokens for MAT: one picks the y-axis (ABS|NORM), the
     # other the selection (PRE|SR|JB).  Order-independent, both optional, e.g.
@@ -6065,6 +6771,41 @@ def parse_args():
     return args
 
 
+def stream_fill_histograms(manager, metas, specs, hist_maker,
+                           first_sample=None, report_acc=None, report_cut=None):
+    """Stream each sample once through EVERY spec with only one array resident
+    at a time -- peak RSS is a single sample, not all of them.
+
+    Returns ``[(hist_data, hist_var), ...]`` parallel to ``specs``.  When
+    ``report_acc`` is given, each sample is also folded into the MAT summary
+    accumulator (replaces the separate mat_report pass).  ``first_sample`` is an
+    already-materialized metas[0] (from the cut field-check) so it is not read
+    twice.
+    """
+    accs = [({}, {}) for _ in specs]
+    n = len(metas)
+    for i, meta in enumerate(metas):
+        sample = (first_sample if (i == 0 and first_sample is not None)
+                  else manager.materialize(meta))
+        if sample is None or sample.get("array") is None:
+            print(f"\n[FILL] {i + 1}/{n}  {meta['name']}: unreadable, skip.")
+            continue
+        if report_acc is not None:
+            hist_maker.mat_report_add(report_acc, sample, report_cut)
+        for (hd, hv), p in zip(accs, specs):
+            hist_maker.accumulate_sample(sample, p, hd, hv)
+        print(f"\r[FILL] {i + 1}/{n} | group={sample['group']:<10} "
+              f"| Mem={get_memory_mb():.1f} MB", end="")
+        # drop the array + the (id(arr), cut) context cache before the next
+        # sample: id() is reused by CPython once this array is freed, so a stale
+        # cache entry would otherwise be a silent wrong-sample hit.
+        sample["array"] = None
+        hist_maker.clear_context_cache()
+        gc.collect()
+    print("")
+    return accs
+
+
 def main():
     t_total0 = time.time()
 
@@ -6076,6 +6817,7 @@ def main():
     cfg.plot_mode = args.mode
     cfg.mat_sel = getattr(args, "sel", "PRE")
     cfg.signal_only = (args.mode == "MAT-SIGNAL")
+    cfg.bkg_only = (args.mode == "MAT-BKG")
     ensure_dir(cfg.figure_path)
     ensure_dir(cfg.cache_path)
 
@@ -6090,34 +6832,50 @@ def main():
     print(f"[INFO] Force reload : {cfg.force_reload}")
     print("=" * 100)
 
-    # ------- Load phase ----------
+    # ------- Sample-list phase (no arrays read yet) ----------
     t_load0 = time.time()
     manager = DataManager(cfg)
-    samples = manager.load_all()
+    sample_metas = manager.load_all()
     t_load = time.time() - t_load0
 
-    print(f"[INFO] Loaded {len(samples)} samples.")
-    print(f"[INFO] Memory after loading: {get_memory_mb():.1f} MB")
-    print(f"[TIME] Data loaded in {fmt_hms(t_load)}")
+    print(f"[INFO] Resolved {len(sample_metas)} samples (arrays read lazily, "
+          f"one at a time).")
+    print(f"[INFO] Memory now: {get_memory_mb():.1f} MB")
+    print(f"[TIME] Sample list built in {fmt_hms(t_load)}")
 
     hist_maker = Histogrammer(cfg)
     plotter = Plotter(cfg)
 
     # ------- MAT mode: matching-truth overlay only ----------
-    if args.mode in ("MAT", "MAT-SIGNAL"):
+    if args.mode in ("MAT", "MAT-SIGNAL", "MAT-BKG"):
         mat_settings = build_mat_plot_settings(args.sel, cfg.signal_only)
         mat_cut = mat_settings[0]["cut"] if mat_settings else "1"
         _normalize = (args.norm == "NORM")
         print(f"[INFO] MAT selection: {args.sel}   (cut: {mat_cut})")
         print(f"[INFO] MAT y-axis   : {'shape-normalized (NORM)' if _normalize else 'absolute yields, W->cb auto-scaled to t->bc proxy (ABS)'}")
 
+        # WCB_MAT_SPECS=comma,sep,substrings -> fill+draw only the specs whose
+        # name contains one of them (fast single-plot iteration; the cache-column
+        # set is still the full one so results are identical).
+        _spec_filt = [s for s in os.environ.get("WCB_MAT_SPECS", "").split(",")
+                      if s.strip()]
+        if _spec_filt:
+            mat_settings = [p for p in mat_settings
+                            if any(s.strip() in p["name"] for s in _spec_filt)]
+            print(f"[INFO] WCB_MAT_SPECS -> {len(mat_settings)} spec(s): "
+                  f"{[p['name'] for p in mat_settings]}")
+
+        # Read the first sample once, for the cut field-check; hand it to the
+        # streaming pass so it is not read twice.
+        _first = manager.materialize(sample_metas[0]) if sample_metas else None
+
         # Fail fast with a clear message if the selection's cut needs a field
-        # that isn't in the loaded cache (e.g. running MAT JB against a cache
-        # tag older than v15m -- the tau21(j_b) branch is missing).  `ak8_pt`
-        # is exempt: `ak8_pt[0]` is turned into a leading alias downstream.
-        if samples:
+        # that isn't in the cache (e.g. running MAT JB against a cache tag older
+        # than v15m -- the tau21(j_b) branch is missing).  `ak8_pt` is exempt:
+        # `ak8_pt[0]` is turned into a leading alias downstream.
+        if _first is not None:
             _need = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", mat_cut))
-            _have = set(samples[0]["array"].fields)
+            _have = set(_first["array"].fields)
             _miss = sorted(f for f in _need if f not in _have
                            and f not in ("and", "or", "not", "abs", "ak8_pt"))
             if _miss:
@@ -6141,9 +6899,25 @@ def main():
                 for _p in mat_settings:
                     _p["cut"] = mat_cut
 
-        # One-pass summary (also warms the per-sample event-context cache that
-        # every MAT plot below reuses).
-        hist_maker.mat_report(samples, mat_cut)
+        for i, p in enumerate(mat_settings):
+            p["_progress"] = f"MAT {i + 1}/{len(mat_settings)}"
+            p["_normalize"] = _normalize
+            p["_sel"] = args.sel
+            p["_signal_only"] = cfg.signal_only
+            p["_bkg_only"] = cfg.bkg_only
+
+        # ---- streaming fill: one sample array resident at a time ----
+        t_fill0 = time.time()
+        print("=" * 100)
+        print(f"[INFO] Filling {len(mat_settings)} MAT histograms over "
+              f"{len(sample_metas)} samples (streaming, one array resident)")
+        print("=" * 100)
+        report_acc = hist_maker.mat_report_acc()
+        accs = stream_fill_histograms(manager, sample_metas, mat_settings,
+                                      hist_maker, first_sample=_first,
+                                      report_acc=report_acc, report_cut=mat_cut)
+        hist_maker.mat_report_print(report_acc, mat_cut)
+        t_fill = time.time() - t_fill0
 
         t_draw0 = time.time()
         plot_times = []
@@ -6152,18 +6926,11 @@ def main():
         print(f"[INFO] Start drawing MAT (matching-truth) plots: {len(mat_settings)} plots")
         print("=" * 100)
 
-        for i, p in enumerate(mat_settings):
-            p["_progress"] = f"MAT {i + 1}/{len(mat_settings)}"
-            p["_normalize"] = _normalize
-            p["_sel"] = args.sel
-            p["_signal_only"] = cfg.signal_only
-            t_p0 = time.time()
-            hist_data, hist_var = hist_maker.make_histograms(samples, p)
-
+        for i, (p, (hist_data, hist_var)) in enumerate(zip(mat_settings, accs)):
             if len(hist_data) == 0:
                 print(f"[WARN] {i + 1}/{len(mat_settings)}  {p['name']}: empty, skip.")
                 continue
-
+            t_p0 = time.time()
             plotter.draw_matching(hist_data, p, hist_var)
             plot_times.append(time.time() - t_p0)
 
@@ -6173,7 +6940,8 @@ def main():
 
         print("=" * 100)
         print(f"[DONE] {n} plots in {fmt_hms(t_total)}")
-        print(f"[TIME]   load : {fmt_hms(t_load)}  ({t_load:.1f}s)")
+        print(f"[TIME]   list : {fmt_hms(t_load)}  ({t_load:.1f}s)")
+        print(f"[TIME]   fill : {fmt_hms(t_fill)}  ({t_fill:.1f}s, read + histogram, streamed)")
         print(f"[TIME]   draw : {fmt_hms(t_draw)}  ({t_draw:.1f}s"
               + (f", {sum(plot_times) / len(plot_times):.1f}s/plot avg" if plot_times else "")
               + ")")
@@ -6186,6 +6954,8 @@ def main():
 
         # end-of-run panel of every raw GloParT ak8_gpt_* score plot.
         _msfx = ({"PRE": "_PRE", "SR": "_SR", "JB": "_JB"}.get(args.sel, "")
+                 + ("_sig" if cfg.signal_only else "")
+                 + ("_bkg" if cfg.bkg_only else "")
                  + ("_norm" if args.norm == "NORM" else ""))
         run_gpt_score_montage(cfg.figure_path, _msfx)
         # full mSD / pT panels: run `montage_mat.sh <dir> <suffix>` by hand.
@@ -6196,6 +6966,18 @@ def main():
     roc_settings = []          # ROC plots disabled: only SD mass + Dbc score
     dbc_roc_settings = []
 
+    for i, p in enumerate(plot_settings):
+        p["_progress"] = f"PLOT {i + 1}/{len(plot_settings)}"
+
+    # ------- Fill phase (streaming: one sample array resident at a time) ------
+    t_fill0 = time.time()
+    print("=" * 100)
+    print(f"[INFO] Filling {len(plot_settings)} Data/MC histograms over "
+          f"{len(sample_metas)} samples (streaming, one array resident)")
+    print("=" * 100)
+    accs = stream_fill_histograms(manager, sample_metas, plot_settings, hist_maker)
+    t_fill = time.time() - t_fill0
+
     # ------- Draw phase ----------
     t_draw0 = time.time()
     plot_times = []
@@ -6204,30 +6986,29 @@ def main():
     print(f"[INFO] Start drawing Data/MC plots: {len(plot_settings)} plots")
     print("=" * 100)
 
-    for i, p in enumerate(plot_settings):
-        p["_progress"] = f"PLOT {i + 1}/{len(plot_settings)}"
-        t_p0 = time.time()
-        hist_data, hist_var = hist_maker.make_histograms(samples, p)
-
+    for i, (p, (hist_data, hist_var)) in enumerate(zip(plot_settings, accs)):
         if len(hist_data) == 0:
             print(f"[WARN] {i + 1}/{len(plot_settings)}  {p['name']}: empty, skip.")
             continue
-
+        t_p0 = time.time()
         plotter.draw_datamc(hist_data, p)
         plot_times.append(time.time() - t_p0)
 
     if roc_settings or dbc_roc_settings:
+        # ROC needs every sample resident at once -- read them all here (only
+        # when ROC is actually enabled; it is disabled by default).
+        _roc_samples = manager.materialize_all(sample_metas)
         print("=" * 100)
         print(f"[INFO] Start drawing ROC plots: "
               f"{len(roc_settings) + len(dbc_roc_settings)} settings")
         print("=" * 100)
         for r in roc_settings:
             t_p0 = time.time()
-            plotter.draw_eventclassifier_multiclass_roc_binned(samples, r)
+            plotter.draw_eventclassifier_multiclass_roc_binned(_roc_samples, r)
             print(f"[RUN] ROC {r['name']}  ({time.time() - t_p0:.1f}s)")
         for r in dbc_roc_settings:
             t_p0 = time.time()
-            plotter.draw_dbc_roc_binned(samples, r)
+            plotter.draw_dbc_roc_binned(_roc_samples, r)
             print(f"[RUN] ROC {r['name']}  ({time.time() - t_p0:.1f}s)")
 
     t_draw = time.time() - t_draw0
@@ -6237,7 +7018,8 @@ def main():
     # ------- Runtime summary (Root_plot.py style) ----------
     print("=" * 100)
     print(f"[DONE] {n} plots in {fmt_hms(t_total)}")
-    print(f"[TIME]   load : {fmt_hms(t_load)}  ({t_load:.1f}s)")
+    print(f"[TIME]   list : {fmt_hms(t_load)}  ({t_load:.1f}s)")
+    print(f"[TIME]   fill : {fmt_hms(t_fill)}  ({t_fill:.1f}s, read + histogram, streamed)")
     print(f"[TIME]   draw : {fmt_hms(t_draw)}  ({t_draw:.1f}s"
           + (f", {sum(plot_times) / len(plot_times):.1f}s/plot avg" if plot_times else "")
           + ")")
