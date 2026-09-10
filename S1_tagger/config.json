@@ -1,0 +1,60 @@
+{
+  "_comment": "S1 / S1' boosted-cb tagger. S1 = XGBoost over the 30 independent GloParT ak8_gpt_* leaf nodes; S1' = S1 + ak8_tau21 + ak8_tau32. Binary: signal = any of the 4 W->cb jet topologies (W(cb), t2(b'c), t2(b'b), t3(b'bc)); background = every AK8 jet from the 16 non-Vcb samples. Built on Youpeng's dcb_versions_v1/run_dcb_versions.py.",
+
+  "seed": 42,
+  "dataset_tag": "presel_v1",
+
+  "data_dir": "/eos/user/a/agapitos/S1_tagger_data",
+  "output_dir": "output",
+  "mc_dir": "/afs/cern.ch/user/y/youpeng/eos/RunTTH/_2017_1L/MC/scored_samples_2final_v20260902_rerun",
+  "tree": "Events",
+
+  "signal_sample": "ttbar-powheg_merged_Skim.root",
+
+  "split": {"train": 70, "valid": 15, "test": 15},
+
+  "weights": ["xsecWeight", "genWeight", "lumiwgt", "puWeight", "trigEffWeight", "l1PreFiringWeight"],
+
+  "preselection": {
+    "jet_pt_min": 200.0,
+    "jet_sdmass_min": 40.0,
+    "jet_tau21_max": 0.65,
+    "dr_lep_jet_min": 1.3,
+    "event_subleading_sdmass_max": 100.0
+  },
+
+  "background_keep_prob": 0.15,
+
+  "features_S1": [
+    "ak8_gpt_bb", "ak8_gpt_cc", "ak8_gpt_bc", "ak8_gpt_bs", "ak8_gpt_cs",
+    "ak8_gpt_qq", "ak8_gpt_ss", "ak8_gpt_tauhtauh",
+    "ak8_gpt_qcdb", "ak8_gpt_qcdbb", "ak8_gpt_qcdc", "ak8_gpt_qcdcc", "ak8_gpt_qcdothers",
+    "ak8_gpt_topbwc", "ak8_gpt_topbwcs", "ak8_gpt_topbwq", "ak8_gpt_topbwqq", "ak8_gpt_topbws",
+    "ak8_gpt_topbwev", "ak8_gpt_topbwmv", "ak8_gpt_topbwtauev", "ak8_gpt_topbwtauhv", "ak8_gpt_topbwtaumv",
+    "ak8_gpt_topwqq", "ak8_gpt_topwcs",
+    "ak8_gpt_topwev", "ak8_gpt_topwmv", "ak8_gpt_topwtauev", "ak8_gpt_topwtauhv", "ak8_gpt_topwtaumv"
+  ],
+  "_features_S1_note": "30 nodes = the full ak8_gpt_* set MINUS the 3 parents (topbw, topw, qcd), which are exact sums of their sub-nodes and carry no extra information.",
+
+  "features_S1p_extra": ["ak8_tau21", "ak8_tau32"],
+
+  "xgboost": {
+    "n_estimators": 800,
+    "max_depth": 5,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "objective": "binary:logistic",
+    "eval_metric": "auc",
+    "tree_method": "hist",
+    "n_jobs": 12,
+    "early_stopping_rounds": 40
+  },
+
+  "benchmark_bkg_eff": [0.05, 0.01, 0.001],
+
+  "compare_models": {
+    "Dbc_old_8node": "train_bdt/dbc_bdt_output/bdt_dbc_model.pkl",
+    "Dbc_3class_expanded": "/eos/user/y/youpeng/research/wcb/BoostedDbcTrain/dbc_3class_v1/output_inclusive_v1/models/expanded/model.json"
+  }
+}

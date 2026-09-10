@@ -222,7 +222,14 @@ class Config:
         #   in the 2026-09-02 rerun).  Old ntuples without the gen-Z direction
         #   auto-fall back to the pT proxy.  mat_cat 13/14/15 (Zlight/Zhf) are
         #   cached -> full re-derive (~25 min).
-        self.cache_tag = "derived_v21_zdr_v1"   # dR(J,Z_gen)<0.8 merged-Z match (2026-09-10)
+        # v22 (derived_v22_jrank_v1, 2026-09-10): the cb-candidate jet J is now
+        #   argmax(ak8_gpt_bc + ak8_gpt_bb + ak8_gpt_topbwc) instead of
+        #   argmax(ak8_gpt_bc).  j_b (2nd-ranked AK8) uses the same ordering.
+        #   Signal-jet selection efficiency in n_ak8>=2 events 85.5% -> 92.9%
+        #   (t^2(b'b) 72.4% -> 95.2%, the class GloParT has no node for).
+        #   J feeds EVERY cached *_0 column, true_cat / mat_cat, score_Dbc and
+        #   every gpt_* ratio -> full re-derive (~25 min).
+        self.cache_tag = "derived_v22_jrank_v1"   # J = argmax(bc+bb+topbwc) (2026-09-10)
 
         # ------------------------------------------------------------------
         # Switches
@@ -2374,7 +2381,32 @@ class DataManager:
 
         # ------------------------------------------------------------------
         # cb-candidate AK8 jet  ==  J = the AK8 jet with the highest GloParT
-        # bc score  (was: j_1, the pT-leading AK8).  Every AK8 jet in these
+        # J-rank score  (2026-09-10):
+        #     J-rank = ak8_gpt_bc + ak8_gpt_bb + ak8_gpt_topbwc
+        # (was: the single `bc` node; before that j_1, the pT-leading AK8).
+        # Each term targets one W->cb signal topology, verified on the Vcb
+        # sample (ttbar-powheg, per-jet gen match, n_ak8 >= 2 events):
+        #   bc      -> W(cb)    : the merged b+c 2-prong
+        #   bb      -> t^2(b'b) : top-b + the W's b IS a bb 2-prong, and
+        #                         GloParT has no `topbwb` node, so the single
+        #                         `bc` ranking picked the wrong jet 27% of the
+        #                         time here (72.4% -> 95.2% with +bb).
+        #   topbwc  -> t^2(b'c) : t->bW with only the W's c merged = b'+c
+        #                         exactly (88.4% -> 91.3%).
+        #   t^3(b'bc) rides on bc+bb (87.8% -> 92.2%); GloParT has no
+        #   3-prong b+b+c node at all.
+        # Net signal-jet selection efficiency over the 4 classes in n_ak8 >= 2
+        # events: 85.5% -> 92.9% (+7.4 pp, ~+1.6% of all signal).
+        # `topbwcs` was tested and dropped: it is t^3(b'cs), NOT the signal
+        # t^3(b'bc), sits only 5th among the nodes a true t^3(b'bc) jet fires
+        # (median 0.029, same as on W(cb) jets), buys only +0.34 pp, and risks
+        # preferring genuine t->b(W->cs) background tops.  `topbw` (inclusive)
+        # was also tested and made things WORSE -- it fires for every hadronic
+        # top, so it cannot separate the signal jet from a background top jet
+        # within the same event.
+        # NB the same ordering now also defines j_b (the 2nd-ranked AK8), so J
+        # and j_b come from one consistent ranking.
+        # Every AK8 jet in these
         # ntuples is already produced with pT > 200 GeV (verified 2026-08-29:
         # min 200.1, 0% below 200 across all samples), so ranking by bc score
         # instead of pT never drops a jet or moves the phase space -- it only
@@ -2389,8 +2421,20 @@ class DataManager:
         # AK4 quantities and the "sub_*" / "maxmass" alternative orderings stay
         # as they were.
         # ------------------------------------------------------------------
+        # Composite J-rank, built once and reused for J and for every
+        # "2nd-ranked AK8" (j_b) quantity below.  Falls back term-by-term so
+        # an ntuple without `topbwc` (pre-2final) still ranks on bc+bb.
+        _JRANK_KEY = "ak8_gpt_Jrank"
+        _JRANK_NODES = ("ak8_gpt_bc", "ak8_gpt_bb", "ak8_gpt_topbwc")
+        _jrank = None
         if (not is_data) and ("ak8_gpt_bc" in raw.fields):
-            _cand_idx = ak.argmax(raw["ak8_gpt_bc"], axis=1, keepdims=True)
+            for _nd in _JRANK_NODES:
+                if _nd not in raw.fields:
+                    continue
+                _jrank = raw[_nd] if _jrank is None else _jrank + raw[_nd]
+
+        if _jrank is not None:
+            _cand_idx = ak.argmax(_jrank, axis=1, keepdims=True)
         else:
             _cand_idx = None
 
@@ -2782,9 +2826,17 @@ class DataManager:
         #      J / j_b  -> highest / 2nd-highest GloParT bc score
         #                   (J == the cb candidate == the *_0 fields)
         def nth_by(order_branch, value_branch, k, default=-999.0):
-            if order_branch not in raw.fields or value_branch not in raw.fields:
+            # `order_branch` may be a real branch or the synthetic composite
+            # J-rank key (_JRANK_KEY), so j_b uses the SAME ordering as J.
+            if order_branch == _JRANK_KEY:
+                order = _jrank
+            elif order_branch in raw.fields:
+                order = raw[order_branch]
+            else:
+                order = None
+            if order is None or value_branch not in raw.fields:
                 return np.full(n, default, dtype=np.float32)
-            idx = ak.argsort(raw[order_branch], axis=1, ascending=False)
+            idx = ak.argsort(order, axis=1, ascending=False)
             ranked = raw[value_branch][idx]
             picked = ak.pad_none(ranked, k + 1, axis=1)[:, k]
             return np.asarray(ak.fill_none(picked, default), dtype=np.float32)
@@ -2795,12 +2847,12 @@ class DataManager:
         # ak8_sdmass_lead_pt_0  = nth_by("ak8_pt",     "ak8_sdmass", 0)   # j_1 (pT-leading; J == ak8_sdmass_0)
         # ak8_sdmass_sub_pt_0   = nth_by("ak8_pt",     "ak8_sdmass", 1)   # j_2
         ak8_sdmass_sub_mass_0 = nth_by("ak8_sdmass", "ak8_sdmass", 1)   # j^2
-        ak8_sdmass_sub_bc_0   = nth_by("ak8_gpt_bc", "ak8_sdmass", 1)   # j_b
-        ak8_tau21_sub_bc_0    = nth_by("ak8_gpt_bc", "ak8_tau21",  1)   # tau21 of j_b
+        ak8_sdmass_sub_bc_0   = nth_by(_JRANK_KEY, "ak8_sdmass", 1)   # j_b
+        ak8_tau21_sub_bc_0    = nth_by(_JRANK_KEY, "ak8_tau21",  1)   # tau21 of j_b
 
         # -- Dbc BDT score for the OTHER ranked AK8 jets --------------------
         # Same 8-GloParT-node BDT as score_Dbc (J), re-evaluated on:
-        #   j_b  = 2nd-highest bc-score AK8   (nth_by "ak8_gpt_bc", k=1)
+        #   j_b  = 2nd-highest J-rank AK8     (nth_by _JRANK_KEY, k=1)
         #   j^1  = highest-mSD AK8            (nth_by "ak8_sdmass",  k=0)
         #   j^2  = 2nd-highest-mSD AK8        (nth_by "ak8_sdmass",  k=1)
         # Missing-jet slots get 0 fed to the BDT, then the score is set to
@@ -2815,7 +2867,7 @@ class DataManager:
 
         _n_ak8_i = np.asarray(n_ak8, dtype=np.float32)
         score_Dbc_jb    = np.where(_n_ak8_i >= 2,
-                                   _dbc_for("ak8_gpt_bc", 1), SENTINEL).astype(np.float32)
+                                   _dbc_for(_JRANK_KEY, 1), SENTINEL).astype(np.float32)
         score_Dbc_jsup1 = np.where(_n_ak8_i >= 1,
                                    _dbc_for("ak8_sdmass", 0), SENTINEL).astype(np.float32)
         score_Dbc_jsup2 = np.where(_n_ak8_i >= 2,
@@ -2853,8 +2905,8 @@ class DataManager:
         gpt_w_vs_top = safe_ratio(g_bc + g_cs + g_qq,
                                   g_bc + g_cs + g_qq + g_topbw + g_topw + g_bqq)
         # same W-like/(W-like+top-like) GloParT ratio but evaluated on j_b (the
-        # 2nd-highest bc-score AK8).  -999 (dropped) when n_ak8 < 2.
-        _gb = lambda node: nth_by("ak8_gpt_bc", node, 1, default=0.0)
+        # 2nd-highest J-rank AK8).  -999 (dropped) when n_ak8 < 2.
+        _gb = lambda node: nth_by(_JRANK_KEY, node, 1, default=0.0)
         _wlike_jb = _gb("ak8_gpt_bc") + _gb("ak8_gpt_cs") + _gb("ak8_gpt_qq")
         gpt_w_vs_top_jb = safe_ratio(
             _wlike_jb,
@@ -6341,7 +6393,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
-        # ("score_Dbc_jb",           "score_Dbc_jb",           0.0, 1.0, 50, r"$D_{bc}(j_b)$   (2nd-highest-$bc$-score AK8)", True),  # commented out on request 2026-09-04
+        # ("score_Dbc_jb",           "score_Dbc_jb",           0.0, 1.0, 50, r"$D_{bc}(j_b)$   (2nd-highest $bc\!+\!bb\!+\!t^{2}(b^{\prime}c)$ AK8)", True),  # commented out on request 2026-09-04
         # ("score_Dbc_jsup1",        "score_Dbc_jsup1",        0.0, 1.0, 50, r"$D_{bc}(j^{1})$   (highest-$m_{\mathrm{SD}}$ AK8)", True),  # commented out on request
         # ("score_Dbc_jsup2",        "score_Dbc_jsup2",        0.0, 1.0, 50, r"$D_{bc}(j^{2})$   (2nd-highest-$m_{\mathrm{SD}}$ AK8)", True),  # commented out on request
         ("score_SC",               "score_SC",             1e-4, 1.0, 50, r"$S_{\mathrm{EVT}}$",            True, False, True),
@@ -6450,12 +6502,12 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # phi is flat / detector-frame only -> no separation power, dropped.
         # ("ak8_phi_0",              "ak8_phi_0",             -PI,   PI,    50, r"$J$ $\phi$",          False),
         # SD masses: 25 bins over 0-250 GeV -> 10 GeV bins (rebinned x2 from 50).
-        ("ak8_sdmass_0",           "ak8_sdmass_0",            0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  (highest-$bc$-score AK8)", False),
+        ("ak8_sdmass_0",           "ak8_sdmass_0",            0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J)$ [GeV]  (highest $bc\!+\!bb\!+\!t^{2}(b^{\prime}c)$ AK8)", False),
         # m(J_b) / m(J^1) / m(J^2) re-enabled 2026-09-07 (user).  J_b =
         # 2nd-highest $bc$-score AK8;  J^1 / J^2 = highest / 2nd-highest
         # $m_{\mathrm{SD}}$ AK8.  Raw cached columns (nth_by) -- the sub-
         # leading slots are SENTINEL (dropped) for n_ak8 < 2.
-        ("ak8_sdmass_sub_bc_0",    "ak8_sdmass_sub_bc_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J_{b})$ [GeV]  (2nd-highest-$bc$-score AK8)", False),
+        ("ak8_sdmass_sub_bc_0",    "ak8_sdmass_sub_bc_0",     0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J_{b})$ [GeV]  (2nd-highest $bc\!+\!bb\!+\!t^{2}(b^{\prime}c)$ AK8)", False),
         ("ak8_sdmass_maxmass_0",   "ak8_sdmass_maxmass_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J^{1})$ [GeV]  (highest-$m_{\mathrm{SD}}$ AK8)", False),
         ("ak8_sdmass_sub_mass_0",  "ak8_sdmass_sub_mass_0",   0.0, 250.0, 25, r"$m_{\mathrm{SD}}(J^{2})$ [GeV]  (2nd-highest-$m_{\mathrm{SD}}$ AK8)", False),
         # ("ak8_sdmass_lead_pt_0",   "ak8_sdmass_lead_pt_0",    0.0, 250.0, 25, r"$m_{\mathrm{SD}}(j_{1})$ [GeV]  (highest-$p_T$ AK8)", False),  # commented out on request 2026-09-04
@@ -6478,7 +6530,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         ("ak8_tau21_0",            "ak8_tau21_0",             0.0, 1.0,   50, r"$\tau_{21}(J)$",     False),
         ("ak8_tau32_0",            "ak8_tau32_0",             0.0, 1.0,   50, r"$\tau_{32}(J)$",     False),
         ("ak8_tau31_0",            "ak8_tau31_0",             0.0, 1.0,   50, r"$\tau_{31}(J) = \tau_{32}\,\tau_{21}$", False),
-        # ("ak8_tau21_sub_bc_0",     "ak8_tau21_sub_bc_0",      0.0, 1.0,   50, r"$\tau_{21}(j_b)$   (2nd-highest-$bc$-score AK8)", False),  # commented out on request 2026-09-04
+        # ("ak8_tau21_sub_bc_0",     "ak8_tau21_sub_bc_0",      0.0, 1.0,   50, r"$\tau_{21}(j_b)$   (2nd-highest $bc\!+\!bb\!+\!t^{2}(b^{\prime}c)$ AK8)", False),  # commented out on request 2026-09-04
         # ("ak8_nConst_0",         "ak8_nConst_0",            0.0, 120.0, 60, r"$J$ $N_{\mathrm{const}}$", False),  # dropped 2026-08-31
         # ("ak8_n_b_in_jet",         "ak8_n_b_in_jet",         -0.5, 5.5,    6, r"$N_b$ in $J$ (gen)",    False, True),  # commented out on request
         # ("ak8_n_c_in_jet",         "ak8_n_c_in_jet",         -0.5, 5.5,    6, r"$N_c$ in $J$ (gen)",    False, True),  # commented out on request
