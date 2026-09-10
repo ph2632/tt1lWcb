@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plot gallery</title>
+<style>
+  :root{color-scheme:light dark;--bg:#fff;--fg:#111;--card:#f5f5f7;--line:#dcdce0;--mut:#777;--acc:#3763c4}
+  @media (prefers-color-scheme:dark){:root{--bg:#15161a;--fg:#e8e8ea;--card:#1e1f25;--line:#33343c;--mut:#9a9aa2;--acc:#7aa2ff}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--line);padding:8px 12px;display:flex;flex-direction:column;gap:7px}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .crumb a{color:var(--acc);text-decoration:none}
+  .crumb span.sep{color:var(--mut);margin:0 2px}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{display:inline-block;padding:2px 8px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--fg);text-decoration:none}
+  .chip small{color:var(--mut)}
+  .chip.up{border-style:dashed}
+  input[type=search]{flex:1;min-width:160px;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+  select,input[type=range]{accent-color:var(--acc)}
+  .mut{color:var(--mut)}
+  main{display:grid;gap:13px;padding:13px;grid-template-columns:repeat(auto-fill,minmax(var(--w,360px),1fr))}
+  figure{margin:0;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:6px;display:flex;flex-direction:column;gap:4px}
+  figure img{width:100%;height:auto;background:#fff;border-radius:4px;display:block;cursor:zoom-in}
+  figcaption{font-weight:600;word-break:break-all}
+  .meta{color:var(--mut)}
+  .x a{color:var(--acc);text-decoration:none;margin-right:6px}
+  .empty{padding:40px 13px;color:var(--mut)}
+  #lb[hidden]{display:none}
+  #lb{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.92);display:flex;align-items:center;justify-content:center;padding:16px}
+  #lb img{max-width:100%;max-height:calc(100vh - 40px);object-fit:contain;background:#fff;border-radius:4px;cursor:zoom-out}
+  #lb .bar{position:absolute;top:0;left:0;right:0;display:flex;gap:12px;align-items:center;padding:9px 13px;color:#fff;background:linear-gradient(rgba(0,0,0,.65),transparent)}
+  #lb .bar .sp{flex:1}
+  #lb .bar a{color:#9cf;text-decoration:none}
+  #lb button{background:rgba(255,255,255,.16);color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:15px;line-height:1;cursor:pointer}
+  #lb button:hover{background:rgba(255,255,255,.32)}
+</style></head><body>
+<header>
+  <div class="row crumb" id="crumb"></div>
+  <div class="row chips" id="subdirs"></div>
+  <div class="row">
+    <input type="search" id="q" placeholder="filter filename in this folder (space = AND)">
+    <label class="mut">sort
+      <select id="sort">
+        <option value="m-desc">newest</option><option value="m-asc">oldest</option>
+        <option value="n-asc">name A-Z</option><option value="n-desc">name Z-A</option>
+      </select></label>
+    <label class="mut">size <input type="range" id="w" min="180" max="900" step="20" value="360"></label>
+    <span class="mut" id="status"></span>
+  </div>
+</header>
+<main id="grid"></main>
+<div id="lb" hidden>
+  <div class="bar">
+    <button id="lbPrev" title="previous (&larr;)">&lsaquo;</button>
+    <button id="lbNext" title="next (&rarr;)">&rsaquo;</button>
+    <span id="lbName"></span>
+    <span class="sp"></span>
+    <a id="lbRaw" target="_blank" rel="noopener">open raw &#8599;</a>
+    <button id="lbClose" title="close (Esc)">&#10005;</button>
+  </div>
+  <img id="lbImg" alt="">
+</div>
+<script>
+let DATA=null, lastGen=null;
+const $=id=>document.getElementById(id);
+const grid=$('grid'), q=$('q'), sortSel=$('sort'), w=$('w');
+
+function curPath(){
+  let h=decodeURIComponent(location.hash.replace(/^#\/?/,'')).replace(/\/+$/,'');
+  if(DATA && !(h in DATA.tree)) h=(DATA.start in DATA.tree)?DATA.start:'';
+  return h;
+}
+function lsKey(){return 'plotgallery:'+location.pathname+'#'+curPath();}
+function saveUI(){try{localStorage.setItem(lsKey(),JSON.stringify(
+  {q:q.value,s:sortSel.value,w:w.value}))}catch(e){}}
+function loadUI(){try{const p=JSON.parse(localStorage.getItem(lsKey())||'{}');
+  q.value=p.q||''; if(p.s)sortSel.value=p.s; w.value=p.w||360;
+  document.documentElement.style.setProperty('--w',w.value+'px');}catch(e){
+  q.value='';document.documentElement.style.setProperty('--w','360px');}}
+
+async function poll(){
+  try{
+    const r=await fetch('_gallery.json?t='+Date.now(),{cache:'no-store'});
+    const d=await r.json();
+    if(d.generated!==lastGen){lastGen=d.generated;DATA=d;render();}
+  }catch(e){$('status').textContent='(offline)';}
+  setTimeout(poll,(DATA&&DATA.interval?DATA.interval:3)*1000);
+}
+
+function render(){
+  if(!DATA)return;
+  const path=curPath();
+  const node=DATA.tree[path]||{dirs:[],images:[]};
+
+  // breadcrumb
+  const parts=path?path.split('/'):[];
+  let acc='', c=['<a href="#/">'+DATA.root_abs.split('/').pop()+'</a>'];
+  parts.forEach(p=>{acc=acc?acc+'/'+p:p;
+    c.push('<span class="sep">/</span><a href="#/'+encodeURI(acc)+'">'+p+'</a>');});
+  $('crumb').innerHTML=c.join('');
+
+  // subdirs
+  const chips=[];
+  if(path) chips.push('<a class="chip up" href="#/'+
+    encodeURI(parts.slice(0,-1).join('/'))+'">../</a>');
+  node.dirs.forEach(d=>{
+    const rp=path?path+'/'+d:d;
+    let n=0; (function cnt(k){const t=DATA.tree[k];if(!t)return;
+      n+=t.images.length;t.dirs.forEach(x=>cnt(k+'/'+x));})(rp);
+    chips.push('<a class="chip" href="#/'+encodeURI(rp)+'">'+d+
+      ' <small>'+n+'</small></a>');
+  });
+  $('subdirs').innerHTML=chips.join('')||'<span class="mut">no subfolders with plots</span>';
+
+  // images
+  const prefix=path?path+'/':'';
+  const terms=q.value.toLowerCase().split(/\s+/).filter(Boolean);
+  let imgs=node.images.filter(im=>terms.every(t=>im.n.toLowerCase().includes(t)));
+  const [key,dir]=sortSel.value.split('-'), s=dir==='asc'?1:-1;
+  imgs.sort((a,b)=>key==='n'?s*a.n.localeCompare(b.n):s*(a.m-b.m));
+  $('status').textContent=imgs.length+' / '+node.images.length+
+    ' plots  ·  built '+DATA.generated;
+  document.title=(path||'/')+' — '+node.images.length+' plots';
+
+  const openName=(!lb.hidden && lbI>=0 && VIEW.imgs[lbI]) ? VIEW.imgs[lbI].n : null;
+  VIEW={prefix:prefix,imgs:imgs};
+  if(openName){                         // a plot is open in the lightbox: follow it across re-renders
+    const j=imgs.findIndex(im=>im.n===openName);
+    if(j>=0) openLB(j); else closeLB();
+  }
+  if(!imgs.length){grid.innerHTML='<div class="empty">No plots in this folder'+
+    (node.images.length?' match the filter.':'.')+'</div>';return;}
+  grid.innerHTML=imgs.map((im,i)=>{
+    const u=encodeURI(prefix+im.n)+'?m='+im.m;   // ?m= busts the cache when --watch sees a new plot
+    const x=im.x.map(f=>'<a href="'+encodeURI(prefix+f)+'" target="_blank" rel="noopener">['+
+      f.split('.').pop().toLowerCase()+']</a>').join(' ');
+    const d=new Date(im.m*1000);
+    const dt=('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2)+' '+
+      ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);
+    return '<figure data-i="'+i+'">'+
+      '<img loading="lazy" src="'+u+'" alt="">'+
+      '<figcaption title="'+im.n+'">'+im.n+'</figcaption>'+
+      '<div class="meta">'+Math.round(im.s/1024)+' KB · '+dt+'</div>'+
+      (x?'<div class="x">'+x+'</div>':'')+'</figure>';
+  }).join('');
+}
+
+// ---- lightbox: open the full plot on the same page ----
+const lb=$('lb'), lbImg=$('lbImg'), lbName=$('lbName'), lbRaw=$('lbRaw');
+let VIEW={prefix:'',imgs:[]}, lbI=-1;
+function openLB(i){
+  if(i<0||i>=VIEW.imgs.length){closeLB();return;}
+  lbI=i; const im=VIEW.imgs[i];
+  const u=encodeURI(VIEW.prefix+im.n)+'?m='+im.m;
+  lbImg.src=u; lbRaw.href=u;
+  lbName.textContent=(i+1)+' / '+VIEW.imgs.length+'   '+im.n;
+  lb.hidden=false; document.body.style.overflow='hidden';
+}
+function closeLB(){lb.hidden=true; lbImg.removeAttribute('src'); lbI=-1; document.body.style.overflow='';}
+function navLB(d){if(VIEW.imgs.length) openLB((lbI+d+VIEW.imgs.length)%VIEW.imgs.length);}
+grid.addEventListener('click',e=>{
+  const f=e.target.closest('figure');
+  if(f && e.target.tagName==='IMG') openLB(+f.dataset.i);
+});
+$('lbPrev').addEventListener('click',e=>{e.stopPropagation();navLB(-1);});
+$('lbNext').addEventListener('click',e=>{e.stopPropagation();navLB(1);});
+$('lbClose').addEventListener('click',closeLB);
+lbImg.addEventListener('click',closeLB);
+lb.addEventListener('click',e=>{if(e.target===lb)closeLB();});
+addEventListener('keydown',e=>{
+  if(lb.hidden)return;
+  if(e.key==='Escape')closeLB();
+  else if(e.key==='ArrowLeft')navLB(-1);
+  else if(e.key==='ArrowRight')navLB(1);
+});
+
+addEventListener('hashchange',()=>{closeLB();loadUI();render();});
+q.addEventListener('input',()=>{saveUI();render();});
+sortSel.addEventListener('change',()=>{saveUI();render();});
+w.addEventListener('input',()=>{document.documentElement.style.setProperty('--w',w.value+'px');saveUI();});
+loadUI(); poll();
+</script>
+</body></html>

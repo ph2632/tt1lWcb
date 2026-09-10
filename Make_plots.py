@@ -141,7 +141,9 @@ class Config:
         # v15j: + z_decay / genZ_pt loaded -> 3 merged hadronic-Z flavour
         #       lines carved out of 'rest' (mat_cat 13/14/15 = Z->qq' light /
         #       Z->cc / Z->bb), "merged" = loose pT proxy pT(J)/pT(Z_gen)>0.7;
-        #       failing that -> "Z resolved" stays in 'rest'.
+        #       failing that -> "Z resolved" stays in 'rest'.  (Superseded by
+        #       the v21 dR(J, Z_gen) < 0.8 match; the proxy is now only the
+        #       fallback for pre-rerun ntuples with no genZ_eta/phi.)
         # v15k: + gpt_bc_vs_qcd = bc / (bc + QCD)  (GloParT W(cb) vs QCD).
         # v15l: + ak8_tau21_sub_bc_0 = tau21 of j_b (2nd-highest bc-score AK8),
         #       for the jb-Region selection.
@@ -214,7 +216,13 @@ class Config:
         # v18 (2026-09-04): + the 25 finer GloParT sub-nodes from the 2final
         #   ntuples (_GPT_EXTRA_NODES -> ak8_gpt_<node>_0).  New cached
         #   fields -> full re-derive.
-        self.cache_tag = "derived_v20_bake_v1"   # runtime fields baked into the parquet; chi2 reco off by default (2026-09-07)
+        # v21 (derived_v21_zdr_v1, 2026-09-10): merged hadronic-Z matching
+        #   switched from the loose pT proxy pT(J)/pT(Z_gen) > 0.7 to a real
+        #   geometric match dR(J, Z_gen) < 0.8, using genZ_eta/genZ_phi (new
+        #   in the 2026-09-02 rerun).  Old ntuples without the gen-Z direction
+        #   auto-fall back to the pT proxy.  mat_cat 13/14/15 (Zlight/Zhf) are
+        #   cached -> full re-derive (~25 min).
+        self.cache_tag = "derived_v21_zdr_v1"   # dR(J,Z_gen)<0.8 merged-Z match (2026-09-10)
 
         # ------------------------------------------------------------------
         # Switches
@@ -531,11 +539,14 @@ class Config:
             "w_decay",
             # event-level hadronic-Z decay code (|pdgId| of the Z daughter):
             # 0 = Z->ll / Z->vv / no gen Z ; 1/2/3 = Z->dd/uu/ss (light) ;
-            # 4 = Z->cc ; 5 = Z->bb.  With genZ_pt this drives the merged
-            # hadronic-Z flavour split of 'rest' (loose pT proxy for "merged":
-            # J carries most of the Z momentum; no gen-Z direction stored).
+            # 4 = Z->cc ; 5 = Z->bb.  Together with the gen-Z direction
+            # (genZ_eta/phi, new in the 2026-09-02 rerun) this drives the
+            # merged hadronic-Z flavour split of 'rest' via a real dR(J, Z_gen)
+            # match; genZ_pt is kept for the pre-rerun pT-proxy fallback.
             "z_decay",
             "genZ_pt",
+            "genZ_eta",
+            "genZ_phi",
         ]
 
         # ------------------------------------------------------------------
@@ -2658,14 +2669,17 @@ class DataManager:
         mat_cat[(match_tbqqwcb_lead == 1) & not_qcd] = 20
 
         # --- merged hadronic-Z -> qq, carved out of 'rest' ------------------
-        # These ntuples carry no gen-Z direction (only genZ_pt) and no per-jet
-        # Z match, so "merged" is a LOOSE pT proxy: the cb-candidate AK8 J
-        # carries most of the Z momentum, pT(J) / pT(Z_gen) > 0.7.  Flavour
-        # from z_decay (5 = bb, 4 = cc, 1/2/3 = light).  Only rewrites events
-        # still in 'rest' (mat_cat == 3: J not W/top matched) and not V+jets
-        # (is_qcd -> DY / W+jets stay in 'rest', same rule as the W-classes).
-        # Hadronic-Z events that fail the pT proxy are "Z resolved" and stay
-        # in 'rest' (mat_cat == 3), exactly like the resolved-W treatment.
+        # The 2026-09-02 rerun added the gen-Z DIRECTION (genZ_eta/genZ_phi) on
+        # top of genZ_pt, so "merged" is now a real geometric match: the gen Z
+        # lies inside the cb-candidate AK8 cone, dR(J, Z_gen) < 0.8.  The old
+        # ntuples carried genZ_pt only, so those fall back to the previous
+        # LOOSE pT proxy pT(J)/pT(Z_gen) > 0.7 (J carries most of the Z
+        # momentum).  Flavour from z_decay (5 = bb, 4 = cc, 1/2/3 = light).
+        # Only rewrites events still in 'rest' (mat_cat == 3: J not W/top
+        # matched) and not V+jets (is_qcd -> DY / W+jets stay in 'rest', same
+        # rule as the W-classes).  Hadronic-Z events that fail the match are
+        # "Z resolved" and stay in 'rest' (mat_cat == 3), exactly like the
+        # resolved-W treatment.
         #   13 = merged Z->qq' (light)   14 = merged Z->cc   15 = merged Z->bb
         z_decay = np.asarray(
             raw["z_decay"] if "z_decay" in raw.fields else np.zeros(n),
@@ -2676,8 +2690,20 @@ class DataManager:
             dtype=np.float32,
         )
         _z_had = np.isin(z_decay, (1, 2, 3, 4, 5)) & not_qcd
-        _z_ptratio = ak8_pt_0 / np.where(genZ_pt > 0.0, genZ_pt, 1.0)
-        _z_merged = _z_had & (genZ_pt > 0.0) & (ak8_pt_0 > 0.0) & (_z_ptratio > 0.7)
+        _has_zdir = ("genZ_eta" in raw.fields) and ("genZ_phi" in raw.fields)
+        if _has_zdir:
+            genZ_eta = np.asarray(raw["genZ_eta"], dtype=np.float32)
+            genZ_phi = np.asarray(raw["genZ_phi"], dtype=np.float32)
+            # dPhi wrapped to (-pi, pi]; J eta/phi are -999 when there is no AK8
+            _z_dphi = np.abs(genZ_phi - ak8_phi_0)
+            _z_dphi = np.where(_z_dphi > np.pi, 2.0 * np.pi - _z_dphi, _z_dphi)
+            _z_dR = np.hypot(genZ_eta - ak8_eta_0, _z_dphi)
+            _z_merged = (_z_had & (genZ_pt > 0.0) & (ak8_pt_0 > 0.0)
+                         & (_z_dR < 0.8))
+        else:
+            _z_ptratio = ak8_pt_0 / np.where(genZ_pt > 0.0, genZ_pt, 1.0)
+            _z_merged = (_z_had & (genZ_pt > 0.0) & (ak8_pt_0 > 0.0)
+                         & (_z_ptratio > 0.7))
         _in_rest = mat_cat == 3
         mat_cat[_in_rest & _z_merged & np.isin(z_decay, (1, 2, 3))] = 13
         mat_cat[_in_rest & _z_merged & (z_decay == 4)] = 14
@@ -6501,7 +6527,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # min Delta-R / Delta-phi over tagged-AK4 pairs -- Delta vars, commented out on request:
         ("minDR_b",                "minDR_b",                 0.0, 5.0,   50, r"$\Delta R$ of the closest $b^{L}b^{L}$ AK4 jet pair", True),  # re-enabled: m_t=-1 study
         # ("minDR_c",                "minDR_c",                 0.0, 5.0,   50, r"$\Delta R$ of the closest $c^{L}c^{L}$ AK4 jet pair", True),
-        # ("minDR_bc",               "minDR_bc",                0.0, 5.0,   50, r"$\Delta R$ of the closest $b^{L}c^{L}$ AK4 jet pair",   True),
+        ("minDR_bc",               "minDR_bc",                0.0, 5.0,   50, r"$\Delta R$ of the closest $b^{L}c^{L}$ AK4 jet pair",   True),  # re-enabled next to minDR_b (2026-09-07, user)
         # ("minDR_bc_LM",            "minDR_bc_LM",             0.0, 5.0,   50, r"$\Delta R$ of the closest $b\,c$ AK4 pair, $b^{L}c^{M}$ or $b^{M}c^{L}$", True),
         # ("minDR_bc_MM",            "minDR_bc_MM",             0.0, 5.0,   50, r"$\Delta R$ of the closest $b^{M}c^{M}$ AK4 jet pair",   True),
         # ("minDphi_bc",             "minDphi_bc",              0.0, PI,    50, r"min $\Delta\phi$ over $b^{L}c^{L}$ AK4 jet pairs",     True),
@@ -6535,6 +6561,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ---- event activity -------------------------------------------
         # ("ht",                     "ht",                      0.0, 2000.0, 50, r"$H_T$ [GeV]",               True),  # commented out on request
         ("n_ak4",                  "n_ak4",                  -0.5, 14.5,   15, r"# AK4 jets",                False),  # re-enabled: m_t=-1 study
+        ("n_btag",                 "n_btag",                 -0.5, 8.5,     9, r"$N_{b^{L}}$  (# ParticleNetAK4 loose-$b$-tagged AK4)",   False),  # added right after n_ak4 (2026-09-07, user)
         # ("ht_bc",                  "ht_bc",                   0.0, 1500.0, 50, r"$\sum p_T$ of $b$- and $c$-tagged AK4 jets [GeV]", True),
         # n_ak4 re-enabled for the m_t=-1 study -- moved up next to ttreco_mt.
         ("n_ak8",                  "n_ak8",                  -0.5, 6.5,     7, r"$N_{\mathrm{AK8}}$",         False),
@@ -6542,7 +6569,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # p_bc = P(b)+P(c) and r_b = P(b)/p_bc.  b-tag WPs: L = p_bc>0.5 &
         # r_b>0.40 ; M = & r_b>0.70 ; T = & r_b>0.88.  c-tag WPs:
         # L = p_bc>0.1 (not b) ; M = p_bc>0.2 ; T = p_bc>0.5 & r_b<=0.40.
-        # ("n_btag",                 "n_btag",                 -0.5, 8.5,     9, r"$N_{b^{L}}$  (# ParticleNetAK4 loose-$b$-tagged AK4)",   False),  # commented out on request
+        # n_btag ($N_{b^{L}}$) now enabled above, right after n_ak4 (2026-09-07, user)
         # ("n_btagM",                "n_btagM",                -0.5, 8.5,     9, r"$N_{b^{M}}$  (# ParticleNetAK4 medium-$b$-tagged AK4)",  False),  # commented out on request
         # ("n_btagT",                "n_btagT",                -0.5, 8.5,     9, r"$N_{b^{T}}$  (# ParticleNetAK4 tight-$b$-tagged AK4)",   False),  # commented out on request
         # ("n_ctag",                 "n_ctag",                 -0.5, 8.5,     9, r"$N_{c^{L}}$  (# ParticleNetAK4 loose-$c$-tagged AK4)",   False),  # commented out on request

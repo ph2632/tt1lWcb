@@ -69,7 +69,29 @@ N=$(printf '%s\n' $FILES | wc -l | tr -d ' ')
 echo "panels_to_pdf: $N panel(s) -> $OUT"
 printf '  %s\n' $FILES
 
-# -auto-orient: honour any EXIF rotation; default Zip (lossless) compression.
-convert $FILES -auto-orient "$OUT"
+# --- stamp a slide number (lower-left) onto each panel -------------------
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+i=0
+STAMPED=""
+for f in $FILES; do
+    i=$((i + 1))
+    out=$(printf '%s/%03d.png' "$TMP" "$i")
+    # point size scaled to the panel height so the stamp looks the same on
+    # every layout; white under-box so the digits stay readable on any
+    # background.  SouthWest gravity + a small proportional inset.
+    h=$(identify -format '%h' "$f" 2>/dev/null || echo 600)
+    ps=$(( h / 30 )); [ "$ps" -lt 14 ] && ps=14
+    off=$(( ps / 2 ))
+    convert "$f" -auto-orient \
+        -gravity SouthWest -pointsize "$ps" -font Helvetica \
+        -fill black -undercolor '#ffffffcc' \
+        -annotate +${off}+${off} " $i / $N " \
+        "$out"
+    STAMPED="$STAMPED $out"
+done
+
+# default Zip (lossless) compression.
+convert $STAMPED "$OUT"
 
 echo "panels_to_pdf: wrote $OUT ($(du -h "$OUT" | cut -f1))"
