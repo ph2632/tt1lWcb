@@ -89,8 +89,9 @@ NODE_LABEL = {
 def node_label(feat):
     return NODE_LABEL.get(feat.replace("ak8_gpt_", ""), feat.replace("ak8_gpt_", ""))
 TOPO_COL = {1: ROOT.kAzure + 2, 2: ROOT.kOrange + 7,
-            3: ROOT.kGreen + 2, 4: ROOT.kMagenta + 1}
-TOPO_LAB = {1: "W(cb)", 2: "t^{2}(b'c)", 3: "t^{2}(b'b)", 4: "t^{3}(b'bc)"}
+            3: ROOT.kGreen + 2, 4: ROOT.kMagenta + 1, 5: ROOT.kCyan + 2}
+TOPO_LAB = {1: "W(cb)", 2: "t^{2}(b'c)", 3: "t^{2}(b'b)", 4: "t^{3}(b'bc)",
+            5: "t^{2}(b'c) proxy"}
 
 
 def cms_style():
@@ -179,7 +180,10 @@ def roc_figure(outdir, summary, cfg, out_png):
 
     entries = []
     for name in ("S1", "S1p"):
-        e = np.load(outdir / name / "eval.npz")
+        f = outdir / name / "eval.npz"
+        if not f.exists():
+            continue
+        e = np.load(f)
         entries.append((PRETTY[name], COL[name], 1, e["test_y"], e["test_score"], e["test_w"]))
     # S1 with the t2(b'c) class removed from the signal: a b'+c jet from W->cb
     # and one from W->cs contain the same two partons, so that class is very
@@ -463,6 +467,9 @@ def build_report(cfg, outdir):
 
     published = {f"S1_tagger_{tag}_roc.png": roc}
     for name in ("S1", "S1p"):
+        if name not in summary["models"] or not (outdir / name / "eval.npz").exists():
+            print(f"  [{name}] no eval.npz / not in summary -- skipping its plots")
+            continue
         ov, pi, sc = (outdir / f"{k}_{name}.png"
                       for k in ("overtrain", "permimp", "score"))
         keep += overtrain_figure(outdir, name, summary, cfg, ov)

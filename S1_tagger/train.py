@@ -256,6 +256,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, default=HERE / "config.json")
     ap.add_argument("--no-report", action="store_true", help="skip panel rendering")
+    ap.add_argument("--only", default=None,
+                    help="comma-separated model(s) to train, e.g. S1 or S1,S1p "
+                         "(default: config 'train_models', else both)")
     args = ap.parse_args()
     cfg = json.loads(args.config.read_text())
 
@@ -317,7 +320,12 @@ def main():
         "split_note": "train 70 / valid 15 (early stop) / test 15 (held out)",
         "models": {}, "comparison_test_auc": {}}
 
+    model_list = ([m.strip() for m in args.only.split(",")] if args.only
+                  else cfg.get("train_models", ["S1", "S1p"]))
     for name, feats in (("S1", feats_s1), ("S1p", feats_s1p)):
+        if name not in model_list:
+            print(f"  [{name}] skipped (not in {model_list} -- pass --only S1,S1p to include)")
+            continue
         _, _, _, res = train_one(name, feats, tr, va, te, cfg["xgboost"],
                                  cfg["seed"], sig_codes, bkg_effs, outdir, cfg)
         summary["models"][name] = res
@@ -346,6 +354,8 @@ def main():
 
     print("\n==== SUMMARY ====")
     for name in ("S1", "S1p"):
+        if name not in summary["models"]:
+            continue
         r = summary["models"][name]
         ot = r["overtraining"]
         print(f"  {name:4s} AUC train {r['train']['auc']:.3f} / test {r['test']['auc']:.3f}"
@@ -358,12 +368,13 @@ def main():
         print("       per-class @1e-3: " + "  ".join(f"{k} {v:.3f}" for k, v in pc.items()))
     for k, v in summary["comparison_test_auc"].items():
         print(f"  {k:24s} test AUC {v:.3f}")
-    print("\n  S1 top-10 by permutation importance (AUC drop) [gain rank in brackets]:")
-    grank = {r["feature"]: i for i, r in
-             enumerate(summary["models"]["S1"]["feature_importance"], 1)}
-    for i, rk in enumerate(summary["models"]["S1"]["permutation_importance"][:10], 1):
-        print(f"    {i:>2}  {rk['feature'].replace('ak8_gpt_',''):<14} "
-              f"dAUC {rk['auc_drop']:+.5f}   [gain #{grank[rk['feature']]}]")
+    if "S1" in summary["models"]:
+        print("\n  S1 top-10 by permutation importance (AUC drop) [gain rank in brackets]:")
+        grank = {r["feature"]: i for i, r in
+                 enumerate(summary["models"]["S1"]["feature_importance"], 1)}
+        for i, rk in enumerate(summary["models"]["S1"]["permutation_importance"][:10], 1):
+            print(f"    {i:>2}  {rk['feature'].replace('ak8_gpt_',''):<14} "
+                  f"dAUC {rk['auc_drop']:+.5f}   [gain #{grank[rk['feature']]}]")
     print("  XGBoost: " + ", ".join(f"{k}={v}" for k, v in cfg["xgboost"].items()
                                     if not k.startswith("_")))
     print(f"\n  outputs -> {outdir}")

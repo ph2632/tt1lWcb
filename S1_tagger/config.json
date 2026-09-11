@@ -31,6 +31,8 @@
     "dr_lep_jet_min": 1.3,
     "event_subleading_sdmass_max": 100.0
   },
+  "train_models": ["S1"],
+  "_train_models_note": "S1' dropped as the carried default (agreed: substructure adds ~0 AUC, tau21/tau32/nConstituents rank low) -- also halves wall time on this dataset size (S1 alone took 3412s in the last full run) and reduces exposure to this shared node's memory-pressure kills. Override with train.py --only S1,S1p to train both.",
   "background_keep_prob": 0.5,
   "_background_keep_prob_note": "base build at the top of the 0.2/0.3/0.4/0.5 scan (scan_keep_prob.py); it sub-thins this dataset in-memory so the expensive ROOT read runs once. Final value picked after the scan.",
   "class_weight_multiplier": {
