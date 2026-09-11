@@ -215,9 +215,22 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs,
                   key=lambda x: abs(x["target_bkg_eff"] - 1e-3))["threshold"]
     res["test"]["per_class_signal_eff_at_1e-3"] = per_class_eff(
         te["topology"].to_numpy(), sc["test"], w["test"], ref_thr, sig_codes)
+    # Overtraining must compare LIKE WITH LIKE.  train weights are class-
+    # reweighted (signal ~58% Wcb) while test weights are raw physics (signal
+    # ~99% proxy); since Wcb scores higher than the proxy, that mixture
+    # difference alone showed up as a ~9% "bias" that is not overfitting at
+    # all.  So the test side is reweighted with the same class multipliers
+    # HERE ONLY -- AUC, working points and per-class efficiency above keep the
+    # raw physics weights and stay physically meaningful.
+    cwm = class_weight_lookup(cfg)
+    w_te_ot = (w["test"] * cwm[te["topology"].to_numpy()]
+               if cwm is not None else w["test"])
     res["overtraining"] = overtrain_metrics(
-        sc["train"], y["train"], w["train"], sc["test"], y["test"], w["test"],
+        sc["train"], y["train"], w["train"], sc["test"], y["test"], w_te_ot,
         cfg.get("overtrain_score_cut", 0.6))
+    res["overtraining"]["weighting"] = (
+        "train and test both class-reweighted (like-for-like)"
+        if cwm is not None else "raw physics weights")
 
     # Arrays for the plotting stage.  Keep EVERY training signal jet -- a flat
     # subsample left the train-signal curve with ~1/3 the statistics of the
@@ -236,9 +249,14 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs,
         mdir / "eval.npz",
         test_score=sc["test"].astype(np.float32), test_y=y["test"],
         test_w=w["test"].astype(np.float32),
+        test_w_ot=np.asarray(w_te_ot, dtype=np.float32),   # like-for-like vs train
         test_topo=te["topology"].to_numpy().astype(np.int8),
         train_score=sc["train"][idx].astype(np.float32), train_y=y["train"][idx],
-        train_w=w_plot.astype(np.float32))
+        train_w=w_plot.astype(np.float32),
+        # per-jet topology of the plotted train subset, so the overtraining
+        # figure can be restricted to a signal subset (S2/S3) the same way
+        # the test side already can
+        train_topo=tr["topology"].to_numpy()[idx].astype(np.int8))
 
     ot = res["overtraining"]
     print(f"       AUC train {res['train']['auc']:.3f} / valid {res['valid']['auc']:.3f} "
@@ -337,10 +355,14 @@ def main():
     three = eval_dbc_3class(cmp_cfg.get("Dbc_3class_expanded", ""), te)
     if three:
         comparisons.update(three)
-    # untrained baseline: the raw GloParT sum used to pick J (bc + bb + topbwc)
+    # untrained baselines: the raw GloParT sums, added cumulatively, so the ROC
+    # shows what each extra node buys before any training (bc -> +bb -> +topbwc,
+    # the last being the sum used to pick J).
     raw = cfg.get("raw_sum_baseline", [])
     if raw and all(c in te.columns for c in raw):
-        comparisons["raw_sum_bc_bb_topbwc"] = te[raw].sum(axis=1).to_numpy()
+        for key, cols in (("raw_cb", raw[:1]), ("raw_cb_bb", raw[:2]),
+                          ("raw_sum_bc_bb_topbwc", raw)):
+            comparisons[key] = te[cols].sum(axis=1).to_numpy()
     for key, s in comparisons.items():
         if s is None:
             continue
@@ -379,7 +401,7 @@ def main():
                                     if not k.startswith("_")))
     print(f"\n  outputs -> {outdir}")
     if not args.no_report:
-        print("  (render plots with:  source LCG; python3 S1_tagger/make_plots_root.py)")
+        print("  (render plots with:  source LCG; python3 XGBoost_training.py)")
 
 
 if __name__ == "__main__":
