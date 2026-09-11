@@ -1,20 +1,29 @@
 {
-  "_comment": "S1 / S1' boosted-cb tagger. S1 = XGBoost over the 30 independent GloParT ak8_gpt_* leaf nodes; S1' = S1 + ak8_tau21 + ak8_tau32. Binary: signal = any of the 4 W->cb jet topologies (W(cb), t2(b'c), t2(b'b), t3(b'bc)); background = every AK8 jet from the 16 non-Vcb samples. Built on Youpeng's dcb_versions_v1/run_dcb_versions.py.",
-
+  "_comment": "S1 / S1' boosted-cb tagger. Inputs = the 30 independent MASS-DECORRELATED ak8_gpt_* scores (Sophon-style: a generic massive resonance X, no parent-flavour assumption, so equally valid for H+->cb). S1' adds tau21, tau32, nConstituents. Binary: signal = the 4 gen-matched W->cb jet topologies W(cb)/t2(b'c)/t2(b'b)/t3(b'bc); background = every AK8 jet from the 16 non-Vcb samples. Inputs are written p(..) in the plots so they are never confused with the truth topologies.",
   "seed": 42,
-  "dataset_tag": "presel_v1",
-
+  "dataset_tag": "presel_v3_kp50",
+  "run_tag": "presel_v3_kp50",
+  "_run_tag_note": "output/<run_tag>/ ; dataset_tag selects the input parquet, run_tag names the training run so re-tunes never clobber.",
+  "lumi_label": "41.5 fb^{-1} (13 TeV)",
+  "cms_label": "Simulation",
   "data_dir": "/eos/user/a/agapitos/S1_tagger_data",
   "output_dir": "output",
   "mc_dir": "/afs/cern.ch/user/y/youpeng/eos/RunTTH/_2017_1L/MC/scored_samples_2final_v20260902_rerun",
   "tree": "Events",
-
   "signal_sample": "ttbar-powheg_merged_Skim.root",
-
-  "split": {"train": 70, "valid": 15, "test": 15},
-
-  "weights": ["xsecWeight", "genWeight", "lumiwgt", "puWeight", "trigEffWeight", "l1PreFiringWeight"],
-
+  "split": {
+    "train": 70,
+    "valid": 15,
+    "test": 15
+  },
+  "weights": [
+    "xsecWeight",
+    "genWeight",
+    "lumiwgt",
+    "puWeight",
+    "trigEffWeight",
+    "l1PreFiringWeight"
+  ],
   "preselection": {
     "jet_pt_min": 200.0,
     "jet_sdmass_min": 40.0,
@@ -22,39 +31,84 @@
     "dr_lep_jet_min": 1.3,
     "event_subleading_sdmass_max": 100.0
   },
-
-  "background_keep_prob": 0.15,
-
+  "background_keep_prob": 0.5,
+  "_background_keep_prob_note": "base build at the top of the 0.2/0.3/0.4/0.5 scan (scan_keep_prob.py); it sub-thins this dataset in-memory so the expensive ROOT read runs once. Final value picked after the scan.",
+  "class_weight_multiplier": {
+    "1": 131.70,
+    "2": 76.48,
+    "3": 55.94,
+    "4": 69.52,
+    "5": 0.2017
+  },
+  "_class_weight_multiplier_note": "unweighted, the 5 signal sub-classes' train-split sumw was Wcb 0.38% / t2_bc 0.16% / t2_bb 0.21% / t3_bbc 0.09% / t2_bc_proxy 99.16% (proxy pulled unthinned from the whole 16-sample background pool, Cabibbo-favoured W->cs vastly outnumbers the dedicated Vcb sample) -- the BDT loss was ~99% 'find a proxy-like jet' and Wcb was noise in the gradient. These multipliers retarget train-split positive-class sumw shares to Wcb 50% / t2_bc 12% / t2_bb 12% / t3_bbc 6% / proxy 20% (Wcb prioritised: ~2/3 of SR significance; the other 3 true classes placeholder-equal pending a real significance breakdown; proxy capped at 20% i.e. ~1.7x true t2_bc instead of 632x). Applied at LOAD time (train.py/scan_keep_prob.py) to TRAIN and VALID weight only -- TEST is left at raw physics weight so reported AUC/working-points/per-class efficiency stay physically meaningful. Computed from presel_v3_kp50 train raw sumw (Wcb 85.78, t2_bc 35.45, t2_bb 48.47, t3_bbc 19.50, proxy 22406.01); independent of background_keep_prob (only touches topology==0). Revisit the 12/12/6 split and the 20% proxy cap once a real per-class SR-significance number exists.",
   "features_S1": [
-    "ak8_gpt_bb", "ak8_gpt_cc", "ak8_gpt_bc", "ak8_gpt_bs", "ak8_gpt_cs",
-    "ak8_gpt_qq", "ak8_gpt_ss", "ak8_gpt_tauhtauh",
-    "ak8_gpt_qcdb", "ak8_gpt_qcdbb", "ak8_gpt_qcdc", "ak8_gpt_qcdcc", "ak8_gpt_qcdothers",
-    "ak8_gpt_topbwc", "ak8_gpt_topbwcs", "ak8_gpt_topbwq", "ak8_gpt_topbwqq", "ak8_gpt_topbws",
-    "ak8_gpt_topbwev", "ak8_gpt_topbwmv", "ak8_gpt_topbwtauev", "ak8_gpt_topbwtauhv", "ak8_gpt_topbwtaumv",
-    "ak8_gpt_topwqq", "ak8_gpt_topwcs",
-    "ak8_gpt_topwev", "ak8_gpt_topwmv", "ak8_gpt_topwtauev", "ak8_gpt_topwtauhv", "ak8_gpt_topwtaumv"
+    "ak8_gpt_bb",
+    "ak8_gpt_cc",
+    "ak8_gpt_bc",
+    "ak8_gpt_bs",
+    "ak8_gpt_cs",
+    "ak8_gpt_qq",
+    "ak8_gpt_ss",
+    "ak8_gpt_tauhtauh",
+    "ak8_gpt_qcdb",
+    "ak8_gpt_qcdbb",
+    "ak8_gpt_qcdc",
+    "ak8_gpt_qcdcc",
+    "ak8_gpt_qcdothers",
+    "ak8_gpt_topbwc",
+    "ak8_gpt_topbwcs",
+    "ak8_gpt_topbwq",
+    "ak8_gpt_topbwqq",
+    "ak8_gpt_topbws",
+    "ak8_gpt_topwqq",
+    "ak8_gpt_topwcs",
+    "ak8_gpt_lepq"
   ],
-  "_features_S1_note": "30 nodes = the full ak8_gpt_* set MINUS the 3 parents (topbw, topw, qcd), which are exact sums of their sub-nodes and carry no extra information.",
-
-  "features_S1p_extra": ["ak8_tau21", "ak8_tau32"],
-
+  "_features_S1_note": "21 nodes = the 30-node ak8_gpt_* set (all minus the 3 parent sums topbw/topw/qcd) with the 10 leptonic top/W-decay categories merged into one ak8_gpt_lepq = their sum. These are mutually-exclusive sub-classes of one GloParT parent softmax (leptonic top-or-W decay), so the sum is a lossless union probability, not a dropped feature -- and all 10 individually contributed <0.0012 permutation AUC (9 of 10 below 0.001; physically expected since our AK8 jet is a hadronic W->cb candidate). cc/qcdbb/qcdcc/topbwcs/qq/ss/tauhtauh were also individually <0.001 but are NOT merged: they are physically distinct categories (not mutually-exclusive sub-classes of one summed parent), so low permutation importance there means 'not needed for this S:B split', not 'redundant' -- kept as-is per instruction.",
+  "derived_features": {
+    "ak8_gpt_lepq": [
+      "ak8_gpt_topbwev", "ak8_gpt_topbwmv", "ak8_gpt_topbwtauev",
+      "ak8_gpt_topbwtauhv", "ak8_gpt_topbwtaumv",
+      "ak8_gpt_topwev", "ak8_gpt_topwmv", "ak8_gpt_topwtauev",
+      "ak8_gpt_topwtauhv", "ak8_gpt_topwtaumv"
+    ]
+  },
+  "_derived_features_note": "computed at LOAD time in train.py/scan_keep_prob.py (df[name] = df[components].sum(axis=1)) -- the raw components stay in the parquet (build_trainset.py always writes them) so this is a train-time-only reduction, reversible with no rebuild. topbwtaumv (auc_drop 0.00113, the highest of the 10) is included for physical consistency of the group; flag if you want it split out separately instead.",
+  "features_S1p_extra": [
+    "ak8_tau21",
+    "ak8_tau32",
+    "ak8_nConstituents"
+  ],
   "xgboost": {
-    "n_estimators": 800,
-    "max_depth": 5,
+    "n_estimators": 4000,
+    "max_depth": 2,
     "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "subsample": 0.5,
+    "colsample_bytree": 0.5,
+    "min_child_weight": 300,
+    "reg_lambda": 20.0,
     "objective": "binary:logistic",
     "eval_metric": "auc",
     "tree_method": "hist",
     "n_jobs": 12,
-    "early_stopping_rounds": 40
+    "early_stopping_rounds": 50
   },
-
-  "benchmark_bkg_eff": [0.05, 0.01, 0.001],
-
+  "_xgboost_note": "point D3 of the regularisation scans: depth 2, min_child_weight 300, subsample 0.5. Background training bias 6.1% (from 14.2%), converges at ~620 of 4000 trees so early stopping decides, 45 s/model. reg_alpha HURTS (10.6%) and max_delta_step does not help. Regularisation saturates ~6%: the residual bias is statistics-limited (halving the background doubles it), so <5% needs background_keep_prob 0.15 -> ~0.40 and a dataset rebuild.",
+  "raw_sum_baseline": [
+    "ak8_gpt_bc",
+    "ak8_gpt_bb",
+    "ak8_gpt_topbwc"
+  ],
+  "permutation_repeats": 3,
+  "overtrain_score_cut": 0.6,
+  "benchmark_bkg_eff": [
+    0.05,
+    0.01,
+    0.001
+  ],
   "compare_models": {
     "Dbc_old_8node": "train_bdt/dbc_bdt_output/bdt_dbc_model.pkl",
     "Dbc_3class_expanded": "/eos/user/y/youpeng/research/wcb/BoostedDbcTrain/dbc_3class_v1/output_inclusive_v1/models/expanded/model.json"
-  }
+  },
+  "_features_S1p_note": "S1' = the 30 GloParT nodes + tau21 + tau32 + nConstituents"
 }

@@ -101,7 +101,7 @@ def overtrain_figure(outdir, name, summary, out_png):
     plt.ylabel("a.u.  (density)")
     col = {"OK": "#2a8a2a", "WARN": "#c98a00", "FAIL": "#c0392b"}[ot["verdict"]]
     txt = (f"KS $p$  sig {ot['ks_sig_p']:.3f}   bkg {ot['ks_bkg_p']:.3f}\n"
-           f"sig-eff bias  {ot['sig_eff_bias_pct']:+.1f}%\n"
+           f"sig-eff bias  {ot['rel_diff_sig_pct']:+.1f}%\n"
            f"train AUC {summary['models'][name]['train']['auc']:.4f}   "
            f"test AUC {summary['models'][name]['test']['auc']:.4f}")
     plt.gca().text(0.03, 0.97, txt, transform=plt.gca().transAxes, va="top",
@@ -123,7 +123,7 @@ def featimp_figure(outdir, name, summary, out_png):
     ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=9)
     ax.set_xlabel("XGBoost importance  (total gain)")
     ax.set_title(f"{NAMES[name]}  feature importance  "
-                 f"(top 15 of {m['n_features']} inputs)")
+                 f"({len(top)} out of {m['n_features']} input param/s)")
     ax.grid(alpha=0.3, axis="x")
 
     ot = m["overtraining"]
@@ -143,7 +143,7 @@ def featimp_figure(outdir, name, summary, out_png):
         f"     valid {m['valid']['auc']:.4f}\n"
         f"     test  {m['test']['auc']:.4f}\n"
         f"KS $p$  sig {ot['ks_sig_p']:.3f}  bkg {ot['ks_bkg_p']:.3f}\n"
-        f"overtraining  {ot['verdict']}  ({ot['sig_eff_bias_pct']:+.1f}%)")
+        f"overtraining  {ot['verdict']}  ({ot['rel_diff_sig_pct']:+.1f}%)")
     ax.text(0.99, 0.02, info, transform=ax.transAxes, ha="right", va="bottom",
             fontsize=8, family="monospace",
             bbox=dict(boxstyle="round", fc="#f4f4f4", ec="#bbbbbb"))
@@ -213,7 +213,7 @@ def table_figure(summary, out_png):
         rows.append([key, "30+tau21,32" if key == "S1'" else "30 nodes",
                      f"{m['test']['auc']:.4f}",
                      *[f"{w['signal_eff']:.3f}" for w in wp],
-                     f"{ot['verdict']} ({ot['sig_eff_bias_pct']:+.0f}%)"])
+                     f"{ot['verdict']} ({ot['rel_diff_sig_pct']:+.0f}%)"])
     rows.append([r"$D_{bc}$ old", "8 nodes (pkl)",
                  f"{cmp.get('Dbc_old_8node', float('nan')):.4f}", "-", "-", "-", "-"])
     rows.append([r"$D_{bc}$ 3-class", "33 nodes, [:,0]",

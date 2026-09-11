@@ -11,9 +11,16 @@ parquet chunks.
                  2 = t2(b'c)    top-b + W's c, partial merge      (ak8_type 2)
                  3 = t2(b'b)    top-b + W's b, partial merge      (ak8_type 2)
                  4 = t3(b'bc)   fully-merged top t->(b b c)       (ak8_type 4)
-  background   : every AK8 jet from the other 16 samples (label 0), Bernoulli-
-                 thinned with p = background_keep_prob and weight up-scaled by
-                 1/p so the summed weight (effective luminosity) is preserved.
+                 5 = t2(b'c) PROXY: top-b' + W's c merged in a W->cs event of
+                     the 16 non-Vcb samples (ak8_match_top_bc & w_decay==4).
+                     Confirmed statistically identical to class 2 (tau21/32,
+                     mSD, all gpt nodes agree to 1-2%) -- promoted to signal
+                     instead of contaminating the background pool with
+                     mislabeled duplicates of class 2. Never thinned.
+  background   : every remaining AK8 jet from the 16 non-Vcb samples (label
+                 0), Bernoulli-thinned with p = background_keep_prob and
+                 weight up-scaled by 1/p so the summed weight (effective
+                 luminosity) is preserved.
 
 The non-signal jets of ttbar-powheg (leptonic-side b, ISR, and -- crucially --
 the ~48% of Vcb events where W->cb is fully RESOLVED) are dropped entirely:
@@ -41,8 +48,9 @@ HERE = Path(__file__).resolve().parent
 PI = float(np.pi)
 
 # jet topology codes
-SIG_CODES = {1: "Wcb", 2: "t2_bc", 3: "t2_bb", 4: "t3_bbc"}
+SIG_CODES = {1: "Wcb", 2: "t2_bc", 3: "t2_bb", 4: "t3_bbc", 5: "t2_bc_proxy"}
 BKG_CODE = 0
+PROXY_CODE = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -143,15 +151,35 @@ def main():
     # 3-class) and future feature-set studies need no rebuild.  S1 / S1' pick
     # their subsets at train time from config.
     gpt_parents = ["ak8_gpt_topbw", "ak8_gpt_topw", "ak8_gpt_qcd"]
-    feats_all = sorted(set(cfg["features_S1"] + cfg["features_S1p_extra"] + gpt_parents))
-    presel = cfg["preselection"]
+    # raw components of any train-time derived feature (e.g. ak8_gpt_lepq)
+    # must still be streamed/stored -- the merge happens at load time, not here.
+    derived_raw = sorted({c for comps in cfg.get("derived_features", {}).values() for c in comps})
+    feats_all = sorted(set(cfg["features_S1"] + cfg["features_S1p_extra"] + gpt_parents
+                           + derived_raw) - set(cfg.get("derived_features", {})))
+
+    # Preselection is read from Make_plots.py so a threshold change there
+    # propagates here automatically; config.json only supplies fallbacks.
+    presel = dict(cfg["preselection"])
+    try:
+        from presel import parse_preselection
+        parsed, cut_expr, missing = parse_preselection()
+        presel.update(parsed)
+        print(f"[presel] from Make_plots.py: {cut_expr}")
+        if missing:
+            print(f"[presel] not found, using config fallback for: {missing}")
+    except Exception as exc:                                   # noqa: BLE001
+        cut_expr = "(config fallback)"
+        print(f"[presel] WARNING could not read Make_plots.py ({exc}); "
+              f"using config.json preselection")
+    print("[presel] " + "  ".join(f"{k}={v}" for k, v in presel.items()))
     keep_p = float(cfg["background_keep_prob"])
     psel = cfg["split"]
 
     # branches to read (jagged + event-scalar)
     kin = ["ak8_pt", "ak8_eta", "ak8_phi", "ak8_sdmass"]
     truth = ["ak8_type", "ak8_n_b_in_jet", "ak8_n_c_in_jet",
-             "ak8_match_wqq_wcb", "ak8_match_tbq_wcb", "ak8_match_tbqq_wcb", "w_decay"]
+             "ak8_match_wqq_wcb", "ak8_match_tbq_wcb", "ak8_match_tbqq_wcb",
+             "ak8_match_top_bc", "w_decay"]
     ev_scalar = ["run", "luminosityBlock", "event", "n_ak8",
                  "lep1_pt", "lep1_eta", "lep1_phi"] + cfg["weights"]
     read_cols = sorted(set(kin + truth + ev_scalar + feats_all))
@@ -218,9 +246,19 @@ def main():
             if is_signal:
                 keep &= topo > 0                       # signal jets only
             else:
-                topo[:] = BKG_CODE
-                keep &= rng.random(len(keep)) < keep_p  # thin the background
-                weight = weight / keep_p                # ... keep sum(w) intact
+                # t2(b'c) PROXY: top-b' + W's c merged in a W->cs event (the
+                # background mirror image of signal class 2, b<->s swapped).
+                # Confirmed statistically identical to true t2(b'c) (tau21,
+                # tau32, mSD, all gpt nodes agree to 1-2%), so it is promoted
+                # to a 5th signal class rather than left as contaminating
+                # background -- and, like true signal, is never thinned.
+                w_decay_bg = broadcast(events, "w_decay", template, -1).astype(np.int16)
+                m_top_bc = flatten(events["ak8_match_top_bc"], 0).astype(bool)
+                proxy = (w_decay_bg == 4) & m_top_bc
+                topo = np.where(proxy, PROXY_CODE, BKG_CODE).astype(np.int8)
+                thin = rng.random(len(keep)) < keep_p   # thin true background only
+                keep &= (proxy | thin)
+                weight = np.where(proxy, weight, weight / keep_p)  # ... keep sum(w) intact for bkg
 
             if not keep.any():
                 continue
@@ -254,6 +292,7 @@ def main():
 
     summary = {
         "config": cfg, "dataset_dir": str(data_dir),
+        "preselection_used": presel, "preselection_source": cut_expr,
         "n_input_files": len(files), "n_parquet_chunks": part_idx,
         "counts_per_split": counts, "sumw_per_split": sumw,
         "signal_codes": SIG_CODES,

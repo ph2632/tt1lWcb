@@ -45,6 +45,27 @@ def load_split(dsdir, sub, columns):
                      ignore_index=True)
 
 
+def class_weight_lookup(cfg):
+    """topology-code -> multiplier array (index 0..5), 1.0 where unspecified
+    (background and any un-listed class pass through unchanged)."""
+    cwm = cfg.get("class_weight_multiplier")
+    if not cwm:
+        return None
+    lut = np.ones(max(6, max(int(k) for k in cwm) + 1), dtype=np.float64)
+    for k, v in cwm.items():
+        lut[int(k)] = float(v)
+    return lut
+
+
+def add_derived_features(df, cfg):
+    """Sum mutually-exclusive raw nodes into train-time derived features
+    (e.g. ak8_gpt_lepq = the 10 leptonic top/W-decay categories). Raw
+    components stay in the parquet; this is a load-time-only reduction."""
+    for name, comps in cfg.get("derived_features", {}).items():
+        df[name] = df[comps].sum(axis=1)
+    return df
+
+
 def wp_table(y, score, w, bkg_effs):
     fpr, tpr, thr = roc_curve(y, score, sample_weight=w)
     out = []
@@ -61,20 +82,50 @@ def per_class_eff(topo, score, w, thr, sig_codes):
             for c, name in sig_codes.items()}
 
 
-def overtrain_metrics(tr_s, tr_y, tr_w, te_s, te_y, te_w, thr):
-    """KS train-vs-test for signal and background score shapes (unweighted,
-    the standard overtraining check) + the signal-efficiency bias at `thr`."""
-    d_sig, p_sig = ks_2samp(tr_s[tr_y == 1], te_s[te_y == 1])
-    d_bkg, p_bkg = ks_2samp(tr_s[tr_y == 0], te_s[te_y == 0])
-    eff_tr = tr_w[(tr_y == 1) & (tr_s >= thr)].sum() / max(tr_w[tr_y == 1].sum(), 1e-12)
-    eff_te = te_w[(te_y == 1) & (te_s >= thr)].sum() / max(te_w[te_y == 1].sum(), 1e-12)
-    bias = 100.0 * (eff_tr - eff_te) / max(eff_te, 1e-12)
-    verdict = "OK" if min(p_sig, p_bkg) > 0.05 else \
-              ("WARN" if min(p_sig, p_bkg) > 0.01 else "FAIL")
-    return {"ks_sig_D": float(d_sig), "ks_sig_p": float(p_sig),
-            "ks_bkg_D": float(d_bkg), "ks_bkg_p": float(p_bkg),
-            "sig_eff_train": float(eff_tr), "sig_eff_test": float(eff_te),
-            "sig_eff_bias_pct": float(bias), "verdict": verdict}
+def overtrain_metrics(tr_s, tr_y, tr_w, te_s, te_y, te_w, cut=0.6):
+    """Overtraining check on the fully held-out test set.
+
+    Primary metric (same as ../Hgg/Plot.py):  |test - train| / test  on the
+    weighted fraction of each class above `cut`, i.e. in the region the
+    analysis actually cuts on.  KS is kept as a secondary, shape-wide number
+    but it is dominated by the low-score bulk and misses tail overtraining.
+    """
+    out = {"score_cut": float(cut)}
+    worst = 0.0
+    for cls, tag in ((1, "sig"), (0, "bkg")):
+        f_tr = tr_w[(tr_y == cls) & (tr_s > cut)].sum() / max(tr_w[tr_y == cls].sum(), 1e-12)
+        f_te = te_w[(te_y == cls) & (te_s > cut)].sum() / max(te_w[te_y == cls].sum(), 1e-12)
+        rel = 100.0 * abs(f_te - f_tr) / max(f_te, 1e-12)
+        out[f"frac_train_{tag}"] = float(f_tr)
+        out[f"frac_test_{tag}"] = float(f_te)
+        out[f"rel_diff_{tag}_pct"] = float(rel)
+        worst = max(worst, rel)
+        d, p = ks_2samp(tr_s[tr_y == cls], te_s[te_y == cls])
+        out[f"ks_{tag}_D"] = float(d)
+        out[f"ks_{tag}_p"] = float(p)
+    out["worst_rel_diff_pct"] = float(worst)
+    out["verdict"] = "OK" if worst < 5.0 else ("WARN" if worst < 15.0 else "FAIL")
+    return out
+
+
+def permutation_importance(model, X, y, w, feats, repeats, seed):
+    """AUC drop when each input is shuffled -- the discrimination each input
+    actually provides (same definition as ../Hgg/permutation_importance.py).
+    XGBoost `gain` is a split-time bookkeeping number and is badly distorted
+    by the correlated GloParT nodes, so this is the ranking we quote."""
+    rng = np.random.default_rng(seed)
+    base = roc_auc_score(y, model.predict_proba(X)[:, 1], sample_weight=w)
+    rows = []
+    for i, f in enumerate(feats):
+        d = []
+        for _ in range(repeats):
+            Xp = X.copy()
+            rng.shuffle(Xp[:, i])
+            d.append(base - roc_auc_score(y, model.predict_proba(Xp)[:, 1], sample_weight=w))
+        rows.append({"feature": f, "auc_drop": float(np.mean(d)),
+                     "auc_drop_err": float(np.std(d))})
+    rows.sort(key=lambda r: -r["auc_drop"])
+    return base, rows
 
 
 def eval_old_dbc(pkl_path, df):
@@ -87,6 +138,12 @@ def eval_old_dbc(pkl_path, df):
 
 
 def eval_dbc_3class(model_path, df):
+    """Youpeng's 3-class model -> the three class probabilities.
+
+    Class order is (bc, bb, other).  Our signal deliberately contains the
+    t2(b'b) topology, which is a bb 2-prong, so Dbc alone cannot describe it
+    -- Dbc+Dbb (= 1 - Dother) is the fair single discriminant to compare.
+    """
     if not Path(model_path).exists():
         return None
     m = XGBClassifier()
@@ -94,7 +151,8 @@ def eval_dbc_3class(model_path, df):
     feats = m.get_booster().feature_names
     if feats is None or not all(f in df.columns for f in feats):
         return None
-    return m.predict_proba(df[feats])[:, 0]
+    p = m.predict_proba(df[feats])
+    return {"Dbc3_bc": p[:, 0], "Dbc3_bb": p[:, 1], "Dbc3_bc_plus_bb": p[:, 0] + p[:, 1]}
 
 
 def feature_importance(model, feats):
@@ -110,7 +168,8 @@ def feature_importance(model, feats):
     return sorted(rows, key=lambda d: d["gain"], reverse=True)
 
 
-def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs, outdir):
+def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs,
+              outdir, cfg):
     y = {s: (d["topology"] > 0).astype(np.int8).to_numpy() for s, d in
          (("train", tr), ("valid", va), ("test", te))}
     w = {s: d["weight"].to_numpy() for s, d in
@@ -137,10 +196,14 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs, ou
     sc = {s: model.predict_proba(d[feats])[:, 1] for s, d in
           (("train", tr), ("valid", va), ("test", te))}
     ranking = feature_importance(model, feats)
+    X_te = te[feats].to_numpy(dtype=np.float32)
+    _, perm = permutation_importance(model, X_te, y["test"], w["test"], feats,
+                                     cfg.get("permutation_repeats", 3), seed)
 
     res = {"features": feats, "n_features": len(feats), "scale_pos_weight": spw,
            "best_iteration": best_it, "fit_seconds": round(fit_s, 1),
            "params": params, "feature_importance": ranking,
+           "permutation_importance": perm,
            "n_train": int(len(tr)), "n_train_signal": int(y["train"].sum()),
            "n_train_background": int((y["train"] == 0).sum())}
     for s in ("train", "valid", "test"):
@@ -153,28 +216,39 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs, ou
     res["test"]["per_class_signal_eff_at_1e-3"] = per_class_eff(
         te["topology"].to_numpy(), sc["test"], w["test"], ref_thr, sig_codes)
     res["overtraining"] = overtrain_metrics(
-        sc["train"], y["train"], w["train"], sc["test"], y["test"], w["test"], ref_thr)
+        sc["train"], y["train"], w["train"], sc["test"], y["test"], w["test"],
+        cfg.get("overtrain_score_cut", 0.6))
 
-    # arrays for the plotting stage (train sub-sampled to keep npz small)
+    # Arrays for the plotting stage.  Keep EVERY training signal jet -- a flat
+    # subsample left the train-signal curve with ~1/3 the statistics of the
+    # test one and made it visibly noisier than the 70% split implies.  Only
+    # the (far more numerous) background is thinned, and its weights are
+    # rescaled so the drawn shape is unbiased.
     rng = np.random.default_rng(seed)
-    ntr = min(len(tr), 120_000)
-    idx = rng.choice(len(tr), ntr, replace=False)
+    sig_i = np.flatnonzero(y["train"] == 1)
+    bkg_i = np.flatnonzero(y["train"] == 0)
+    keep_b = min(len(bkg_i), 400_000)
+    bkg_i = rng.choice(bkg_i, keep_b, replace=False)
+    idx = np.concatenate([sig_i, bkg_i])
+    w_plot = w["train"][idx].astype(np.float64).copy()
+    w_plot[len(sig_i):] *= len(np.flatnonzero(y["train"] == 0)) / keep_b
     np.savez_compressed(
         mdir / "eval.npz",
         test_score=sc["test"].astype(np.float32), test_y=y["test"],
         test_w=w["test"].astype(np.float32),
         test_topo=te["topology"].to_numpy().astype(np.int8),
         train_score=sc["train"][idx].astype(np.float32), train_y=y["train"][idx],
-        train_w=w["train"][idx].astype(np.float32))
+        train_w=w_plot.astype(np.float32))
 
     ot = res["overtraining"]
-    print(f"       AUC train {res['train']['auc']:.4f} / valid {res['valid']['auc']:.4f} "
-          f"/ test {res['test']['auc']:.4f}   best_iter {best_it}   ({fit_s:.0f}s)")
-    print(f"       overtraining: KS_sig p={ot['ks_sig_p']:.3f}  KS_bkg p={ot['ks_bkg_p']:.3f}  "
-          f"sig-eff bias {ot['sig_eff_bias_pct']:+.1f}%   -> {ot['verdict']}")
-    print(f"       top-5 by gain: "
-          + ", ".join(f"{r['feature'].replace('ak8_gpt_','')}({r['gain']:.0f})"
-                      for r in ranking[:5]))
+    print(f"       AUC train {res['train']['auc']:.3f} / valid {res['valid']['auc']:.3f} "
+          f"/ test {res['test']['auc']:.3f}   best_iter {best_it}   ({fit_s:.0f}s)")
+    print(f"       overtraining |test-train|/test @score>{ot['score_cut']}:  "
+          f"sig {ot['rel_diff_sig_pct']:.1f}%   bkg {ot['rel_diff_bkg_pct']:.1f}%"
+          f"   -> {ot['verdict']}   (KS p: sig {ot['ks_sig_p']:.3f} bkg {ot['ks_bkg_p']:.3f})")
+    print("       top-5 by permutation (AUC drop): "
+          + ", ".join(f"{r['feature'].replace('ak8_gpt_','')}({r['auc_drop']:.4f})"
+                      for r in perm[:5]))
     return sc["test"], y["test"], w["test"], res
 
 
@@ -186,22 +260,53 @@ def main():
     cfg = json.loads(args.config.read_text())
 
     dsdir = Path(os.environ.get("S1_DATA_DIR", cfg["data_dir"])) / cfg["dataset_tag"]
-    outdir = HERE / cfg["output_dir"] / cfg["dataset_tag"]
+    outdir = HERE / cfg["output_dir"] / cfg.get("run_tag", cfg["dataset_tag"])
     outdir.mkdir(parents=True, exist_ok=True)
-    ds_meta = json.loads((dsdir / "dataset_complete.json").read_text())
+    marker = dsdir / "dataset_complete.json"
+    if not marker.exists():
+        in_progress = any((dsdir / sub).exists() and any((dsdir / sub).glob("*.parquet"))
+                          for sub in ("train", "valid", "test"))
+        if in_progress:
+            raise SystemExit(
+                f"[train.py] {marker} not found -- build_trainset.py for "
+                f"dataset_tag='{cfg['dataset_tag']}' looks IN PROGRESS "
+                f"(partial parquet already under {dsdir}).\n"
+                f"  Check it's still running:  ps aux | grep build_trainset\n"
+                f"  It finishes when its log prints '==== dataset built ===='. "
+                f"Re-run train.py once that shows up.")
+        raise SystemExit(
+            f"[train.py] no dataset at {dsdir} -- run build_trainset.py first:\n"
+            f"  ./.venv/bin/python S1_tagger/build_trainset.py --config {args.config}")
+    ds_meta = json.loads(marker.read_text())
     sig_codes = {int(k): v for k, v in ds_meta["signal_codes"].items()}
     bkg_effs = cfg["benchmark_bkg_eff"]
+
+    derived = cfg.get("derived_features", {})
+    derived_raw = sorted({c for comps in derived.values() for c in comps})
 
     feats_s1 = cfg["features_S1"]
     feats_s1p = cfg["features_S1"] + cfg["features_S1p_extra"]
     gpt_all = sorted(set(feats_s1p) | {"ak8_gpt_topbw", "ak8_gpt_topw",
                                        "ak8_gpt_qcd", "ak8_gpt_cc"})
-    load_cols = sorted(set(["topology", "weight"] + feats_s1p + gpt_all))
+    # merged names (e.g. ak8_gpt_lepq) aren't real parquet columns -- swap them
+    # for their raw components on load, then sum into the merged column below.
+    load_cols = sorted((set(["topology", "weight"] + feats_s1p + gpt_all) - set(derived))
+                       | set(derived_raw))
 
     print(f"[load] {dsdir}")
-    tr = load_split(dsdir, "train", load_cols)
-    va = load_split(dsdir, "valid", load_cols)
-    te = load_split(dsdir, "test", load_cols)
+    tr = add_derived_features(load_split(dsdir, "train", load_cols), cfg)
+    va = add_derived_features(load_split(dsdir, "valid", load_cols), cfg)
+    te = add_derived_features(load_split(dsdir, "test", load_cols), cfg)
+
+    # per-class sig sumw retarget (e.g. Wcb was 0.4%, proxy 99% unweighted) --
+    # TRAIN + VALID only, so the loss/early-stopping objective is reshaped but
+    # TEST (reported AUC, working points, per-class eff) stays physical.
+    cwm = class_weight_lookup(cfg)
+    if cwm is not None:
+        tr["weight"] = tr["weight"].to_numpy() * cwm[tr["topology"].to_numpy()]
+        va["weight"] = va["weight"].to_numpy() * cwm[va["topology"].to_numpy()]
+        print(f"[class_weight_multiplier] applied to train+valid: "
+              + ", ".join(f"{c}={m:.4g}" for c, m in enumerate(cwm) if m != 1.0))
     print(f"       train {len(tr):,}  valid {len(va):,}  test {len(te):,}")
 
     summary = {
@@ -214,21 +319,28 @@ def main():
 
     for name, feats in (("S1", feats_s1), ("S1p", feats_s1p)):
         _, _, _, res = train_one(name, feats, tr, va, te, cfg["xgboost"],
-                                 cfg["seed"], sig_codes, bkg_effs, outdir)
+                                 cfg["seed"], sig_codes, bkg_effs, outdir, cfg)
         summary["models"][name] = res
 
     y_te = (te["topology"] > 0).astype(np.int8).to_numpy()
     w_te = te["weight"].to_numpy()
     cmp_cfg = cfg.get("compare_models", {})
-    for key, fn in (("Dbc_old_8node", eval_old_dbc),
-                    ("Dbc_3class_expanded", eval_dbc_3class)):
-        s = fn(cmp_cfg.get(key, ""), te)
-        if s is not None:
-            summary["comparison_test_auc"][key] = float(
-                roc_auc_score(y_te, s, sample_weight=w_te))
-            np.savez_compressed(outdir / f"cmp_{key}.npz",
-                                score=s.astype(np.float32), y=y_te,
-                                w=w_te.astype(np.float32))
+    comparisons = {"Dbc_old_8node": eval_old_dbc(cmp_cfg.get("Dbc_old_8node", ""), te)}
+    three = eval_dbc_3class(cmp_cfg.get("Dbc_3class_expanded", ""), te)
+    if three:
+        comparisons.update(three)
+    # untrained baseline: the raw GloParT sum used to pick J (bc + bb + topbwc)
+    raw = cfg.get("raw_sum_baseline", [])
+    if raw and all(c in te.columns for c in raw):
+        comparisons["raw_sum_bc_bb_topbwc"] = te[raw].sum(axis=1).to_numpy()
+    for key, s in comparisons.items():
+        if s is None:
+            continue
+        summary["comparison_test_auc"][key] = float(
+            roc_auc_score(y_te, s, sample_weight=w_te))
+        np.savez_compressed(outdir / f"cmp_{key}.npz",
+                            score=np.asarray(s, dtype=np.float32), y=y_te,
+                            w=w_te.astype(np.float32))
 
     (outdir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
@@ -236,25 +348,27 @@ def main():
     for name in ("S1", "S1p"):
         r = summary["models"][name]
         ot = r["overtraining"]
-        print(f"  {name:4s} AUC train {r['train']['auc']:.4f} / test {r['test']['auc']:.4f}"
-              f"   overtraining {ot['verdict']} (bias {ot['sig_eff_bias_pct']:+.1f}%)"
+        print(f"  {name:4s} AUC train {r['train']['auc']:.3f} / test {r['test']['auc']:.3f}"
+              f"   overtraining {ot['verdict']} "
+              f"(sig {ot['rel_diff_sig_pct']:.1f}% / bkg {ot['rel_diff_bkg_pct']:.1f}%)"
               f"   best_iter {r['best_iteration']}")
         for wp in r["test"]["working_points"]:
             print(f"       bkg_eff {wp['target_bkg_eff']:<6} -> sig_eff {wp['signal_eff']:.3f}")
         pc = r["test"]["per_class_signal_eff_at_1e-3"]
         print("       per-class @1e-3: " + "  ".join(f"{k} {v:.3f}" for k, v in pc.items()))
     for k, v in summary["comparison_test_auc"].items():
-        print(f"  {k:22s} test AUC {v:.4f}")
-    print("\n  S1 top-10 nodes by gain:")
-    for i, rk in enumerate(summary["models"]["S1"]["feature_importance"][:10], 1):
+        print(f"  {k:24s} test AUC {v:.3f}")
+    print("\n  S1 top-10 by permutation importance (AUC drop) [gain rank in brackets]:")
+    grank = {r["feature"]: i for i, r in
+             enumerate(summary["models"]["S1"]["feature_importance"], 1)}
+    for i, rk in enumerate(summary["models"]["S1"]["permutation_importance"][:10], 1):
         print(f"    {i:>2}  {rk['feature'].replace('ak8_gpt_',''):<14} "
-              f"gain {rk['gain']:>9.1f}  splits {rk['weight']:>5.0f}")
-    print("  XGBoost: " + ", ".join(f"{k}={v}" for k, v in cfg["xgboost"].items()))
-
-    if not args.no_report:
-        import make_report_panel
-        make_report_panel.build_report(cfg, outdir)
+              f"dAUC {rk['auc_drop']:+.5f}   [gain #{grank[rk['feature']]}]")
+    print("  XGBoost: " + ", ".join(f"{k}={v}" for k, v in cfg["xgboost"].items()
+                                    if not k.startswith("_")))
     print(f"\n  outputs -> {outdir}")
+    if not args.no_report:
+        print("  (render plots with:  source LCG; python3 S1_tagger/make_plots_root.py)")
 
 
 if __name__ == "__main__":
