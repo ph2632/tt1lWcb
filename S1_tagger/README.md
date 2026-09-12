@@ -12,23 +12,26 @@ Binary `binary:logistic`. Output ∈ [0,1], plotted as `$S_{1}$ (BDT fine-tuned 
 
 ## Signal / background
 
-**Signal** = an AK8 jet in the Vcb sample (`ttbar-powheg`) that is gen-matched
-to one of the four W→cb topologies, gated on `w_decay == 5`:
+**Signal** = an AK8 jet gen-matched to one of 6 topologies (codes 1-4 in the
+Vcb sample `ttbar-powheg`, gated on `w_decay == 5`; codes 5-6 pulled from the
+other 16 non-Vcb samples and promoted to signal, never thinned):
 
-| code | name | flag | ak8_type |
+| code | name | flag | source |
 |---|---|---|---|
-| 1 | `Wcb`    | `ak8_match_wqq_wcb`  | 1 (merged 2-prong b+c) |
-| 2 | `t2_bc`  | `ak8_match_tbq_wcb` & n_c≥1 | 2 (top-b + W's c) |
-| 3 | `t2_bb`  | `ak8_match_tbq_wcb` & n_c=0 | 2 (top-b + W's b) |
-| 4 | `t3_bbc` | `ak8_match_tbqq_wcb` | 4 (fully-merged t→bbc) |
+| 1 | `Wcb`    | `ak8_match_wqq_wcb`, ak8_type 1 | ttbar-powheg (merged 2-prong b+c) |
+| 2 | `t2_bc`  | `ak8_match_tbq_wcb` & n_c≥1, ak8_type 2 | ttbar-powheg (top-b + W's c) |
+| 3 | `t2_bb`  | `ak8_match_tbq_wcb` & n_c=0, ak8_type 2 | ttbar-powheg (top-b + W's b) |
+| 4 | `t3_bbc` | `ak8_match_tbqq_wcb`, ak8_type 4 | ttbar-powheg (fully-merged t→bbc) |
+| 5 | `t2_bc_proxy` | `ak8_match_top_bc` & `w_decay==4` | the 16 non-Vcb samples (W→cs event, statistically identical to class 2) |
+| 6 | `z_bb` (Z(bb)-adj) | `z_decay==5` & dR(J, Z_gen)<0.8 | the 16 non-Vcb samples (tagger can't distinguish it from class 3, see `z_contamination_study.py`) |
 
 The fully-**resolved** W→cb events (~48 % of the Vcb sample) and all other
 `ttbar-powheg` jets are **dropped** — they are real W→cb physics and must not
 teach the tagger to reject signal.
 
-**Background** = every AK8 jet from the other 16 samples (tt-semi, tt-had,
+**Background** = every remaining AK8 jet from the other 16 samples (tt-semi, tt-had,
 ttbb, single-top, QCD, W+jets, DY, ttV, ttH, dibosons). Bernoulli-thinned with
-`background_keep_prob = 0.15`, each kept jet up-weighted by `1/p`, so the
+`background_keep_prob` (see `config.json`), each kept jet up-weighted by `1/p`, so the
 summed event weight (effective luminosity) is preserved.
 
 ## Preselection (per jet — the MAT `PRE`)
@@ -77,17 +80,34 @@ Revisit if we move to an NN.
 
 ## Run
 
-```bash
-# 1. build the per-jet training set  (streams 17 ROOT files -> EOS parquet, ~10 min)
-./.venv/bin/python S1_tagger/build_trainset.py            # --overwrite to rebuild
+The pipeline is 3 steps, each also runnable standalone; `run_s1_tagger.py`
+drives all of them (2026-09-13 -- scripts moved to `tt1lWcb/` root and
+renamed so `ls` shows execution order):
 
-# 2. train S1 + S1', benchmark vs old D_bc and Youpeng's 3-class  (~5 min)
-./.venv/bin/python S1_tagger/train.py
+```bash
+./run_s1_tagger.py                 # train + plots (dataset reused if built)
+./run_s1_tagger.py all             # dataset + train + plots
+./run_s1_tagger.py dataset         # 01_build_trainset.py only
+./run_s1_tagger.py train           # 02_train_tagger.py only
+./run_s1_tagger.py plots           # 03_render_report.py only (no retrain)
+
+# or run any step directly:
+./.venv/bin/python 01_build_trainset.py   # ~10 min (streams 17 ROOT files -> EOS parquet)
+./.venv/bin/python 02_train_tagger.py     # ~50 min (S1 only; derives class_weight_multiplier
+                                           # fresh from config.json's class_weight_share every run)
+./.venv/bin/python 03_render_report.py    # ~15 s (self-bootstraps into an LCG view for PyROOT)
 ```
+
+`config.json` is pure input (preselection fallback, `class_weight_share`,
+XGBoost hyperparameters) — nothing in the pipeline writes back to it; the
+old separate "derive multiplier from the built dataset, write it into
+config.json" shell step was folded into `02_train_tagger.py` so it can never
+go stale relative to `class_weight_share`.
 
 Dataset parquet → `$S1_DATA_DIR` (default `/eos/user/a/agapitos/S1_tagger_data/`,
 **not** `work` which is ~91 % full). Models + plots + `summary.json` →
-`S1_tagger/output/<dataset_tag>/`.
+`S1_tagger/output/<dataset_tag>/` (still under `S1_tagger/` even though the
+scripts themselves now live at the `tt1lWcb/` root).
 
 ## Outputs — everything under `output/<dataset_tag>/`, one self-contained bundle per run
 
@@ -104,7 +124,7 @@ Dataset parquet → `$S1_DATA_DIR` (default `/eos/user/a/agapitos/S1_tagger_data
 | **`panel_{S1,S1p}.png`** | **2×2:  ROC │ overtraining  /  feature-importance+info │ score-by-topology** |
 
 Re-render any run's figures without retraining:
-`./.venv/bin/python S1_tagger/make_report_panel.py`
+`./.venv/bin/python 03_render_report.py --config S1_tagger/config.json`
 
 Published into the gallery root (`:8899`), tagged per run so nothing clobbers:
 `S1_tagger_<tag>_panel_{S1,S1p}.png`, `_results_table.png`, `_roc.png`,

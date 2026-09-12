@@ -4,6 +4,10 @@ These are derived per-event quantities (no dedicated ROOT branch):
   score_SC        : S_EVT = w_qq / sum(6 EC categories)
   score_Dbc       : Boosted Dbc (trained BDT)
   score_Dbc_ratio : ratio Dbc = bc/(bc+bb+bs+qcd+cc+cs+qq+topbw)
+  score_Dbc3_bc   : Youpeng's 3-class GloParT-node BDT, p(bc) column
+  score_Dbc3_bb   : Youpeng's 3-class GloParT-node BDT, p(bb) column
+                    (dbc_3class_v1/expanded model; applied at load time,
+                    no such branch exists in the production trees, 2026-09-12)
 """
 from .helpers import V
 
@@ -11,6 +15,8 @@ VARIABLES = [
     V("score_SC", None, r"$S_{\mathrm{EVT}}$", xlim=(0.0, 1.0)),
     V("score_Dbc", None, r"$D_{bc}$ (BDT)", xlim=(0.0, 1.0)),
     V("score_Dbc_ratio", None, r"$D_{bc}$ (ratio)", xlim=(0.0, 1.0)),
+    V("score_Dbc3_bc", None, r"$D_{bc}$ (3cl)", xlim=(0.0, 1.0)),
+    V("score_Dbc3_bb", None, r"$D_{bb}$ (3cl)", xlim=(0.0, 1.0)),
     # ttH/ttZ/ttbb tagger scores (ParT-based, from the scored trees)
     V("score_ttHbb", "score_ttHbb", r"ttH$(bb)$ tagger score", xlim=(0.0, 1.0)),
     V("score_ttHcc", "score_ttHcc", r"ttH$(cc)$ tagger score", xlim=(0.0, 1.0)),

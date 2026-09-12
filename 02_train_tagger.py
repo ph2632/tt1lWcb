@@ -18,8 +18,19 @@ Per run everything lands in  S1_tagger/output/<dataset_tag>/ :
                     feature_importance, overtraining (KS + bias), comparisons
   + the plots and 2x2 panels written by make_report_panel.build_report()
 
+class_weight_multiplier is no longer read from config.json: it is DERIVED
+here, every run, from config.json's class_weight_share and the just-loaded
+train split's real per-class sumw (2026-09-13 -- previously a separate shell
+step wrote it into config.json, which could silently go stale if
+class_weight_share was edited without re-running that step). config.json
+therefore only carries class_weight_share now; the derived numbers are
+printed below and baked into summary.json's "config" for 03_render_report.py.
+
 Usage:
-  ./.venv/bin/python S1_tagger/train.py [--config S1_tagger/config.json]
+  ./.venv/bin/python 02_train_tagger.py [--config S1_tagger/config.json]
+
+Step 2/3 of the S1 tagger pipeline: 01_build_trainset.py -> 02_train_tagger.py
+-> 03_render_report.py (or run_s1_tagger.py to drive all three).
 """
 import argparse
 import datetime
@@ -35,19 +46,30 @@ from sklearn.metrics import roc_auc_score, roc_curve, log_loss
 from xgboost import XGBClassifier
 
 HERE = Path(__file__).resolve().parent
+PKG = HERE / "S1_tagger"          # config.json / output live here
+
+
+def _done_banner(t0, output):
+    """One unmissable line at the very end of a run: wall time + where the
+    output landed (2026-09-13, user -- the per-step timers were easy to miss
+    scrolled past in a long log)."""
+    line = f"[DONE  time {(time.time() - t0) / 60.0:.1f} min  output: {output}]"
+    print("-" * len(line)); print(line); print("-" * len(line))
 
 
 def load_split(dsdir, sub, columns):
     paths = sorted((dsdir / sub).glob("*.parquet"))
     if not paths:
-        raise SystemExit(f"no parquet parts in {dsdir/sub} -- run build_trainset.py first")
+        raise SystemExit(f"no parquet parts in {dsdir/sub} -- run 01_build_trainset.py first")
     return pd.concat((pd.read_parquet(p, columns=columns) for p in paths),
                      ignore_index=True)
 
 
 def class_weight_lookup(cfg):
-    """topology-code -> multiplier array (index 0..5), 1.0 where unspecified
-    (background and any un-listed class pass through unchanged)."""
+    """topology-code -> multiplier array, 1.0 where unspecified (background
+    and any un-listed class pass through unchanged). Reads cfg["class_weight_
+    multiplier"] -- populated in-memory by derive_class_weight_multiplier(),
+    never persisted to config.json."""
     cwm = cfg.get("class_weight_multiplier")
     if not cwm:
         return None
@@ -55,6 +77,31 @@ def class_weight_lookup(cfg):
     for k, v in cwm.items():
         lut[int(k)] = float(v)
     return lut
+
+
+def derive_class_weight_multiplier(train_df, cfg):
+    """Derive {topology -> multiplier} from class_weight_share (the CHOSEN
+    target sumw fraction per signal topology) and the train split's REAL
+    per-class raw sumw:  multiplier_c = share_c * total_raw_sumw / raw_sumw_c.
+    Sets cfg["class_weight_multiplier"] IN MEMORY ONLY (never written back to
+    config.json) so class_weight_lookup(cfg) and summary.json's "config"
+    field both see it.
+
+    Folds in what used to be a separate shell step (run against the freshly
+    built parquet, then written back into config.json) -- computing it here
+    means it can never go stale relative to class_weight_share.
+    """
+    share = cfg.get("class_weight_share")
+    if not share:
+        return
+    g = (train_df.loc[train_df["topology"] > 0]
+                 .groupby("topology")["weight"].sum())
+    tot = g.sum()
+    mult = {k: round(float(v) * tot / g[int(k)], 4) for k, v in share.items()
+            if int(k) in g.index}
+    cfg["class_weight_multiplier"] = mult
+    print(f"[class_weight_multiplier] derived from real train sumw: "
+          + ", ".join(f"{k}={v:g}" for k, v in mult.items()))
 
 
 def add_derived_features(df, cfg):
@@ -182,9 +229,13 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs,
 
     model = XGBClassifier(**params)
     t0 = time.time()
+    # verbose=100 (was False, 2026-09-13): fit on 5M+ rows for ~2500-2900
+    # rounds takes 45-65 min with ZERO console output otherwise, which reads
+    # as "hung" -- this just prints eval AUC every 100 rounds, no effect on
+    # the fit itself.
     model.fit(tr[feats], y["train"], sample_weight=w["train"],
               eval_set=[(tr[feats], y["train"]), (va[feats], y["valid"])],
-              sample_weight_eval_set=[w["train"], w["valid"]], verbose=False)
+              sample_weight_eval_set=[w["train"], w["valid"]], verbose=100)
     fit_s = time.time() - t0
     best_it = int(getattr(model, "best_iteration", params["n_estimators"] - 1))
 
@@ -271,8 +322,9 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs,
 
 
 def main():
+    t_wall0 = time.time()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=Path, default=HERE / "config.json")
+    ap.add_argument("--config", type=Path, default=PKG / "config.json")
     ap.add_argument("--no-report", action="store_true", help="skip panel rendering")
     ap.add_argument("--only", default=None,
                     help="comma-separated model(s) to train, e.g. S1 or S1,S1p "
@@ -281,7 +333,7 @@ def main():
     cfg = json.loads(args.config.read_text())
 
     dsdir = Path(os.environ.get("S1_DATA_DIR", cfg["data_dir"])) / cfg["dataset_tag"]
-    outdir = HERE / cfg["output_dir"] / cfg.get("run_tag", cfg["dataset_tag"])
+    outdir = PKG / cfg["output_dir"] / cfg.get("run_tag", cfg["dataset_tag"])
     outdir.mkdir(parents=True, exist_ok=True)
     marker = dsdir / "dataset_complete.json"
     if not marker.exists():
@@ -289,15 +341,15 @@ def main():
                           for sub in ("train", "valid", "test"))
         if in_progress:
             raise SystemExit(
-                f"[train.py] {marker} not found -- build_trainset.py for "
+                f"[02_train_tagger] {marker} not found -- 01_build_trainset.py for "
                 f"dataset_tag='{cfg['dataset_tag']}' looks IN PROGRESS "
                 f"(partial parquet already under {dsdir}).\n"
-                f"  Check it's still running:  ps aux | grep build_trainset\n"
+                f"  Check it's still running:  ps aux | grep 01_build_trainset\n"
                 f"  It finishes when its log prints '==== dataset built ===='. "
-                f"Re-run train.py once that shows up.")
+                f"Re-run 02_train_tagger.py once that shows up.")
         raise SystemExit(
-            f"[train.py] no dataset at {dsdir} -- run build_trainset.py first:\n"
-            f"  ./.venv/bin/python S1_tagger/build_trainset.py --config {args.config}")
+            f"[02_train_tagger] no dataset at {dsdir} -- run 01_build_trainset.py first:\n"
+            f"  ./.venv/bin/python 01_build_trainset.py --config {args.config}")
     ds_meta = json.loads(marker.read_text())
     sig_codes = {int(k): v for k, v in ds_meta["signal_codes"].items()}
     bkg_effs = cfg["benchmark_bkg_eff"]
@@ -322,6 +374,9 @@ def main():
     # per-class sig sumw retarget (e.g. Wcb was 0.4%, proxy 99% unweighted) --
     # TRAIN + VALID only, so the loss/early-stopping objective is reshaped but
     # TEST (reported AUC, working points, per-class eff) stays physical.
+    # Multiplier is DERIVED here from tr's real (pre-reweight) per-class sumw
+    # -- see derive_class_weight_multiplier() docstring.
+    derive_class_weight_multiplier(tr, cfg)
     cwm = class_weight_lookup(cfg)
     if cwm is not None:
         tr["weight"] = tr["weight"].to_numpy() * cwm[tr["topology"].to_numpy()]
@@ -399,9 +454,10 @@ def main():
                   f"dAUC {rk['auc_drop']:+.5f}   [gain #{grank[rk['feature']]}]")
     print("  XGBoost: " + ", ".join(f"{k}={v}" for k, v in cfg["xgboost"].items()
                                     if not k.startswith("_")))
-    print(f"\n  outputs -> {outdir}")
     if not args.no_report:
-        print("  (render plots with:  source LCG; python3 XGBoost_training.py)")
+        print("\n  (render plots with:  ./.venv/bin/python 03_render_report.py)")
+    print()
+    _done_banner(t_wall0, outdir)
 
 
 if __name__ == "__main__":

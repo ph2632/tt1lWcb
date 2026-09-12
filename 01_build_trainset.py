@@ -17,6 +17,20 @@ parquet chunks.
                      mSD, all gpt nodes agree to 1-2%) -- promoted to signal
                      instead of contaminating the background pool with
                      mislabeled duplicates of class 2. Never thinned.
+                 6 = Z(bb)-adj: gen-matched hadronic Z->bb in the 16 non-Vcb
+                     samples (z_decay==5 & dR(J, Z_gen)<0.8, the SAME
+                     geometric match Make_plots.py already uses for its
+                     mat_cat==15).  Quantified in z_contamination_study.py:
+                     mean S1 response 0.797 vs true t2(b'b) signal's 0.834,
+                     tracking it closely up to and including the highest
+                     score bin -- a b'+b jet from a top and a b+b jet from a
+                     Z are the same object to a bb-content tagger.  8.1x
+                     LARGER in sumw than genuine t2(b'b) (real Zbb yield vs a
+                     Cabibbo-suppressed partial-merge topology), so this is a
+                     substantial addition, not a rounding correction. Never
+                     thinned. Z->cc / Z->light stay BACKGROUND: Z->cc scores
+                     0.452, far from the bc-like region -- the "fakes bc"
+                     hypothesis is not supported by the tagger response.
   background   : every remaining AK8 jet from the 16 non-Vcb samples (label
                  0), Bernoulli-thinned with p = background_keep_prob and
                  weight up-scaled by 1/p so the summed weight (effective
@@ -30,12 +44,16 @@ Structure and helpers follow
   /eos/user/y/youpeng/research/wcb/BoostedDbcTrain/dcb_versions_v1/run_dcb_versions.py
 
 Usage:
-  ./.venv/bin/python S1_tagger/build_trainset.py [--config S1_tagger/config.json] [--overwrite]
+  ./.venv/bin/python 01_build_trainset.py [--config S1_tagger/config.json] [--overwrite]
+
+Step 1/3 of the S1 tagger pipeline: 01_build_trainset.py -> 02_train_tagger.py
+-> 03_render_report.py (or run_s1_tagger.py to drive all three).
 """
 import argparse
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -45,12 +63,15 @@ import awkward as ak
 import uproot
 
 HERE = Path(__file__).resolve().parent
+PKG = HERE / "S1_tagger"          # config.json / output / presel.py live here
 PI = float(np.pi)
 
 # jet topology codes
-SIG_CODES = {1: "Wcb", 2: "t2_bc", 3: "t2_bb", 4: "t3_bbc", 5: "t2_bc_proxy"}
+SIG_CODES = {1: "Wcb", 2: "t2_bc", 3: "t2_bb", 4: "t3_bbc", 5: "t2_bc_proxy",
+             6: "z_bb"}
 BKG_CODE = 0
 PROXY_CODE = 5
+ZBB_CODE = 6
 
 
 # --------------------------------------------------------------------------- #
@@ -77,6 +98,14 @@ def event_split(source, run, lumi, event, split_cfg):
     lo = split_cfg["train"]
     hi = lo + split_cfg["valid"]
     return np.where(buckets < lo, "train", np.where(buckets < hi, "valid", "test"))
+
+
+def _done_banner(t0, output):
+    """One unmissable line at the very end of a run: wall time + where the
+    output landed (2026-09-13, user -- the per-step timers were easy to miss
+    scrolled past in a long log)."""
+    line = f"[DONE  time {(time.time() - t0) / 60.0:.1f} min  output: {output}]"
+    print("-" * len(line)); print(line); print("-" * len(line))
 
 
 def dphi_pipi(a, b):
@@ -112,8 +141,9 @@ def topology_codes(events, template):
 
 # --------------------------------------------------------------------------- #
 def main():
+    t_wall0 = time.time()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=Path, default=HERE / "config.json")
+    ap.add_argument("--config", type=Path, default=PKG / "config.json")
     ap.add_argument("--overwrite", action="store_true",
                     help="rebuild even if dataset_complete.json exists")
     ap.add_argument("--limit-files", type=int, default=0,
@@ -131,6 +161,7 @@ def main():
     marker = data_dir / "dataset_complete.json"
     if marker.exists() and not args.overwrite:
         print(f"[skip] {marker} exists -- pass --overwrite to rebuild")
+        _done_banner(t_wall0, data_dir)
         return
 
     mc_dir = Path(cfg["mc_dir"])
@@ -161,6 +192,7 @@ def main():
     # propagates here automatically; config.json only supplies fallbacks.
     presel = dict(cfg["preselection"])
     try:
+        sys.path.insert(0, str(PKG))
         from presel import parse_preselection
         parsed, cut_expr, missing = parse_preselection()
         presel.update(parsed)
@@ -179,7 +211,8 @@ def main():
     kin = ["ak8_pt", "ak8_eta", "ak8_phi", "ak8_sdmass"]
     truth = ["ak8_type", "ak8_n_b_in_jet", "ak8_n_c_in_jet",
              "ak8_match_wqq_wcb", "ak8_match_tbq_wcb", "ak8_match_tbqq_wcb",
-             "ak8_match_top_bc", "w_decay"]
+             "ak8_match_top_bc", "w_decay",
+             "z_decay", "genZ_pt", "genZ_eta", "genZ_phi"]
     ev_scalar = ["run", "luminosityBlock", "event", "n_ak8",
                  "lep1_pt", "lep1_eta", "lep1_phi"] + cfg["weights"]
     read_cols = sorted(set(kin + truth + ev_scalar + feats_all))
@@ -255,10 +288,28 @@ def main():
                 w_decay_bg = broadcast(events, "w_decay", template, -1).astype(np.int16)
                 m_top_bc = flatten(events["ak8_match_top_bc"], 0).astype(bool)
                 proxy = (w_decay_bg == 4) & m_top_bc
-                topo = np.where(proxy, PROXY_CODE, BKG_CODE).astype(np.int8)
+
+                # Z(bb)-adj: gen-matched hadronic Z->bb, same geometric match
+                # Make_plots.py uses for mat_cat==15 (dR(J,Z_gen)<0.8).
+                # Quantified in z_contamination_study.py: mean S1 response
+                # 0.797 vs true t2(b'b)'s 0.834 -- the tagger cannot tell a
+                # b'+b top pairing from a Z->bb pairing, so this is promoted
+                # to signal for the same reason the t2(b'c) proxy was.
+                # z_bb takes precedence over the (rarer) proxy match on the
+                # few jets where both could apply, matching the precedence
+                # already established in z_contamination_study.py.
+                z_decay = broadcast(events, "z_decay", template, 0).astype(np.int16)
+                gz_pt = broadcast(events, "genZ_pt", template, -1.0)
+                gz_eta = broadcast(events, "genZ_eta", template, 0.0)
+                gz_phi = broadcast(events, "genZ_phi", template, 0.0)
+                z_dr = np.hypot(gz_eta - jeta, dphi_pipi(gz_phi, jphi))
+                z_bb = (z_decay == 5) & (gz_pt > 0.0) & (jpt > 0.0) & (z_dr < 0.8)
+
+                special = proxy | z_bb
+                topo = np.select([z_bb, proxy], [ZBB_CODE, PROXY_CODE], default=BKG_CODE).astype(np.int8)
                 thin = rng.random(len(keep)) < keep_p   # thin true background only
-                keep &= (proxy | thin)
-                weight = np.where(proxy, weight, weight / keep_p)  # ... keep sum(w) intact for bkg
+                keep &= (special | thin)
+                weight = np.where(special, weight, weight / keep_p)  # ... keep sum(w) intact for bkg
 
             if not keep.any():
                 continue
@@ -310,6 +361,7 @@ def main():
         tot = sum(counts[s][c] for s in counts)
         print(f"      {c} {name:8s} {tot:>9d}")
     print(f"  wrote {part_idx} chunks to {data_dir}  in {summary['build_seconds']}s")
+    _done_banner(t_wall0, data_dir)
 
 
 if __name__ == "__main__":

@@ -15,33 +15,45 @@ The preselection is READ FROM Make_plots.py (the `_SELECTIONS["PRE"]` block),
 so changing a threshold there propagates here automatically -- nothing to keep
 in sync by hand.
 
-Two interpreters are needed and are handled for you:
-  training / dataset -> ./.venv/bin/python   (xgboost, awkward, zstd parquet)
-  plots              -> an LCG view          (PyROOT; the venv has no ROOT)
+Drives the 3-step pipeline (each step also runs standalone):
+  dataset -> 01_build_trainset.py   per-jet training parquet (venv)
+  train   -> 02_train_tagger.py     XGBoost S1 tagger + summary.json (venv)
+  plots   -> 03_render_report.py    PyROOT panel + figures (self-bootstraps
+                                     into an LCG view; no separate interpreter
+                                     handling needed here since 2026-09-13)
+
+config.json is pure input (preselection fallback, class_weight_share,
+hyperparameters) -- nothing in this pipeline writes back to it.
+class_weight_multiplier is derived fresh every run inside 02_train_tagger.py
+from class_weight_share + the real per-class train sumw, so it can never go
+stale.
 """
 import argparse
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE / "S1_tagger"
 CONFIG = PKG / "config.json"
 VENV = HERE / ".venv" / "bin" / "python"
-LCG = "/cvmfs/sft.cern.ch/lcg/views/LCG_105/x86_64-el9-gcc13-opt/setup.sh"
 
 STEPS = ("dataset", "train", "plots")
+STEP_SCRIPT = {"dataset": HERE / "01_build_trainset.py",
+               "train": HERE / "02_train_tagger.py",
+               "plots": HERE / "03_render_report.py"}
 
 
-def sh(cmd, lcg=False):
-    if lcg:
-        cmd = ["bash", "-lc", f"source {LCG} >/dev/null 2>&1; " + " ".join(cmd)]
+def sh(cmd):
     print(f"\n>>> {' '.join(str(c) for c in cmd[:3])} ...", flush=True)
+    t0 = time.time()
     r = subprocess.run(cmd, cwd=HERE)
     if r.returncode:
         sys.exit(f"step failed (exit {r.returncode})")
+    print(f"    ({time.time() - t0:.1f}s)", flush=True)
 
 
 def show_presel():
@@ -87,6 +99,7 @@ def main():
                     help="override a config or xgboost key, e.g. max_depth=3")
     ap.add_argument("--overwrite-dataset", action="store_true")
     args = ap.parse_args()
+    t_wall0 = time.time()
 
     steps = args.steps
     if "presel" in steps:
@@ -106,20 +119,21 @@ def main():
     show_presel()
 
     if "dataset" in steps:
-        cmd = [str(VENV), str(PKG / "build_trainset.py"), "--config", str(cfg_path)]
+        cmd = [str(VENV), str(STEP_SCRIPT["dataset"]), "--config", str(cfg_path)]
         if args.overwrite_dataset:
             cmd.append("--overwrite")
         sh(cmd)
     if "train" in steps:
-        sh([str(VENV), str(PKG / "train.py"), "--config", str(cfg_path), "--no-report"])
+        sh([str(VENV), str(STEP_SCRIPT["train"]), "--config", str(cfg_path), "--no-report"])
     if "plots" in steps:
-        if not Path(LCG).exists():
-            sys.exit(f"LCG view not found: {LCG}")
-        sh(["python3", str(PKG / "make_plots_root.py"), "--config", str(cfg_path)],
-           lcg=True)
+        # 03_render_report.py self-bootstraps into an LCG view if PyROOT isn't
+        # importable in VENV, so no separate interpreter handling is needed
+        # here (2026-09-13; previously this step forced its own LCG source).
+        sh([str(VENV), str(STEP_SCRIPT["plots"]), "--config", str(cfg_path)])
 
     cfg = json.loads(cfg_path.read_text())
     print(f"\ndone -> {PKG / cfg['output_dir'] / cfg.get('run_tag', cfg['dataset_tag'])}")
+    print(f"[TIMER] run_s1_tagger.py total: {time.time() - t_wall0:.1f}s")
 
 
 if __name__ == "__main__":

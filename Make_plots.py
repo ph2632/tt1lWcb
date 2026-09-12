@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import mplhep as hep
 
 from sklearn.metrics import roc_curve, auc
-from train_bdt.dbc_tools import DbcEvaluator
+from train_bdt.dbc_tools import DbcEvaluator, Dbc3ClassEvaluator
 
 
 def _dir_readable(path):
@@ -229,7 +229,11 @@ class Config:
         #   (t^2(b'b) 72.4% -> 95.2%, the class GloParT has no node for).
         #   J feeds EVERY cached *_0 column, true_cat / mat_cat, score_Dbc and
         #   every gpt_* ratio -> full re-derive (~25 min).
-        self.cache_tag = "derived_v22_jrank_v1"   # J = argmax(bc+bb+topbwc) (2026-09-10)
+        # v23 (derived_v23_dbc3cl_v1, 2026-09-12): + score_Dbc3_bc/score_Dbc3_bb
+        #   (Youpeng's 3-class GloParT-node BDT, dbc_3class_v1/expanded model,
+        #   applied at load time -- no such branch exists in the production
+        #   trees). New cached fields -> full re-derive (~25 min).
+        self.cache_tag = "derived_v23_dbc3cl_v1"   # + score_Dbc3_{bc,bb} (2026-09-12)
 
         # ------------------------------------------------------------------
         # Switches
@@ -250,6 +254,10 @@ class Config:
         # BDT Dbc
         # ------------------------------------------------------------------
         self.dbc_model_path = "./train_bdt/dbc_bdt_output/bdt_dbc_model.pkl"
+        # Youpeng's 3-class (bc/bb/other) GloParT-node model -- native XGBoost
+        # booster, not a tree branch (2026-09-12); see Dbc3ClassEvaluator.
+        self.dbc3_model_path = ("/eos/user/y/youpeng/research/wcb/BoostedDbcTrain/"
+                                 "dbc_3class_v1/output_inclusive_v1/models/expanded/model.json")
 
         # ------------------------------------------------------------------
         # Sample catalog
@@ -326,6 +334,8 @@ class Config:
             "Data": "Data 2017",
 
             "score_Dbc": r"$D_{bc}$",
+            "score_Dbc3_bc": r"$D_{bc}$ (3cl)",
+            "score_Dbc3_bb": r"$D_{bb}$ (3cl)",
             "score_SC": r"$S_{\mathrm{EVT}}$",
 
             "score_cata_w_qq_norm": r"EC $W \to qq'$ score",
@@ -1087,6 +1097,7 @@ class DataManager:
             mode="bdt",
             model_path=self.cfg.dbc_model_path,
         )
+        self.dbc3_eval = Dbc3ClassEvaluator(model_path=self.cfg.dbc3_model_path)
 
         # Columns to pull from the derived parquet cache (see columns_for_cache).
         # None -> read every column (old behaviour / WCB_LOAD_ALL_COLS=1).
@@ -2614,6 +2625,14 @@ class DataManager:
         score_Dbc = np.asarray(score_Dbc, dtype=np.float32)
 
         # ------------------------------------------------------------------
+        # Dbc 3-class BDT (Youpeng's dbc_3class_v1/expanded model, native
+        # XGBoost booster over 33 ak8_gpt_* nodes) -- NOT a tree branch, this
+        # is computed here at load time exactly like score_Dbc above (2026-09-12)
+        # ------------------------------------------------------------------
+        _dbc3_feats = {name: leading_or_zero(name) for name in Dbc3ClassEvaluator.FEATURES}
+        score_Dbc3_bc, score_Dbc3_bb = self.dbc3_eval.get_scores(_dbc3_feats)
+
+        # ------------------------------------------------------------------
         # True category as int8 code
         # ------------------------------------------------------------------
         true_cat = self.make_true_category(ak8_type, n_c, is_qcd)
@@ -3691,6 +3710,8 @@ class DataManager:
             "score_Dbc_jb": score_Dbc_jb,
             "score_Dbc_jsup1": score_Dbc_jsup1,
             "score_Dbc_jsup2": score_Dbc_jsup2,
+            "score_Dbc3_bc": score_Dbc3_bc,
+            "score_Dbc3_bb": score_Dbc3_bb,
             "score_SC": score_SC,
 
             "score_cata_w_qq_norm": score_cata_w_qq_norm,
@@ -4168,9 +4189,11 @@ class Histogrammer:
                              (2, "Cat_Top_bc"), (7, "Cat_Top_bq"),
                              (23, "Cat_Top_bqqc"), (8, "Cat_Top_bqq"),
                              (20, "Cat_Top_bbc"),
-                             # merged Z: cc+bb -> "Zhf", light qq' -> "Zlight"
-                             # (both green); resolved Z -> Rest (V-resolved).
-                             (13, "Zlight"), (14, "Zhf"), (15, "Zhf"),
+                             # merged Z: bb / cc now separate lines (were
+                             # both pooled into "Zhf" until 2026-09-12), light
+                             # qq' -> "Zlight" (all three green); resolved Z ->
+                             # Rest (V-resolved).
+                             (13, "Zlight"), (14, "Zcc"), (15, "Zbb"),
                              (3, "Rest"))
                 per = scatter_hist_by_category(
                     values, weights, mat_cat, bins, [c for c, _ in _code_key])
@@ -4237,9 +4260,14 @@ class Histogrammer:
 # ~0.066 and labels ~0.057 of the pad height, CMS label bold ~0.074, thin frame,
 # inward ticks on all four sides.
 # --------------------------------------------------------------------------------------
+# 800x800 output PNGs (2026-09-12, user): every figure in this file is a
+# 6x6in canvas, so dpi = CANVAS_PX / 6 gets every plot to 800x800 px from one
+# place, instead of touching each figsize=(6,6) call site individually.
+CANVAS_PX = 800
+_DPI = CANVAS_PX / 6.0
 PLOT_STYLE = {
-    "figure.dpi": 100,
-    "savefig.dpi": 100,
+    "figure.dpi": _DPI,
+    "savefig.dpi": _DPI,
     "font.size": 11,
     "axes.labelsize": 15,
     "axes.titlesize": 13,
@@ -4294,7 +4322,7 @@ class Plotter:
 
     def _save_and_show(self, fig, outbase, tag="PLOT"):
         png = os.path.abspath(outbase + ".png")
-        fig.savefig(png, dpi=100)
+        fig.savefig(png, dpi=_DPI)   # 800x800 px (6in canvas x _DPI)
         plt.close(fig)
         self.saved_pngs.append(png)
         print(f"[{tag}] Saved {os.path.basename(png)}")
@@ -4552,7 +4580,7 @@ class Plotter:
                      "Wcq", "Wqq_light",
                      "Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq",
-                     "Rest", "Zhf", "Zlight"]
+                     "Rest", "Zbb", "Zcc", "Zlight"]
         # Subsets of Wcb / Cat_Top_bc (events with mt == -1) -- drawn as dotted
         # lines, but NOT counted in the grand total or the S/sqrt(S+B) bkg sum.
         _SUBSET_KEYS = ("Wcb_nomt", "Cat_Top_bc_nomt")
@@ -4594,8 +4622,12 @@ class Plotter:
             "Cat_Top_bqqc": r"$t^3(b'cq)$",
             "Cat_Top_bqq":  r"$t^3(b'qq)$",
             "Rest": r"Rest: $g,q,c,b$, $V^{\mathrm{rsd}}$",
-            # merged hadronic Z -- 2 lightest of the green V ramp
-            "Zhf":    r"$Z(c\bar c/b\bar b)$",
+            # merged hadronic Z -- was one pooled "Zhf" line, split
+            # 2026-09-12 (S1_tagger found the tagger cannot separate Z->bb
+            # from real t2(b'b) signal -- worth seeing on its own here too);
+            # 3 lightest of the green V ramp now, darkest->lightest bb/cc/qq.
+            "Zbb":    r"$Z(b\bar b)$",
+            "Zcc":    r"$Z(c\bar c)$",
             "Zlight": r"$Z(qq)$",
         }
 
@@ -4767,7 +4799,11 @@ class Plotter:
         # (dark -> light green), upper->lower of the right legend (2026-09-04,
         # user): W(cq) / W(qq) / Z(cc/bb) / Z(qq).  All SOLID.
         _c_wq_a, _c_wq_b = "#0f8a0f", "#14b814"       # ROOT 209 / ROOT 210
-        _c_z1,   _c_z2   = "#47eb47", "#33ff00"       # ROOT 211 / kSpring (820)
+        # Zhf (cc+bb pooled) used to sit at ROOT 211; split into two adjacent
+        # shades (bb keeps the old ROOT 211, cc is a new shade interpolated
+        # halfway to kSpring) so the ramp stays a smooth dark->light 5-step
+        # green family: Wcq / Wqq / Zbb / Zcc / Zlight.
+        _c_z1,   _c_zcc, _c_z2 = "#47eb47", "#3df523", "#33ff00"  # ROOT 211 / new / kSpring(820)
         style_overrides = {
             # the W->cb SIGNAL -- 5 lines, one per topology, distinct colours,
             # all SOLID, uniform linewidth 2 (2026-09-04, user).  Top->bottom
@@ -4804,10 +4840,11 @@ class Plotter:
             # (2026-09-04 user: distinct colour, all 5 signal lines solid lw 2).
             "Cat_Top_bbc": {"color": _c_sig["Cat_Top_bbc"], "linestyle": "-", "linewidth": 2.0, "zorder": 9},
             "Rest":        {"color": "#9C9CA1", "linestyle": _ls2, "linewidth": 1.5, "zorder": 2},
-            # merged hadronic Z -- the 2 LIGHTEST of the green V ramp, SOLID
+            # merged hadronic Z -- the 3 LIGHTEST of the green V ramp, SOLID
             # lw 2.  Resolved Z stays in grey Rest.
-            "Zhf":         {"color": _c_z1, "linestyle": "-", "linewidth": 2.0, "zorder": 3},
-            "Zlight":      {"color": _c_z2, "linestyle": "-", "linewidth": 2.0, "zorder": 3},
+            "Zbb":         {"color": _c_z1,  "linestyle": "-", "linewidth": 2.0, "zorder": 3},
+            "Zcc":         {"color": _c_zcc, "linestyle": "-", "linewidth": 2.0, "zorder": 3},
+            "Zlight":      {"color": _c_z2,  "linestyle": "-", "linewidth": 2.0, "zorder": 3},
         }
 
         for key in key_order:
@@ -5098,7 +5135,7 @@ class Plotter:
                      "Wcb_res", "Wcb_total", "Wcb_nomt"]
         _t_keys   = ["Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq"]
-        _v_keys   = ["Wcq", "Wqq_light", "Zhf", "Zlight", "Rest"]
+        _v_keys   = ["Wcq", "Wqq_light", "Zbb", "Zcc", "Zlight", "Rest"]
         _hmap = {l: h for h, l in zip(*ax.get_legend_handles_labels())}
 
         # Legend style -- IDENTICAL for MAT and MAT-SIGNAL (2026-09-04, user):
@@ -5166,9 +5203,10 @@ class Plotter:
         )
         # ... then the selection tag as its OWN artist: ~5% higher than the
         # "CMS Simulation" baseline and UPRIGHT (non-italic) (2026-09-04, user;
-        # +1% higher 2026-09-06, user).
-        ax.text(0.36, 1.075, _sel_label, transform=ax.transAxes,
-                ha="left", va="baseline", clip_on=False,
+        # +1% higher 2026-09-06, user; +1% higher & horizontally centred
+        # 2026-09-12, user).
+        ax.text(0.5, 1.085, _sel_label, transform=ax.transAxes,
+                ha="center", va="baseline", clip_on=False,
                 fontsize=CMS_LABEL_FONTSIZE * 0.85,
                 fontstyle="normal", fontweight="normal")
 
@@ -5898,6 +5936,16 @@ def build_plot_settings():
             "bins": np.linspace(0, 1, 51),
         },
         {
+            "var": "score_Dbc3_bc",
+            "xlabel": "$D_{bc}$ (3cl)",
+            "bins": np.linspace(0, 1, 51),
+        },
+        {
+            "var": "score_Dbc3_bb",
+            "xlabel": "$D_{bb}$ (3cl)",
+            "bins": np.linspace(0, 1, 51),
+        },
+        {
             "var": "score_SC",
             "xlabel": r"$S_{\mathrm{EVT}}$",
             "bins": np.linspace(0, 1, 51),
@@ -6390,6 +6438,9 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
 
         # ---- classifier / discriminant outputs ------------------------------
         ("score_Dbc",              "score_Dbc",              0.0, 1.0, 50, r"$D_{bc}(J)$",                 True),
+        # Youpeng's 3-class GloParT-node model, applied at load time (2026-09-13)
+        ("score_Dbc3_bc",          "score_Dbc3_bc",          0.0, 1.0, 50, r"$D_{bc}$ (3cl)",              True),
+        ("score_Dbc3_bb",          "score_Dbc3_bb",          0.0, 1.0, 50, r"$D_{bb}$ (3cl)",              True),
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
@@ -7031,11 +7082,13 @@ def main():
         print("=" * 100)
 
         # end-of-run panel of every raw GloParT ak8_gpt_* score plot.
-        _msfx = ({"PRE": "_PRE", "SR": "_SR", "JB": "_JB"}.get(args.sel, "")
-                 + ("_sig" if cfg.signal_only else "")
-                 + ("_bkg" if cfg.bkg_only else "")
-                 + ("_norm" if args.norm == "NORM" else ""))
-        run_gpt_score_montage(cfg.figure_path, _msfx)
+        # Skipped for MAT-SIGNAL (2026-09-12, user): montage_MAT_gpt_scores_SR_sig.png
+        # (and its PRE/JB/norm siblings) is not wanted for the signal-only run.
+        if not cfg.signal_only:
+            _msfx = ({"PRE": "_PRE", "SR": "_SR", "JB": "_JB"}.get(args.sel, "")
+                     + ("_bkg" if cfg.bkg_only else "")
+                     + ("_norm" if args.norm == "NORM" else ""))
+            run_gpt_score_montage(cfg.figure_path, _msfx)
         # full mSD / pT panels: run `montage_mat.sh <dir> <suffix>` by hand.
         # run_mat_montage(cfg.figure_path, _msfx)
         return
