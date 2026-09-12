@@ -409,6 +409,16 @@ def overtrain_figure(outdir, name, summary, cfg, out_png, subset=None, tag=""):
         ot = subset_overtrain(e["train_score"], e["train_w"], s_tr, b_tr,
                               e["test_score"], w_te, s_te, b_te,
                               cfg.get("overtrain_score_cut", 0.6))
+        # The background is the SAME jets in every panel, but eval.npz keeps
+        # only a 400k plotting subsample of the 4.87M training background, so
+        # recomputing its bias here is far noisier than train.py's full-
+        # statistics number (and read WARN spuriously).  Take the background
+        # from summary.json and keep only the subset-specific signal number.
+        full = summary["models"][name]["overtraining"]
+        ot["rel_diff_bkg_pct"] = full["rel_diff_bkg_pct"]
+        ot["ks_bkg_p"] = full["ks_bkg_p"]
+        worst = max(ot["rel_diff_sig_pct"], ot["rel_diff_bkg_pct"])
+        ot["verdict"] = "OK" if worst < 5.0 else ("WARN" if worst < 15.0 else "FAIL")
     n_sig = int(s_te.sum()); n_bkg = int(b_te.sum())
 
     def mk(tg, score, w, m):
@@ -480,7 +490,8 @@ def overtrain_figure(outdir, name, summary, cfg, out_png, subset=None, tag=""):
     return [h_str, h_ste, h_btr, h_bte]
 
 
-def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15):
+def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15,
+                   subset=None, tag=""):
     """Two bars per input, both on a common '% of total' scale.
 
       %Imp   = normalised total gain -- the TMVA convention that
@@ -502,8 +513,8 @@ def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15):
     top = ranked[:ntop][::-1]
     n = len(top)
 
-    h_imp = ROOT.TH1F(f"imp_{name}", "", n, 0, n)
-    h_prm = ROOT.TH1F(f"prm_{name}", "", n, 0, n)
+    h_imp = ROOT.TH1F(f"imp_{name}{tag}", "", n, 0, n)
+    h_prm = ROOT.TH1F(f"prm_{name}{tag}", "", n, 0, n)
     # without Sumw2 the bins inherit sqrt(content) errors, which ROOT then
     # paints as a stripe under each bar -- these are plain numbers, not counts
     h_imp.Sumw2(); h_prm.Sumw2()
@@ -519,7 +530,7 @@ def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15):
         h.SetBarWidth(0.28); h.SetBarOffset(off); h.SetLineWidth(1)
         h.SetMarkerSize(0)
 
-    c = ROOT.TCanvas(f"pi_{name}", "", SQ, SQ)
+    c = ROOT.TCanvas(f"pi_{name}{tag}", "", SQ, SQ)
     c.SetLeftMargin(MARGIN_RANK); c.SetRightMargin(RIGHT_MARGIN)
     c.SetTopMargin(TOP_MARGIN); c.SetBottomMargin(0.105)
     h_prm.GetYaxis().SetTitle("share of total importance   [%]")
@@ -544,6 +555,12 @@ def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15):
     # shares from a config that has moved on since.
     share = summary["config"].get("class_weight_share") or \
         cfg.get("class_weight_share", {})
+    if subset is not None and share:
+        # this panel's signal is only `subset`, so quote the shares
+        # renormalised over those classes (proportions preserved, sum 100%)
+        share = {k: v for k, v in share.items() if int(k) in subset}
+        tot = sum(float(v) for v in share.values()) or 1.0
+        share = {k: float(v) / tot for k, v in share.items()}
     lines = [
         "#bf{%s}  ranked by #DeltaAUC   (%d out of %d input param/s)"
         % (PRETTY[name], n, m["n_features"]),
@@ -592,12 +609,19 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     e = np.load(outdir / name / "eval.npz")
     s, w, topo = e["test_score"], e["test_w"], e["test_topo"]
     nb = 40
-    codes = tuple(sig_codes) if subset is None else tuple(subset)
-    # "signal all" = the mixture the tagger was TRAINED for, i.e. the class
-    # shares of this run (e.g. 50/10/20/10) with the proxy dropped -- proxy is
-    # W->cs background, and on raw physics weights it is 99% of topo>0, so an
-    # unweighted sum would show the proxy shape rather than the Vcb signal.
-    true_codes = tuple(c for c in codes if int(c) != 5)
+    # ALL four signal topologies are drawn in every panel -- the analysis
+    # reconstructs and measures all of them whichever subset a given tagger
+    # was tuned for.  Their shapes are common to S1/S2/S3 (one score); what
+    # distinguishes the panels is the TOTAL, which stays that panel's own
+    # signal definition, so the ratio pad reads "component vs what this
+    # tagger targets".
+    all_true = tuple(c for c in sig_codes if int(c) != 5)
+    sub = all_true if subset is None else tuple(subset)
+    # "signal" total = the mixture the tagger was TRAINED for, i.e. this run's
+    # class shares with the proxy dropped -- proxy is W->cs background, and on
+    # raw physics weights it is 99% of topo>0, so an unweighted sum would show
+    # the proxy shape rather than the Vcb signal.
+    true_codes = tuple(c for c in sub if int(c) != 5)
     sig_m = np.isin(topo, true_codes)
     n_bkg = int((topo == 0).sum()); n_sig = int(sig_m.sum())
     cwm = summary["config"].get("class_weight_multiplier") or \
@@ -622,7 +646,11 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     h_bkg = mk("bkg", topo == 0, ROOT.kGray + 2, 3)
     h_sig = mk("sig", sig_m, ROOT.kRed + 1, 3, w_over=w_sig)
     h_cls = {c: mk(f"c{c}", topo == int(c), TOPO_COL[int(c)], 2, 2)
-             for c in codes if (topo == int(c)).sum() > 20}
+             for c in all_true if (topo == int(c)).sum() > 20}
+    # the proxy is the calibration reference: the ratio pad divides every
+    # signal component (and the total) by it, so it is drawn here too
+    h_prx = mk("prx", topo == 5, TOPO_COL[5], 2, 2)
+    n_prx = int((topo == 5).sum())
 
     # frame width = SQ*(1-2*MARGIN); make the upper pad tall enough that the
     # MAIN frame comes out square even with the ratio pad underneath
@@ -640,7 +668,7 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     f1.GetYaxis().SetTitle("normalised to unit area")
     f1.GetYaxis().SetTitleSize(0.052); f1.GetYaxis().SetTitleOffset(0.91)
     f1.GetYaxis().SetLabelSize(LSIZE / P1_H); f1.GetXaxis().SetLabelSize(0)
-    for h in list(h_cls.values()) + [h_bkg, h_sig]:
+    for h in list(h_cls.values()) + [h_prx, h_bkg, h_sig]:
         h.Draw("HIST SAME")
     # caption shifted ~20% to the right, with the totals
     lg = _legend(0.345, 0.525, 0.78, 0.855, 0.0400)
@@ -648,6 +676,7 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     lg.AddEntry(h_sig, "Signal W#rightarrowcb, class-wgt  (%s)" % f"{n_sig:,}", "l")
     for cc, h in h_cls.items():
         lg.AddEntry(h, TOPO_LAB[int(cc)], "l")
+    lg.AddEntry(h_prx, "t^{2}(b'c) prx  (%s)  [ratio denom.]" % f"{n_prx:,}", "l")
     lg.Draw()
     t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(0.042)
     t.DrawLatex(0.80, 0.862, PRETTY[name])
@@ -660,36 +689,38 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     p2.cd()
     f2 = p2.DrawFrame(0.0, 0.0, 1.0, 2.0)
     f2.GetXaxis().SetTitle(f"{PRETTY[name]}  (BDT fine-tuned score)")
-    f2.GetYaxis().SetTitle("comp. / total")
+    f2.GetYaxis().SetTitle("/ proxy")
     f2.GetXaxis().SetTitleSize(0.125); f2.GetXaxis().SetLabelSize(LSIZE / P2_H)
     f2.GetXaxis().SetTitleOffset(1.12)
     f2.GetYaxis().SetTitleSize(0.105); f2.GetYaxis().SetLabelSize(LSIZE / P2_H)
     f2.GetYaxis().SetTitleOffset(0.39); f2.GetYaxis().SetNdivisions(505)
     ratios = []
-    for cc, h in h_cls.items():
+    # total and each component divided by the PROXY -- the calibration check:
+    # a flat line at 1 means the proxy reproduces that component's tagger
+    # shape and can stand in for it.  Numerator and denominator are disjoint
+    # samples here (different topologies), so the errors are uncorrelated:
+    # var(r) = r^2 [ (sx/x)^2 + (sp/p)^2 ]
+    for cc, h in [("tot", h_sig)] + list(h_cls.items()):
         r = h.Clone(f"r_{name}{tag}_{cc}")
-        # the component is a SUBSET of the total, so the two are correlated:
-        # var(r) = r^2 [ (1-2r) sx^2/x^2 + st^2/t^2 ]   (binomial-like)
         for b in range(1, nb + 1):
             x, sx = h.GetBinContent(b), h.GetBinError(b)
-            tt, st = h_sig.GetBinContent(b), h_sig.GetBinError(b)
-            if tt <= 0 or x < 0:
+            pp, sp = h_prx.GetBinContent(b), h_prx.GetBinError(b)
+            if pp <= 0 or x <= 0:
                 r.SetBinContent(b, 0.0); r.SetBinError(b, 0.0); continue
-            v = x / tt
-            var = v * v * ((1.0 - 2.0 * v) * (sx / x) ** 2 + (st / tt) ** 2) \
-                if x > 0 else 0.0
+            v = x / pp
+            var = v * v * ((sx / x) ** 2 + (sp / pp) ** 2)
             r.SetBinContent(b, v); r.SetBinError(b, float(np.sqrt(max(var, 0.0))))
-        r.SetLineWidth(2); r.SetLineStyle(1)
+        r.SetLineWidth(3 if cc == "tot" else 2); r.SetLineStyle(1)
         r.SetMarkerSize(0); r.SetMarkerColor(h.GetLineColor())
-        r.Draw("HIST SAME")          # same histogram style for all 4
-        r.Draw("E1 SAME")            # ... plus the propagated errors
+        r.Draw("HIST SAME")
+        r.Draw("E1 SAME")
         ratios.append(r)
     one = ROOT.TLine(0.0, 1.0, 1.0, 1.0)
     one.SetLineStyle(2); one.SetLineColor(ROOT.kBlack); one.Draw()
     ROOT.SetOwnership(one, False)
     p2.RedrawAxis()
     c.SaveAs(str(out_png))
-    return [h_bkg, h_sig] + list(h_cls.values()) + ratios
+    return [h_bkg, h_sig, h_prx] + list(h_cls.values()) + ratios
 
 
 # --------------------------------------------------------------------------- #
@@ -711,17 +742,16 @@ def build_report(cfg, outdir):
     # ROC (which shows all of them together) and the input ranking are common;
     # only the overtraining and score-composition quadrants are restricted to
     # that panel's signal classes.
-    pi = outdir / f"permimp_{MODEL}.png"
-    keep += permimp_figure(outdir, MODEL, summary, cfg, pi)
-
     panels = [("S1", None)] + [(k, SUBSET_DEF[k]) for k in SUBSET_ORDER]
-    published = {f"S1_tagger_{tag}_roc.png": roc,
-                 f"S1_tagger_{tag}_permimp_{MODEL}.png": pi}
+    published = {f"S1_tagger_{tag}_roc.png": roc}
     made = []
     for pname, subset in panels:
         sfx = "" if subset is None else f"_{pname}"
         ov = outdir / f"overtrain_{MODEL}{sfx}.png"
         sc = outdir / f"score_{MODEL}{sfx}.png"
+        pi = outdir / f"permimp_{MODEL}{sfx}.png"
+        keep += permimp_figure(outdir, MODEL, summary, cfg, pi,
+                               subset=subset, tag=sfx)
         keep += overtrain_figure(outdir, MODEL, summary, cfg, ov,
                                  subset=subset, tag=sfx)
         keep += score_figure(outdir, MODEL, summary, cfg, sig_codes, sc,
@@ -732,6 +762,7 @@ def build_report(cfg, outdir):
                  "-background", "white", str(panel)])
         published[f"S1_tagger_{tag}_panel_{pname}.png"] = panel
         published[f"S1_tagger_{tag}_overtrain_{pname}.png"] = ov
+        published[f"S1_tagger_{tag}_permimp_{pname}.png"] = pi
         published[f"S1_tagger_{tag}_score_{pname}.png"] = sc
         made.append((pname, panel, ov, sc))
 
