@@ -19,7 +19,7 @@ parquet chunks.
                      mislabeled duplicates of class 2. Never thinned.
                  6 = Z(bb)-adj: gen-matched hadronic Z->bb in the 16 non-Vcb
                      samples (z_decay==5 & dR(J, Z_gen)<0.8, the SAME
-                     geometric match Make_plots.py already uses for its
+                     geometric match 04_Make_plots.py already uses for its
                      mat_cat==15).  Quantified in z_contamination_study.py:
                      mean S1 response 0.797 vs true t2(b'b) signal's 0.834,
                      tracking it closely up to and including the highest
@@ -68,10 +68,11 @@ PI = float(np.pi)
 
 # jet topology codes
 SIG_CODES = {1: "Wcb", 2: "t2_bc", 3: "t2_bb", 4: "t3_bbc", 5: "t2_bc_proxy",
-             6: "z_bb"}
+             6: "z_bb", 7: "qcd_bb"}
 BKG_CODE = 0
 PROXY_CODE = 5
 ZBB_CODE = 6
+QCDBB_CODE = 7
 
 
 # --------------------------------------------------------------------------- #
@@ -163,6 +164,22 @@ def main():
         print(f"[skip] {marker} exists -- pass --overwrite to rebuild")
         _done_banner(t_wall0, data_dir)
         return
+    if args.overwrite:
+        # 2026-09-13 bugfix: --overwrite previously only bypassed the skip
+        # check above -- it never cleared old part-*.parquet files, so a
+        # rebuild (especially a partial one via --samples/--limit-files, used
+        # for quick testing) left STALE files with a different schema sitting
+        # alongside the new ones. pd.concat/read_parquet across the directory
+        # then either crashes (missing column) or silently mixes old+new
+        # rows. Wipe every existing chunk first so --overwrite means what it
+        # says: start clean.
+        n_removed = 0
+        for sub in ("train", "valid", "test"):
+            for p in (data_dir / sub).glob("part-*.parquet"):
+                p.unlink()
+                n_removed += 1
+        if n_removed:
+            print(f"[overwrite] removed {n_removed} stale part-*.parquet files under {data_dir}")
 
     mc_dir = Path(cfg["mc_dir"])
     files = sorted(mc_dir.glob("*.root"))
@@ -188,7 +205,7 @@ def main():
     feats_all = sorted(set(cfg["features_S1"] + cfg["features_S1p_extra"] + gpt_parents
                            + derived_raw) - set(cfg.get("derived_features", {})))
 
-    # Preselection is read from Make_plots.py so a threshold change there
+    # Preselection is read from 04_Make_plots.py so a threshold change there
     # propagates here automatically; config.json only supplies fallbacks.
     presel = dict(cfg["preselection"])
     try:
@@ -196,12 +213,12 @@ def main():
         from presel import parse_preselection
         parsed, cut_expr, missing = parse_preselection()
         presel.update(parsed)
-        print(f"[presel] from Make_plots.py: {cut_expr}")
+        print(f"[presel] from 04_Make_plots.py: {cut_expr}")
         if missing:
             print(f"[presel] not found, using config fallback for: {missing}")
     except Exception as exc:                                   # noqa: BLE001
         cut_expr = "(config fallback)"
-        print(f"[presel] WARNING could not read Make_plots.py ({exc}); "
+        print(f"[presel] WARNING could not read 04_Make_plots.py ({exc}); "
               f"using config.json preselection")
     print("[presel] " + "  ".join(f"{k}={v}" for k, v in presel.items()))
     keep_p = float(cfg["background_keep_prob"])
@@ -211,8 +228,14 @@ def main():
     kin = ["ak8_pt", "ak8_eta", "ak8_phi", "ak8_sdmass"]
     truth = ["ak8_type", "ak8_n_b_in_jet", "ak8_n_c_in_jet",
              "ak8_match_wqq_wcb", "ak8_match_tbq_wcb", "ak8_match_tbqq_wcb",
-             "ak8_match_top_bc", "w_decay",
-             "z_decay", "genZ_pt", "genZ_eta", "genZ_phi"]
+             "ak8_match_top_bc", "ak8_match_top_bcq", "w_decay",
+             "z_decay", "genZ_pt", "genZ_eta", "genZ_phi",
+             # per-AK4-jet hadron flavour (0/4/5, standard convention) -- the
+             # ONLY genuine gen-truth flavour info in this production; used
+             # to gen-match a QCD-origin bb-bar jet (dR<0.8 to the AK8),
+             # since ak8_n_b_in_jet is a top-decay-only sentinel (-1) for
+             # every non-top sample (2026-09-13).
+             "ak4_pt", "ak4_eta", "ak4_phi", "ak4_hflav"]
     ev_scalar = ["run", "luminosityBlock", "event", "n_ak8",
                  "lep1_pt", "lep1_eta", "lep1_phi"] + cfg["weights"]
     read_cols = sorted(set(kin + truth + ev_scalar + feats_all))
@@ -275,6 +298,7 @@ def main():
             )
 
             topo = topology_codes(events, template)
+            t3bcq_proxy_flag = np.zeros(len(keep), dtype=bool)  # bkg-only, see below
 
             if is_signal:
                 keep &= topo > 0                       # signal jets only
@@ -290,7 +314,7 @@ def main():
                 proxy = (w_decay_bg == 4) & m_top_bc
 
                 # Z(bb)-adj: gen-matched hadronic Z->bb, same geometric match
-                # Make_plots.py uses for mat_cat==15 (dR(J,Z_gen)<0.8).
+                # 04_Make_plots.py uses for mat_cat==15 (dR(J,Z_gen)<0.8).
                 # Quantified in z_contamination_study.py: mean S1 response
                 # 0.797 vs true t2(b'b)'s 0.834 -- the tagger cannot tell a
                 # b'+b top pairing from a Z->bb pairing, so this is promoted
@@ -305,11 +329,48 @@ def main():
                 z_dr = np.hypot(gz_eta - jeta, dphi_pipi(gz_phi, jphi))
                 z_bb = (z_decay == 5) & (gz_pt > 0.0) & (jpt > 0.0) & (z_dr < 0.8)
 
-                special = proxy | z_bb
-                topo = np.select([z_bb, proxy], [ZBB_CODE, PROXY_CODE], default=BKG_CODE).astype(np.int8)
+                # QCD(bb): genuine QCD-origin bb-bar (e.g. gluon splitting),
+                # gen-matched via >=2 AK4 jets with real hadron-flavour truth
+                # (ak4_hflav==5) geometrically inside the AK8 cone (dR<0.8,
+                # same convention as z_bb above). ak8_n_b_in_jet cannot be
+                # used here -- it is a top-decay-only sentinel (-1) for every
+                # jet in this sample -- so this is rebuilt from the AK4
+                # collection directly. Rare by construction (2026-09-13,
+                # user: "QCDbb has poor statistics, accept all these
+                # events"); z_bb/proxy take precedence on any jet where more
+                # than one condition could apply (same precedence chain as
+                # the z_bb/proxy overlap above).
+                a8 = ak.zip({"eta": events["ak8_eta"], "phi": events["ak8_phi"]})
+                a4 = ak.zip({"eta": events["ak4_eta"], "phi": events["ak4_phi"],
+                            "pt": events["ak4_pt"], "hflav": events["ak4_hflav"]})
+                p8, p4 = ak.unzip(ak.cartesian([a8, a4], nested=True))
+                q_dr = np.hypot(p4.eta - p8.eta, dphi_pipi(p4.phi, p8.phi))
+                q_match = (q_dr < 0.8) & (p4.pt > 20.0) & (p4.hflav == 5)
+                n_bflav_in_cone = flatten(ak.sum(q_match, axis=-1), 0)
+
+                special_zp = proxy | z_bb
+                qcd_bb = (n_bflav_in_cone >= 2) & ~special_zp
+
+                special = special_zp | qcd_bb
+                topo = np.select([z_bb, proxy, qcd_bb],
+                                [ZBB_CODE, PROXY_CODE, QCDBB_CODE],
+                                default=BKG_CODE).astype(np.int8)
                 thin = rng.random(len(keep)) < keep_p   # thin true background only
                 keep &= (special | thin)
                 weight = np.where(special, weight, weight / keep_p)  # ... keep sum(w) intact for bkg
+
+                # t3(b'cq) proxy flag (2026-09-13, user): same idea as the
+                # t2(b'c) proxy, but for the fully-merged t3(b'bc) signal --
+                # a Cabibbo-favoured W->cs event with the SAME 3-prong
+                # top-decay match pattern (w_decay==4 & ak8_match_top_bcq),
+                # exactly as studied standalone in t3_proxy_study.py. This is
+                # a PLAIN ANNOTATION column, not a topology/signal promotion:
+                # it does not touch topo/special/keep/weight above, so it
+                # cannot change S1 or M3 training at all -- purely for a
+                # reference curve on the bbc score plot (no adequate real
+                # proxy exists there, unlike cb's t2(b'c) proxy).
+                m_top_bcq = flatten(events["ak8_match_top_bcq"], 0).astype(bool)
+                t3bcq_proxy_flag = (w_decay_bg == 4) & m_top_bcq
 
             if not keep.any():
                 continue
@@ -319,7 +380,8 @@ def main():
                     "weight_signed": weight[keep].astype(np.float64),
                     "sample": np.repeat(path.name, int(keep.sum())),
                     "ak8_pt": jpt[keep].astype(np.float32),
-                    "ak8_sdmass": jmsd[keep].astype(np.float32)}
+                    "ak8_sdmass": jmsd[keep].astype(np.float32),
+                    "t3bcq_proxy_flag": t3bcq_proxy_flag[keep]}
             for fname in feats_all:
                 cols[fname] = flatten(events[fname], np.nan)[keep].astype(np.float32)
 

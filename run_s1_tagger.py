@@ -11,7 +11,7 @@ S1 / S1' boosted-cb tagger -- single command-line driver.
     ./run_s1_tagger.py train --run-tag presel_v3 --set max_depth=3 min_child_weight=50
     ./run_s1_tagger.py presel          # just show the preselection it will use
 
-The preselection is READ FROM Make_plots.py (the `_SELECTIONS["PRE"]` block),
+The preselection is READ FROM 04_Make_plots.py (the `_SELECTIONS["PRE"]` block),
 so changing a threshold there propagates here automatically -- nothing to keep
 in sync by hand.
 
@@ -60,7 +60,7 @@ def show_presel():
     sys.path.insert(0, str(PKG))
     from presel import parse_preselection
     p, cut, missing = parse_preselection()
-    print("preselection read from Make_plots.py:\n  " + cut + "\n")
+    print("preselection read from 04_Make_plots.py:\n  " + cut + "\n")
     for k, v in p.items():
         print(f"  {k:32s} {v}")
     if missing:

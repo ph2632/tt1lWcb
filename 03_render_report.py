@@ -134,7 +134,7 @@ CMP_STYLE = {"raw_cb": 2, "raw_cb_bb": 7, "raw_sum_bc_bb_topbwc": 7,
 # answer "how cleanly does the one tagger isolate THIS topology", which is the
 # same construction the old "S1 no t2(b'c)" curve used.
 #   topology codes: 1 W(cb)  2 t2(b'c)  3 t2(b'b)  4 t3(b'bc)  5 t2(b'c) proxy
-SUBSET_DEF = {"S2": (1, 3, 6), "S3": (1,)}   # S2 bb-family now incl. Z(bb)-adj
+SUBSET_DEF = {"S2": (1, 3, 6, 7), "S3": (1,)}   # S2 bb-family: +Z(bb)-adj, +QCD(bb) (2026-09-13)
 SUBSET_LAB = {"S2": "S_{2}: cb+bb",
               "S3": "S_{3}: cb"}
 SUBSET_ORDER = ["S2", "S3"]
@@ -145,7 +145,7 @@ DEF_MARKER = {"S1": 20, "S2": 21, "S3": 22}
 DEF_LAB = {"S1": "S_{1}: cb+bb+t^{2}(bc)+Zbb",
            "S2": "S_{2}: cb+bb", "S3": "S_{3}: cb"}
 
-# Tagger-input labels, in the Make_plots.py notation.  These are the
+# Tagger-input labels, in the 04_Make_plots.py notation.  These are the
 # MASS-DECORRELATED ak8_gpt_* scores of a generic massive resonance X, so
 # they carry no parent-flavour assumption (W->cb, H+->cb, ... all alike).
 # Left column below is the exact ntuple branch suffix.
@@ -184,10 +184,14 @@ def node_label(feat):
 
 TOPO_COL = {1: ROOT.kAzure + 2, 2: ROOT.kOrange + 7,
             3: ROOT.kGreen + 2, 4: ROOT.kMagenta + 1, 5: ROOT.kCyan + 2,
-            6: ROOT.kBlue + 2}
+            6: ROOT.kBlue + 2, 7: ROOT.kRed + 1}
 # short forms (no parens) for Wcb/t2b'b/Zbb, 2026-09-13 -- saves legend width
 TOPO_LAB = {1: "Wcb", 2: "t^{2}(b'c)", 3: "t^{2}b'b", 4: "t^{3}(b'bc)",
-            5: "t^{2}(b'c) proxy", 6: "Zbb adj"}
+            5: "t^{2}(b'c) proxy", 6: "Zbb adj", 7: "QCD(bb)"}
+# M3 (multiclass) per-class colour = the colour of that group's eponymous
+# topology above (cb -> Wcb's azure, bb -> t2(b'b)'s green, bbc -> t3(b'bc)'s
+# magenta), so M3 plots read consistently with every other plot in this file.
+M3_COL = {"cb": TOPO_COL[1], "bb": TOPO_COL[3], "bbc": TOPO_COL[4]}
 
 TOP_MARGIN = 0.065     # all four figures (was 0.085)
 RIGHT_MARGIN = 0.025   # all four figures (was 0.035)
@@ -345,13 +349,13 @@ def roc_figure(outdir, summary, cfg, out_png, presel=None):
         if f.exists():
             d = np.load(f)
             entries.append((CMPLAB[key], COL[key], CMP_STYLE[key],
-                            d["y"], d["score"], d["w"], (1, 2, 3, 4, 6), d["score"]))
+                            d["y"], d["score"], d["w"], (1, 2, 3, 4, 6, 7), d["score"]))
     f = outdir / MODEL / "eval.npz"
     if f.exists():
         e = np.load(f)
         entries.append(("S_{1}: cb+bb+t^{2}(bc)", COL[MODEL], 1,
                         e["test_y"], e["test_score"], e["test_w"],
-                        (1, 2, 3, 4, 6), e["test_score"]))
+                        (1, 2, 3, 4, 6, 7), e["test_score"]))
         # S2/S3/S4: the SAME S1 model, re-scored against a restricted signal
         # definition (background untouched).  These are not separate trainings
         # -- they show how well the one tagger isolates each topology.
@@ -752,7 +756,10 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     n_bkg = int((topo == 0).sum()); n_sig = int(sig_m.sum())
     cwm = summary["config"].get("class_weight_multiplier") or \
         cfg.get("class_weight_multiplier", {})
-    lut = np.ones(max(7, max((int(k) for k in cwm), default=6) + 1))
+    # floor 8 (2026-09-13): topology 7 (QCD(bb)) now exists in test_topo but
+    # isn't in class_weight_share -- must still be safely indexable (defaults
+    # to multiplier 1.0, i.e. excluded from the "signal all" sum like proxy).
+    lut = np.ones(max(8, max((int(k) for k in cwm), default=6) + 1))
     for k, v in cwm.items():
         lut[int(k)] = float(v)
     w_sig = w * lut[topo]                 # per-class multipliers; proxy excluded
@@ -868,6 +875,380 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
 
 
 # --------------------------------------------------------------------------- #
+# M3 (multiclass, bkg/cb/bb/bbc) figures, 2026-09-13.
+#
+# User's framing: "M1 and M3 in parallel... M3 will be just S, as we will
+# have one tagger per class (cb, bb, bbc)" -- so unlike the binary S1/S2/S3
+# overlay (one tagger, three restricted-signal re-scorings drawn as line
+# styles on the SAME plot), M3's overtrain/ranking/score figures are drawn
+# ONCE PER CLASS (3 separate figures each), tiled into a 3x3 panel. The ROC
+# is kept OUT of that panel (user's instruction) as its own single figure
+# with all 3 one-vs-rest curves overlaid, alongside S1's binary curve for
+# direct architecture comparison.
+# --------------------------------------------------------------------------- #
+def m3_roc_figure(outdir, cfg, out_png, presel=None):
+    """3 one-vs-rest ROC curves (cb/bb/bbc vs rest) from M3, plus the S1
+    binary curve on the SAME test split for direct comparison. This is the
+    "+1" ROC figure the user asked to keep separate from the 3x3 panel."""
+    e = np.load(outdir / "M3" / "eval.npz")
+    class_names = [str(x) for x in e["class_names"]]
+    y_te, w_te, proba_te = e["test_y"], e["test_w"], e["test_proba"]
+    topo_te = e["test_topo"]
+
+    c = ROOT.TCanvas("roc_m3", "", SQ, SQ)
+    c.SetTopMargin(TOP_MARGIN - 0.010); c.SetLeftMargin(0.105)
+    c.SetRightMargin(0.018); c.SetBottomMargin(0.085)
+    c.SetLogy(); c.SetGridx(); c.SetGridy()
+    frame = _axes(c.DrawFrame(0.0, 1e-3, 1.0, 0.3),
+                  "Signal eff.", "BKG eff.", xoff=0.96, yoff=1.06)
+    frame.GetYaxis().SetLabelOffset(0.005)
+
+    entries = []
+    for c_idx, cname in enumerate(class_names):
+        if c_idx == 0:
+            continue
+        yb = (y_te == c_idx).astype(np.int8)
+        entries.append((f"M3 {cname} (vs rest)", M3_COL[cname], 1, yb, proba_te[:, c_idx], w_te))
+
+    # restricted-definition subset curves (2026-09-13, user), same pattern as
+    # S1's S2/S3 subset ROCs: keep bkg + ONLY the named topologies (drop
+    # every other topology from consideration entirely, not just from the
+    # positive class), scored on that class's own probability column.
+    for lab, col, cls_idx, codes in [
+        ("Wcb+t^{2}(b'c)", ROOT.kCyan + 2, 1, (1, 2)),          # excludes the proxy (5)
+        ("QCD(bb)+Zbb", ROOT.kOrange + 7, 2, (6, 7)),            # excludes true t2(b'b) (3)
+    ]:
+        m = (topo_te == 0) | np.isin(topo_te, codes)
+        yb = np.isin(topo_te[m], codes).astype(np.int8)
+        entries.append((lab, col, 3, yb, proba_te[m, cls_idx], w_te[m]))
+
+    f_s1 = outdir / MODEL / "eval.npz"
+    if f_s1.exists():
+        e1 = np.load(f_s1)
+        entries.append(("S1 (binary)", COL[MODEL], 2, e1["test_y"], e1["test_score"], e1["test_w"]))
+
+    n = len(entries)
+    lg = _legend(0.480, 0.130, 0.870, 0.130 + 0.055 * n, 0.0303)
+    lg.SetFillStyle(1001); lg.SetFillColor(ROOT.kWhite); lg.SetMargin(0.16)
+    pvw = ROOT.TPave(0.475, 0.125, 0.960, 0.135 + 0.055 * n, 0, "NDC")
+    pvw.SetFillColor(ROOT.kWhite); pvw.SetFillStyle(1001); pvw.SetBorderSize(0)
+    pvw.Draw(); ROOT.SetOwnership(pvw, False)
+
+    keep = [pvw]
+    for lab, col, ls, y, s, w in entries:
+        tpr, fpr, auc = _roc_points(y, s, w)
+        g = ROOT.TGraph(len(tpr), tpr, fpr)
+        g.SetLineColor(col); g.SetLineWidth(3); g.SetLineStyle(ls)
+        g.Draw("L SAME"); keep.append(g)
+        lg.AddEntry(g, f"{lab}   AUC {auc:.3f}", "l")
+    lg.Draw()
+    cms_header(cfg, c, dx=-0.06, dy=0.010, lumi_dx=-0.01)
+    if presel:
+        t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(92)
+        t.SetTextColor(ROOT.kGray + 1); t.SetTextSize(TXT * 1.10 * 1.05)
+        lines = ["#bf{Preselection}",
+                 "p_{T} > %.0f GeV" % presel["jet_pt_min"],
+                 "m_{SD} > %.0f GeV" % presel["jet_sdmass_min"],
+                 "#tau_{21} < %.2f" % presel["jet_tau21_max"],
+                 "#DeltaR(l, J) > %.1f" % presel["dr_lep_jet_min"]]
+        for i, ln in enumerate(lines):
+            t.DrawLatex(0.165, 0.880 - 0.044 * i, ln)
+        ROOT.SetOwnership(t, False)
+        keep.append(t)
+    c.RedrawAxis(); c.SaveAs(str(out_png))
+    return keep
+
+
+def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
+    """One-vs-rest overtraining check for ONE M3 class -- simpler than the
+    binary overtrain_figure since there is only ONE tagger per class here
+    (no S1/S2/S3-style multi-definition overlay). The overtraining numbers
+    themselves are read from summary.json (already computed by
+    train_one_multiclass in 02_train_tagger.py, same pattern the binary
+    overtrain_figure uses) -- NOT recomputed here, since overtrain_metrics()
+    lives only in 02_train_tagger.py's venv-side code, not this PyROOT side."""
+    e = np.load(outdir / name / "eval.npz")
+    nb, lo, hi = 30, 0.0, 1.0
+    y_tr, y_te = e["train_y"], e["test_y"]
+    w_tr, w_te = e["train_w"], e["test_w"]
+    s_tr, s_te = e["train_proba"][:, class_idx], e["test_proba"][:, class_idx]
+    yb_tr = (y_tr == class_idx).astype(np.int8)
+    yb_te = (y_te == class_idx).astype(np.int8)
+
+    def mk(tg, score, w, m):
+        h = ROOT.TH1F(f"h_m3_{cname}_{tg}", "", nb, lo, hi)
+        h.Sumw2()
+        for v, ww in zip(score[m], w[m]):
+            h.Fill(float(v), float(ww))
+        if h.Integral() > 0:
+            h.Scale(1.0 / h.Integral())
+        return h
+
+    h_str = mk("str", s_tr, w_tr, yb_tr == 1); h_ste = mk("ste", s_te, w_te, yb_te == 1)
+    h_btr = mk("btr", s_tr, w_tr, yb_tr == 0); h_bte = mk("bte", s_te, w_te, yb_te == 0)
+    col = M3_COL[cname]
+    h_str.SetLineColor(col); h_str.SetLineWidth(3); h_str.SetMarkerColor(col)
+    h_str.SetMarkerSize(0)   # error bars only (2026-09-13, user) -- no marker dot
+    h_ste.SetMarkerColor(col); h_ste.SetMarkerStyle(20); h_ste.SetMarkerSize(1.0)
+    h_btr.SetLineColor(ROOT.kAzure + 2); h_btr.SetMarkerColor(ROOT.kAzure + 2)
+    h_btr.SetFillColorAlpha(ROOT.kAzure + 2, 0.30); h_btr.SetLineWidth(2)
+    h_btr.SetMarkerSize(0)   # error bars only (2026-09-13, user) -- no marker dot
+    h_bte.SetMarkerColor(ROOT.kAzure + 2); h_bte.SetMarkerStyle(21); h_bte.SetMarkerSize(1.0)
+
+    c = ROOT.TCanvas(f"ot_m3_{cname}", "", SQ, SQ)
+    c.SetTopMargin(TOP_MARGIN); c.SetRightMargin(0.025)
+    c.SetLeftMargin(0.095); c.SetBottomMargin(0.075)
+    c.SetTicks(1, 1); c.SetLogy()
+    frame = _axes(c.DrawFrame(lo, 3e-3, hi, 0.5), f"P({cname}) score",
+                  "N_{jets} norm. to 1", tsize=0.036, xoff=1.05, yoff=1.32)
+    frame.GetYaxis().SetLabelOffset(0.005)
+    # train histograms now ALSO carry error bars (2026-09-13, user), not just
+    # the outline/fill -- "HIST E1" draws both together.
+    h_btr.Draw("HIST E1 SAME"); h_bte.Draw("E1 SAME")
+    h_str.Draw("HIST E1 SAME"); h_ste.Draw("E1 SAME")
+
+    ot = summary["models"][name]["per_class"][cname]["overtraining"]
+    y0, dy = 0.835, 0.040
+    t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(TXT)
+    t.DrawLatex(0.320, y0 + 0.048, f"#bf{{Overtraining test -- M3 {cname}}}   70% train / 15% test")
+    x0 = 0.340; xb, xk, xv = x0 + 0.260, x0 + 0.380, x0 + 0.480
+    # "Test"/"Train" centred over the legend's swatch columns below, same
+    # convention as the binary overtrain_figure (2026-09-13)
+    t.SetTextAlign(21)
+    t.DrawLatex(0.1775, y0, "Test"); t.DrawLatex(0.2675, y0, "Train")
+    t.SetTextAlign(11)
+    t.DrawLatex(xb, y0, "Bias >%.1f" % cfg.get("overtrain_score_cut", 0.6))
+    t.DrawLatex(xk, y0, "KS p-val.")
+    t.DrawLatex(x0, y0 - dy, "bkg (rest)")
+    t.DrawLatex(xb, y0 - dy, "%.1f%%" % ot["rel_diff_bkg_pct"])
+    t.DrawLatex(xk, y0 - dy, "%.2f" % ot["ks_bkg_p"])
+    t.DrawLatex(x0, y0 - 2 * dy, cname)
+    t.DrawLatex(xb, y0 - 2 * dy, "%.1f%%" % ot["rel_diff_sig_pct"])
+    t.DrawLatex(xk, y0 - 2 * dy, "%.2f" % ot["ks_sig_p"])
+    okd = ot["verdict"] == "OK"
+    t.SetTextColor(ROOT.kGreen + 2 if okd else ROOT.kRed + 1)
+    t.DrawLatex(xv, y0 - 2 * dy, "#bf{%s}" % ot["verdict"])
+    t.SetTextColor(ROOT.kBlack)
+    ROOT.SetOwnership(t, False)
+
+    lg = _legend(0.155, y0 - 2.5 * dy, 0.335, y0 - 0.5 * dy, TXT * 1.05)
+    lg.SetNColumns(2); lg.SetColumnSeparation(-0.27); lg.SetMargin(0.50)
+    lg.AddEntry(h_bte, " ", "p"); lg.AddEntry(h_btr, " ", "f")
+    lg.AddEntry(h_ste, " ", "p"); lg.AddEntry(h_str, " ", "l")
+    lg.Draw()
+
+    cms_header(cfg, c, dx=0.095 - CMS_X, lumi_dx=-0.01)
+    c.RedrawAxis(); c.SaveAs(str(out_png))
+    return [h_btr, h_bte, h_str, h_ste]
+
+
+def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg, out_png, ntop=15):
+    """Ranking bars for ONE M3 class's one-vs-rest permutation importance.
+    Single series only (this class's dAUC) -- unlike the binary
+    permimp_figure's dAUC+gain pair, XGBoost's gain accounting does not
+    cleanly separate by class in a shared multiclass booster, so no gain
+    overlay is drawn here."""
+    m = summary["models"][name]
+    pc = m["per_class"][cname]
+    perm = {r["feature"]: max(r["auc_drop"], 0.0) for r in pc["permutation_importance"]}
+    p_tot = sum(perm.values()) or 1.0
+    pim = {f: 100.0 * v / p_tot for f, v in perm.items()}
+    ranked = sorted(pim, key=lambda f: -pim[f])
+    top = ranked[:ntop][::-1]
+    n = len(top)
+    nb_bins = n + 1   # +1 empty bin at the top, same convention as permimp_figure
+
+    h = ROOT.TH1F(f"prm_m3_{cname}", "", nb_bins, 0, nb_bins)
+    h.Sumw2()
+    for i, f in enumerate(top, 1):
+        h.SetBinContent(i, pim[f])
+        h.GetXaxis().SetBinLabel(i, node_label(f))
+    col = M3_COL[cname]
+    h.SetFillColor(col); h.SetLineColor(col); h.SetFillStyle(1001)
+    h.SetBarWidth(0.55); h.SetBarOffset(0.22); h.SetLineWidth(1); h.SetMarkerSize(0)
+
+    c = ROOT.TCanvas(f"pi_m3_{cname}", "", SQ, SQ)
+    c.SetLeftMargin(MARGIN_RANK - 0.010); c.SetRightMargin(RIGHT_MARGIN)
+    c.SetTopMargin(TOP_MARGIN); c.SetBottomMargin(0.105)
+    h.GetYaxis().SetTitle("Share of #DeltaAUC (vs rest)   [%]")
+    h.GetYaxis().SetTitleSize(0.046); h.GetYaxis().SetLabelSize(LSIZE)
+    h.GetYaxis().SetTitleOffset(0.95)
+    h.GetXaxis().SetLabelSize(0.050); h.GetXaxis().SetLabelOffset(0.005)
+    h.SetMaximum(1.1 * max(pim[f] for f in top)); h.SetMinimum(0.0)
+    h.Draw("HBAR")
+
+    ot = pc["overtraining"]
+    lines = [
+        "#bf{M3 -- %s}  ranked by #DeltaAUC vs rest   (%d of %d params)"
+        % (cname, n, m["n_features"]),
+        "AUC(vs rest) test %.3f    bias B %.1f%%  [%s]"
+        % (pc["auc_ovr"], ot["rel_diff_bkg_pct"], ot["verdict"]),
+    ]
+    t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(TXT)
+    t.SetTextAlign(31)
+    for i, ln in enumerate(lines):
+        t.DrawLatex(0.955, 0.905 - 0.036 * i, ln)
+    ROOT.SetOwnership(t, False)
+
+    # topology composition of THIS class's own train-split signal weight
+    # (2026-09-13, user) -- e.g. makes cb's proxy-dominance directly visible,
+    # which is exactly what drives cb's pull on the softmax discussed
+    # alongside the overtraining numbers above. Ratios are invariant to the
+    # (uniform, per-class) M3 weight multiplier, so the already-saved
+    # train_w/train_topo in eval.npz give this directly, no retrain needed.
+    my_codes = sorted(int(k) for k, v in class_groups.items() if int(v) == class_idx)
+    if my_codes:
+        e = np.load(outdir / name / "eval.npz")
+        topo, wtr = e["train_topo"], e["train_w"]
+        tot_w = sum(wtr[topo == tc].sum() for tc in my_codes) or 1.0
+        frac = {tc: 100.0 * wtr[topo == tc].sum() / tot_w for tc in my_codes}
+
+        cap = ROOT.TLatex(); cap.SetNDC(); cap.SetTextFont(42)
+        cap.SetTextSize(TXT * 0.92); cap.SetTextAlign(31)
+        cap.DrawLatex(0.955, 0.905 - 0.036 * len(lines) - 0.018,
+                     "#it{%s signal composition (train, weighted):}" % cname)
+
+        y_top = 0.905 - 0.036 * len(lines) - 0.018 - 0.044
+        x0, x1 = 0.630, 0.955
+        step = (x1 - x0) / len(my_codes)
+        tt = ROOT.TLatex(); tt.SetNDC(); tt.SetTextFont(42); tt.SetTextSize(TXT)
+        tt.SetTextAlign(21)
+        for i, tc in enumerate(my_codes):
+            x = x0 + (i + 0.5) * step
+            tt.SetTextColor(TOPO_COL[tc])
+            tt.DrawLatex(x, y_top, TOPO_LAB[tc].replace(" proxy", " prx"))
+            tt.DrawLatex(x, y_top - 0.036, "%.0f%%" % frac[tc])
+        tt.SetTextColor(ROOT.kBlack)
+        ROOT.SetOwnership(cap, False); ROOT.SetOwnership(tt, False)
+
+    cms_header(cfg, c)
+    c.RedrawAxis(); c.SaveAs(str(out_png))
+    return [h]
+
+
+def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
+                    proxy_mask, proxy_label, show_own_components=True):
+    """One-vs-rest score composition for ONE M3 class, ratio-to-proxy pad
+    style like the binary score_figure ("S/proxy-inspection", user's name
+    for this plot type).
+
+    The reference ("proxy") population is now PASSED IN per class rather
+    than hardcoded to topology 5 for all three (2026-09-13, user):
+      cb  -> topology 5 (t2(b'c) proxy) -- unchanged, genuinely its own
+             constituent, so that curve's ratio is a flat-line-at-1 check.
+      bb  -> topology {6,7} (Z(bb)-adj + QCD(bb)) -- these two DOMINATE the
+             physical (raw-weight) "bb" population (~99%, see investigation
+             2026-09-13: QCD(bb) alone is 94% of it), so the old borrowed
+             t2(b'c) proxy was not just imperfect but irrelevant here; this
+             makes the ratio pad read "how does t2(b'b) compare to the
+             QCD+Z-dominated bulk" instead.
+      bbc -> the t3(b'cq) proxy flag (build_trainset.py, mirrors the t2(b'c)
+             proxy idea for the fully-merged topology) -- bbc has no
+             adequate real proxy at all; used anyway per explicit instruction
+             ("despite knowing it is not the adequate choice").
+    show_own_components=False (bb only) drops the my_codes per-topology
+    overlay entirely -- with proxy now BEING two of bb's own three
+    constituents, drawing them twice (once as "component", once folded into
+    "proxy") would be redundant/confusing; only the total and t2(b'b) itself
+    are still meaningful to show.
+    """
+    e = np.load(outdir / name / "eval.npz")
+    s, w, topo = e["test_proba"][:, class_idx], e["test_w"], e["test_topo"]
+    nb = 30
+    my_codes = sorted(int(k) for k, v in class_groups.items() if int(v) == class_idx)
+
+    def mk(tg, mask, col, width, style=1):
+        h = ROOT.TH1F(f"s_m3_{cname}_{tg}", "", nb, 0.0, 1.0)
+        h.Sumw2()
+        for v, ww in zip(s[mask], w[mask]):
+            h.Fill(float(v), float(ww))
+        if h.Integral() > 0:
+            h.Scale(1.0 / h.Integral())
+        h.SetLineColor(col); h.SetLineWidth(width); h.SetLineStyle(style)
+        h.SetMarkerColor(col)
+        return h
+
+    h_bkg = mk("bkg", topo == 0, ROOT.kGray + 1, 4)
+    h_tot = mk("tot", np.isin(topo, my_codes), M3_COL[cname], 4)
+    show_codes = my_codes if show_own_components else [c for c in my_codes if c == 3]
+    h_cls = {c: mk(f"c{c}", topo == c, TOPO_COL[c], 3, 2) for c in show_codes
+             if (topo == c).sum() > 20}
+    h_prx = mk("prx", proxy_mask, ROOT.kBlack, 4, 1)
+    n_bkg = int((topo == 0).sum())
+
+    c = ROOT.TCanvas(f"sc_m3_{cname}", "", SQ, SQ)
+    p1 = ROOT.TPad(f"p1_m3_{cname}", "", 0, P2_H, 1, 1)
+    p1.SetBottomMargin(0.02); p1.SetTopMargin(0.128)
+    p2 = ROOT.TPad(f"p2_m3_{cname}", "", 0, 0.0, 1, P2_H)
+    p2.SetTopMargin(0.03); p2.SetBottomMargin(0.25)
+    for pp in (p1, p2):
+        pp.SetTicks(1, 1); pp.SetLeftMargin(0.145); pp.SetRightMargin(RIGHT_MARGIN)
+    p1.Draw(); p2.Draw()
+
+    p1.cd(); p1.SetLogy()
+    all_h = [h_bkg, h_tot, h_prx] + list(h_cls.values())
+    # y-axis span fit to what's ACTUALLY drawn (2026-09-13, user: cb/bbc
+    # panels were clipping real yield at both the top and bottom of the old
+    # fixed 3e-3..0.5 window) instead of a one-size-fits-all fixed range.
+    peak = max((h.GetMaximum() for h in all_h), default=0.5)
+    floor = min((h.GetBinContent(b) for h in all_h for b in range(1, nb + 1)
+                if h.GetBinContent(b) > 0), default=3e-3)
+    f1 = p1.DrawFrame(0.0, floor * 0.5, 1.0, peak * 1.8)
+    f1.GetYaxis().SetTitle("N_{jets} norm. to 1")
+    f1.GetYaxis().SetTitleSize(0.0385 / P1_H); f1.GetYaxis().SetTitleOffset(0.72)
+    f1.GetYaxis().SetLabelSize(LSIZE / P1_H); f1.GetXaxis().SetLabelSize(0)
+    f1.GetYaxis().SetLabelOffset(0.005)
+    for h in all_h:
+        h.Draw("HIST SAME")
+
+    lg = _legend(0.335, 0.610, 0.790, 0.840, 0.0294 * 1.05 / P1_H)
+    lg.SetNColumns(2); lg.SetMargin(0.16); lg.SetColumnSeparation(-0.27)
+    left = [(h_bkg, "BKG %.2fM jets" % (n_bkg / 1e6)), (h_tot, f"M3 {cname} (total)"),
+            (h_prx, proxy_label)]
+    right = [(h, TOPO_LAB[c]) for c, h in h_cls.items()]
+    for i in range(max(len(left), len(right))):
+        if i < len(left):
+            lg.AddEntry(left[i][0], left[i][1], "l")
+        if i < len(right):
+            lg.AddEntry(right[i][0], right[i][1], "l")
+    lg.Draw()
+    p1.RedrawAxis()
+    cms_header(cfg, c)
+    p1.cd()
+
+    p2.cd()
+    f2 = p2.DrawFrame(0.0, 0.0, 1.0, 2.0)
+    f2.GetXaxis().SetTitle(f"P({cname}) score")
+    f2.GetYaxis().SetTitle("Signal / proxy")
+    f2.GetXaxis().SetTitleSize(TSIZE_X_RATIO / P2_H); f2.GetXaxis().SetLabelSize(LSIZE / P2_H)
+    f2.GetXaxis().SetTitleOffset(1.12)
+    f2.GetYaxis().SetTitleSize(TSIZE_Y_RATIO / P2_H); f2.GetYaxis().SetLabelSize(LSIZE / P2_H)
+    f2.GetYaxis().SetTitleOffset(0.97); f2.GetYaxis().SetNdivisions(505)
+    f2.GetYaxis().SetLabelOffset(0.005)
+    ratios = []
+    for cc, h in [("tot", h_tot)] + list(h_cls.items()):
+        r = h.Clone(f"r_m3_{cname}_{cc}")
+        for b in range(1, nb + 1):
+            x, sx = h.GetBinContent(b), h.GetBinError(b)
+            pp, sp = h_prx.GetBinContent(b), h_prx.GetBinError(b)
+            if pp <= 0 or x <= 0:
+                r.SetBinContent(b, 0.0); r.SetBinError(b, 0.0); continue
+            v = x / pp
+            var = v * v * ((sx / x) ** 2 + (sp / pp) ** 2)
+            r.SetBinContent(b, v); r.SetBinError(b, float(np.sqrt(max(var, 0.0))))
+        r.SetLineWidth(4 if cc == "tot" else 3)
+        r.SetMarkerSize(0); r.SetMarkerColor(h.GetLineColor())
+        r.Draw("HIST SAME"); r.Draw("E1 SAME")
+        ratios.append(r)
+    one = ROOT.TLine(0.0, 1.0, 1.0, 1.0)
+    one.SetLineStyle(2); one.SetLineColor(ROOT.kBlack); one.Draw()
+    ROOT.SetOwnership(one, False)
+    p2.RedrawAxis()
+    c.SaveAs(str(out_png))
+    return [h_bkg, h_tot, h_prx] + list(h_cls.values()) + ratios
+
+
+# --------------------------------------------------------------------------- #
 def build_report(cfg, outdir):
     outdir = Path(outdir)
     summary = json.loads((outdir / "summary.json").read_text())
@@ -915,6 +1296,69 @@ def build_report(cfg, outdir):
     for f_ in singles:
         print(f"        {f_.name}  ({f_.stat().st_size // 1024} KB)")
     print(f"  published {len(published)} -> {GALLERY}/S1_tagger_{tag}_*.png")
+
+    # M3 (multiclass): ROC kept SEPARATE (user's instruction), overtrain /
+    # ranking / score drawn once per class (cb/bb/bbc) and tiled into a 3x3
+    # panel -- see the "M3 (multiclass) figures" block above for why this is
+    # shaped differently from S1's 2x2.
+    if "M3" in summary["models"] and (outdir / "M3" / "eval.npz").exists():
+        class_names = cfg.get("M3_class_names", ["bkg", "cb", "bb", "bbc"])
+        class_groups = cfg.get("M3_class_groups", {})
+        sig_classes = [(i, cn) for i, cn in enumerate(class_names) if i != 0]
+
+        roc_m3 = outdir / "roc_M3.png"
+        keep += m3_roc_figure(outdir, cfg, roc_m3, ds_meta.get('preselection_used'))
+
+        # per-class proxy reference for the score/S-proxy-inspection plot
+        # (2026-09-13, user) -- see m3_score_figure's docstring for why each
+        # of these three is different.
+        e_m3 = np.load(outdir / "M3" / "eval.npz")
+        _topo_m3 = e_m3["test_topo"]
+        m3_proxy = {
+            "cb":  (_topo_m3 == 5, "t^{2}(b'c) prx", True),
+            "bb":  (np.isin(_topo_m3, (6, 7)), "Zbb+QCD(bb)", False),
+            "bbc": (e_m3["test_t3bcq_proxy"], "t^{3}(b'cq) prx", True),
+        }
+
+        m3_singles = {}   # cname -> (overtrain, permimp, score) paths
+        for c_idx, cname in sig_classes:
+            ov3 = outdir / f"overtrain_M3_{cname}.png"
+            pi3 = outdir / f"permimp_M3_{cname}.png"
+            sc3 = outdir / f"score_M3_{cname}.png"
+            keep += m3_overtrain_figure(outdir, "M3", cname, c_idx, summary, cfg, ov3)
+            keep += m3_permimp_figure(outdir, "M3", cname, c_idx, class_groups, summary, cfg, pi3)
+            pmask, plabel, pshow = m3_proxy.get(cname, (_topo_m3 == 5, "t^{2}(b'c) prx", True))
+            keep += m3_score_figure(outdir, "M3", cname, c_idx, class_groups, cfg, sc3,
+                                    pmask, plabel, pshow)
+            m3_singles[cname] = (ov3, pi3, sc3)
+
+        panel_m3 = outdir / "panel_M3.png"
+        # rows = plot type (overtrain / ranking / score), columns = class
+        # (cb, bb, bbc), in that fixed order regardless of dict iteration --
+        # a stated design choice, not derived from anything upstream.
+        order = [cn for cn in ("cb", "bb", "bbc") if cn in m3_singles]
+        tile_row_ov = [str(m3_singles[cn][0]) for cn in order]
+        tile_row_pi = [str(m3_singles[cn][1]) for cn in order]
+        tile_row_sc = [str(m3_singles[cn][2]) for cn in order]
+        montage(tile_row_ov + tile_row_pi + tile_row_sc +
+                ["-tile", "3x3", "-geometry", f"{SQ}x{SQ}+0+0",
+                 "-background", "white", str(panel_m3)])
+
+        published_m3 = {f"S1_tagger_{tag}_panel_M3.png": panel_m3,
+                        f"S1_tagger_{tag}_roc_M3.png": roc_m3}
+        for cn in order:
+            ov3, pi3, sc3 = m3_singles[cn]
+            published_m3[f"S1_tagger_{tag}_overtrain_M3_{cn}.png"] = ov3
+            published_m3[f"S1_tagger_{tag}_permimp_M3_{cn}.png"] = pi3
+            published_m3[f"S1_tagger_{tag}_score_M3_{cn}.png"] = sc3
+        for gname, src in published_m3.items():
+            shutil.copyfile(src, GALLERY / gname)
+
+        print(f"  wrote {panel_m3.name}  ({panel_m3.stat().st_size // 1024} KB)  "
+              f"(3x3: rows=overtrain/ranking/score, cols={order})")
+        print(f"        {roc_m3.name}  ({roc_m3.stat().st_size // 1024} KB)  "
+              f"(kept OUT of the panel, per instruction)")
+        print(f"  published {len(published_m3)} -> {GALLERY}/S1_tagger_{tag}_*_M3*.png")
 
 
 def main():

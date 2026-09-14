@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Read the MAT preselection straight out of Make_plots.py so that changing a
+Read the MAT preselection straight out of 04_Make_plots.py so that changing a
 threshold there automatically propagates to the S1 tagger training.
 
 `build_mat_plot_settings()` keeps the cut strings in local variables, so we
 lift the `_COMMON / _MJ12 / _SELECTIONS` block out of the source and exec it
-in an empty namespace -- no import of Make_plots (which is heavy and would
+in an empty namespace -- no import of 04_Make_plots (which is heavy and would
 pull in ROOT files) and no duplicated numbers.
 """
 import re
 from pathlib import Path
 
-MAKE_PLOTS = Path(__file__).resolve().parent.parent / "Make_plots.py"
+MAKE_PLOTS = Path(__file__).resolve().parent.parent / "04_Make_plots.py"
 
 # cut-expression token  ->  (config key, comparison)
 _MAP = {
@@ -24,7 +24,7 @@ _MAP = {
 
 
 def read_pre_cut(path=MAKE_PLOTS):
-    """Return the raw PRE cut expression from Make_plots.py."""
+    """Return the raw PRE cut expression from 04_Make_plots.py."""
     src = path.read_text()
     m = re.search(r"^\s*_COMMON = .*?^\s*CUT = ", src, re.S | re.M)
     if not m:
@@ -38,7 +38,7 @@ def read_pre_cut(path=MAKE_PLOTS):
 def parse_preselection(path=MAKE_PLOTS):
     """PRE cut -> the per-jet thresholds build_trainset.py needs.
 
-    `ak8_*_0` in Make_plots.py refers to the candidate jet J; for a per-jet
+    `ak8_*_0` in 04_Make_plots.py refers to the candidate jet J; for a per-jet
     training set the same threshold is applied to every AK8 jet, except
     `ak8_sdmass_sub_mass_0` (2nd-heaviest AK8) which stays event-level.
     """
@@ -54,7 +54,7 @@ def parse_preselection(path=MAKE_PLOTS):
 
 if __name__ == "__main__":
     p, cut, missing = parse_preselection()
-    print("PRE cut in Make_plots.py:\n  " + cut)
+    print("PRE cut in 04_Make_plots.py:\n  " + cut)
     print("\nparsed thresholds:")
     for k, v in p.items():
         print(f"  {k:32s} {v}")

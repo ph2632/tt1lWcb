@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import mplhep as hep
 
 from sklearn.metrics import roc_curve, auc
-from train_bdt.dbc_tools import DbcEvaluator, Dbc3ClassEvaluator
+from train_bdt.dbc_tools import DbcEvaluator, Dbc3ClassEvaluator, S1Evaluator
 
 
 def _dir_readable(path):
@@ -161,7 +161,7 @@ class Config:
         # 2026-09-01: MC ROOT area came back (youpeng renamed MC/ -> mc/, see
         # the path block above).  The v16 parquets on disk are STALE (btt only,
         # derived before the bdr/bL seeds existed) -> tag bumped to v16b, so
-        # the next `python Make_plots.py ...` does a full ~18-min re-derive
+        # the next `python 04_Make_plots.py ...` does a full ~18-min re-derive
         # into *__derived_v16b_ttReco_v1.parquet, then ~3 min/run.  (v15m is
         # folded in.)  Old v16 parquets can be deleted.  To go back to the
         # pre-tt-reco cache with no re-derive: "derived_v15k_cbCandByScore_v1".
@@ -233,7 +233,19 @@ class Config:
         #   (Youpeng's 3-class GloParT-node BDT, dbc_3class_v1/expanded model,
         #   applied at load time -- no such branch exists in the production
         #   trees). New cached fields -> full re-derive (~25 min).
-        self.cache_tag = "derived_v23_dbc3cl_v1"   # + score_Dbc3_{bc,bb} (2026-09-12)
+        # v24 (derived_v24_s1score_v1, 2026-09-13): + score_S1 (this project's
+        #   own S1 boosted-cb tagger, tt1lWcb/02_train_tagger.py's 22-feature
+        #   model, applied at load time). Tied to ONE trained run
+        #   (S1_tagger/output/presel_v3_kp50_zbb/S1/model.json) -- bump this
+        #   tag again after any retrain you want reflected in these plots.
+        # v25 (derived_v25_s1retrain_v1, 2026-09-14): no new fields -- just a
+        #   tag bump because S1/model.json was retrained today (QCD(bb) added
+        #   to class_weight_share, fixing the overtraining regression) and
+        #   the cache lookup is a pure string match on cache_tag with no
+        #   model hash/mtime check, so the v24 cache still had score_S1
+        #   baked in from the OLD model. Forces a full re-derive so MAT
+        #   plots pick up the new one.
+        self.cache_tag = "derived_v25_s1retrain_v1"
 
         # ------------------------------------------------------------------
         # Switches
@@ -258,6 +270,10 @@ class Config:
         # booster, not a tree branch (2026-09-12); see Dbc3ClassEvaluator.
         self.dbc3_model_path = ("/eos/user/y/youpeng/research/wcb/BoostedDbcTrain/"
                                  "dbc_3class_v1/output_inclusive_v1/models/expanded/model.json")
+        # this project's own S1 boosted-cb tagger (2026-09-13); see S1Evaluator.
+        # Tied to ONE trained run -- re-point after any retrain you want
+        # reflected here (02_train_tagger.py overwrites model.json in place).
+        self.s1_model_path = "./S1_tagger/output/presel_v3_kp50_zbb/S1/model.json"
 
         # ------------------------------------------------------------------
         # Sample catalog
@@ -336,6 +352,7 @@ class Config:
             "score_Dbc": r"$D_{bc}$",
             "score_Dbc3_bc": r"$D_{bc}$ (3cl)",
             "score_Dbc3_bb": r"$D_{bb}$ (3cl)",
+            "score_S1": r"$S_{1}$",
             "score_SC": r"$S_{\mathrm{EVT}}$",
 
             "score_cata_w_qq_norm": r"EC $W \to qq'$ score",
@@ -1098,6 +1115,7 @@ class DataManager:
             model_path=self.cfg.dbc_model_path,
         )
         self.dbc3_eval = Dbc3ClassEvaluator(model_path=self.cfg.dbc3_model_path)
+        self.s1_eval = S1Evaluator(model_path=self.cfg.s1_model_path)
 
         # Columns to pull from the derived parquet cache (see columns_for_cache).
         # None -> read every column (old behaviour / WCB_LOAD_ALL_COLS=1).
@@ -2633,6 +2651,13 @@ class DataManager:
         score_Dbc3_bc, score_Dbc3_bb = self.dbc3_eval.get_scores(_dbc3_feats)
 
         # ------------------------------------------------------------------
+        # S1 boosted-cb tagger (this project's own XGBoost model, tied to one
+        # trained run under S1_tagger/output/, applied at load time -- 2026-09-13
+        # ------------------------------------------------------------------
+        _s1_feats = {name: leading_or_zero(name) for name in S1Evaluator.RAW_INPUTS}
+        score_S1 = self.s1_eval.get_score(_s1_feats)
+
+        # ------------------------------------------------------------------
         # True category as int8 code
         # ------------------------------------------------------------------
         true_cat = self.make_true_category(ak8_type, n_c, is_qcd)
@@ -3712,6 +3737,7 @@ class DataManager:
             "score_Dbc_jsup2": score_Dbc_jsup2,
             "score_Dbc3_bc": score_Dbc3_bc,
             "score_Dbc3_bb": score_Dbc3_bb,
+            "score_S1": score_S1,
             "score_SC": score_SC,
 
             "score_cata_w_qq_norm": score_cata_w_qq_norm,
@@ -5946,6 +5972,11 @@ def build_plot_settings():
             "bins": np.linspace(0, 1, 51),
         },
         {
+            "var": "score_S1",
+            "xlabel": "$S_{1}$ (BDT fine-tuned)",
+            "bins": np.linspace(0, 1, 51),
+        },
+        {
             "var": "score_SC",
             "xlabel": r"$S_{\mathrm{EVT}}$",
             "bins": np.linspace(0, 1, 51),
@@ -6141,7 +6172,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     out-of-range entries are folded into the first/last bin by
     hist_with_flow (ROOT UnderOverFlow1D style).
 
-    `sel` picks the event selection (3rd CLI token, `Make_plots.py MAT SR`):
+    `sel` picks the event selection (3rd CLI token, `04_Make_plots.py MAT SR`):
       PRE (default)  : boosted AK8 only, no tagger cut.
       SR             : + score_Dbc > 0.9  (the D_bc BDT; NOT the raw
                          ak8_gpt_bc_0 node -- its softmax score rarely exceeds
@@ -6441,6 +6472,8 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # Youpeng's 3-class GloParT-node model, applied at load time (2026-09-13)
         ("score_Dbc3_bc",          "score_Dbc3_bc",          0.0, 1.0, 50, r"$D_{bc}$ (3cl)",              True),
         ("score_Dbc3_bb",          "score_Dbc3_bb",          0.0, 1.0, 50, r"$D_{bb}$ (3cl)",              True),
+        # this project's own S1 boosted-cb tagger, applied at load time (2026-09-13)
+        ("score_S1",               "score_S1",               0.0, 1.0, 50, r"$S_{1}$ (BDT fine-tuned)",    True),
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
@@ -6532,7 +6565,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("gpt_bc_vs_ccbb",         "gpt_bc_vs_ccbb",          0.0, 1.0, 50, r"$bc/(bc+cc+bb)$",               True),
         # ("gpt_hfmix_vs_2prong",    "gpt_hfmix_vs_2prong",     0.0, 1.0, 50, r"$(bc{+}bs{+}cs)/(bc{+}bs{+}cs{+}cc{+}bb{+}qq)$", True),
         # ("gpt_bc_vs_hf2prong",     "gpt_bc_vs_hf2prong",      0.0, 1.0, 50, r"$bc/(bc{+}bs{+}cs{+}cc{+}bb)$", True),
-        ("gpt_cc_vs_bc",           "gpt_cc_vs_bc",            0.0, 1.0, 50, r"GloParT $cc/(cc+cb)$", False),
+        ("gpt_cc_vs_bc",           "gpt_cc_vs_bc",            0.0, 1.0, 50, r"GloParT $cc/(cc+cb)$", True),
         # ("gpt_bc_vs_bb",           "gpt_bc_vs_bb",            0.0, 1.0, 50, r"$bc/(bc+bb)$",                  False),  # commented out on request
         # ("gpt_bc_vs_qq",           "gpt_bc_vs_qq",            0.0, 1.0, 50, r"$bc/(bc+qq)$",                  True),
         # ("gpt_cs_vs_qq",         "gpt_cs_vs_qq",            0.0, 1.0, 50, r"$cs/(cs+qq)$",                  False),  # dropped 2026-08-31
@@ -6879,8 +6912,8 @@ def parse_args():
     )
     # 2nd/3rd positional tokens for MAT: one picks the y-axis (ABS|NORM), the
     # other the selection (PRE|SR|JB).  Order-independent, both optional, e.g.
-    #   Make_plots.py MAT SR          Make_plots.py MAT NORM JB
-    #   Make_plots.py MAT SR NORM     Make_plots.py MAT ABS
+    #   04_Make_plots.py MAT SR          04_Make_plots.py MAT NORM JB
+    #   04_Make_plots.py MAT SR NORM     04_Make_plots.py MAT ABS
     parser.add_argument("opt_a", nargs="?", default=None, type=str.upper,
                         help="MAT: y-axis ABS (default) | NORM, and/or "
                              "selection PRE (default) | SR | JB (jb-Region).")

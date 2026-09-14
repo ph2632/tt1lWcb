@@ -4,7 +4,7 @@ How much of the current BACKGROUND pool is actually a gen-matched hadronic Z
 (Z->bb, Z->cc, Z->qq light), and where does it sit in the S1 score?
 
 Retraction: an earlier claim that "Z->bb cannot be identified from truth" was
-wrong -- z_decay + genZ_pt/eta/phi exist (2026-09-02 rerun) and Make_plots.py
+wrong -- z_decay + genZ_pt/eta/phi exist (2026-09-02 rerun) and 04_Make_plots.py
 already builds a real geometric match from them (dR(J, Z_gen) < 0.8, same
 convention followed here): z_decay 1/2/3 = light, 4 = cc, 5 = bb.
 
@@ -113,7 +113,7 @@ def main():
                     & (lpt > 0) & (dr_lep > presel["dr_lep_jet_min"])
                     & (sub < presel["event_subleading_sdmass_max"]))
 
-            # Z geometric match, exactly Make_plots.py's convention
+            # Z geometric match, exactly 04_Make_plots.py's convention
             zdec = bcast(ev, "z_decay", tmpl, 0).astype(int)
             gzpt = bcast(ev, "genZ_pt", tmpl, -1.0)
             gzeta = bcast(ev, "genZ_eta", tmpl, 0.0)

@@ -219,3 +219,61 @@ class Dbc3ClassEvaluator:
         p_bc = np.ascontiguousarray(proba[:, 0], dtype=np.float32)
         p_bb = np.ascontiguousarray(proba[:, 1], dtype=np.float32)
         return p_bc, p_bb
+
+
+class S1Evaluator:
+    """The project's own S1 boosted-cb tagger (tt1lWcb/02_train_tagger.py):
+    binary XGBoost over 22 ak8_gpt_* features, loaded natively as a saved
+    XGBoost booster. FEATURES/LEPQ_COMPONENTS mirror S1_tagger/config.json's
+    features_S1/derived_features exactly (2026-09-13 -- feature #22,
+    ak8_gpt_qcd, added on top of the original 21).
+
+    Tied to ONE specific trained run (model_path); re-point it after any
+    retrain you want reflected here (S1's model.json is overwritten in place
+    by 02_train_tagger.py on every run under the same run_tag).
+    """
+
+    LEPQ_COMPONENTS = [
+        "ak8_gpt_topbwev", "ak8_gpt_topbwmv", "ak8_gpt_topbwtauev",
+        "ak8_gpt_topbwtauhv", "ak8_gpt_topbwtaumv", "ak8_gpt_topwev",
+        "ak8_gpt_topwmv", "ak8_gpt_topwtauev", "ak8_gpt_topwtauhv",
+        "ak8_gpt_topwtaumv",
+    ]
+    FEATURES = [
+        "ak8_gpt_bb", "ak8_gpt_cc", "ak8_gpt_bc", "ak8_gpt_bs", "ak8_gpt_cs",
+        "ak8_gpt_qq", "ak8_gpt_ss", "ak8_gpt_tauhtauh", "ak8_gpt_qcdb",
+        "ak8_gpt_qcdbb", "ak8_gpt_qcdc", "ak8_gpt_qcdcc", "ak8_gpt_qcdothers",
+        "ak8_gpt_topbwc", "ak8_gpt_topbwcs", "ak8_gpt_topbwq", "ak8_gpt_topbwqq",
+        "ak8_gpt_topbws", "ak8_gpt_topwqq", "ak8_gpt_topwcs", "ak8_gpt_lepq",
+        "ak8_gpt_qcd",
+    ]
+    # every RAW branch the caller needs to supply -- FEATURES minus the
+    # derived ak8_gpt_lepq, plus the 10 raw components that sum to it
+    RAW_INPUTS = [f for f in FEATURES if f != "ak8_gpt_lepq"] + LEPQ_COMPONENTS
+
+    def __init__(self, model_path):
+        model_path = os.path.abspath(model_path)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"S1 model not found: {model_path}")
+        self.model = XGBClassifier()
+        self.model.load_model(model_path)
+
+    def get_score(self, feature_map):
+        """feature_map: dict of {name: 1D array}, one entry per name in
+        RAW_INPUTS (all must have the same length). Returns score_S1 as a
+        float32 1D array."""
+        n = None
+        cols = {}
+        for name in self.RAW_INPUTS:
+            arr = np.asarray(feature_map[name], dtype=np.float32)
+            if arr.ndim != 1:
+                raise ValueError(f"{name} must be 1D, got shape={arr.shape}")
+            if n is None:
+                n = len(arr)
+            elif len(arr) != n:
+                raise ValueError(f"Length mismatch: {name} has length {len(arr)}, expected {n}")
+            cols[name] = arr
+        cols["ak8_gpt_lepq"] = np.sum([cols[c] for c in self.LEPQ_COMPONENTS], axis=0)
+        X = pd.DataFrame(cols)[self.FEATURES]
+        proba = self.model.predict_proba(X)
+        return np.ascontiguousarray(proba[:, 1], dtype=np.float32)

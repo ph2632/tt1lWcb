@@ -73,7 +73,11 @@ def class_weight_lookup(cfg):
     cwm = cfg.get("class_weight_multiplier")
     if not cwm:
         return None
-    lut = np.ones(max(6, max(int(k) for k in cwm) + 1), dtype=np.float64)
+    # floor 8 (2026-09-13): topology 7 (QCD(bb)) now exists in the dataset
+    # but isn't in class_weight_share (S1 doesn't split it out specially) --
+    # sizing only from cwm's OWN keys would make lut[topo] IndexError on any
+    # jet with topology>=len(lut); un-listed topologies default to 1.0.
+    lut = np.ones(max(8, max(int(k) for k in cwm) + 1), dtype=np.float64)
     for k, v in cwm.items():
         lut[int(k)] = float(v)
     return lut
@@ -102,6 +106,258 @@ def derive_class_weight_multiplier(train_df, cfg):
     cfg["class_weight_multiplier"] = mult
     print(f"[class_weight_multiplier] derived from real train sumw: "
           + ", ".join(f"{k}={v:g}" for k, v in mult.items()))
+
+
+# --------------------------------------------------------------------------- #
+# M3: 4-class multiclass model (bkg/cb/bb/bbc), trained ALONGSIDE the binary
+# S1 model in the same process on the SAME already-loaded tr/va/te -- no
+# second parquet read.  See train_one_multiclass() for why this needs its
+# own weight-derivation path rather than reusing class_weight_multiplier.
+# --------------------------------------------------------------------------- #
+def build_multiclass_labels(topo, class_groups):
+    """topology code array -> M3 class-label array, via {topology_code(str):
+    class_label(int)} from config's M3_class_groups."""
+    lut = np.zeros(max(int(k) for k in class_groups) + 1, dtype=np.int8)
+    for k, v in class_groups.items():
+        lut[int(k)] = int(v)
+    return lut[topo]
+
+
+def derive_multiclass_weight_multiplier(topo_train, w_train_raw, class_groups,
+                                        share, subshare=None):
+    """Derive {TOPOLOGY code -> multiplier} (2026-09-13: topology-keyed, not
+    class-label-keyed as before) so a class with more than one constituent
+    topology (e.g. bb = t2(b'b)/Zbb/QCD(bb)) can be weighted DIFFERENTLY
+    WITHIN the class instead of just uniformly:
+
+      multiplier_t = class_share_c * topo_subshare_t * total_raw_sumw / raw_sumw_t
+      where c = class_groups[t]
+
+    `subshare` is OPTIONAL, per class: {class_label(str): {topology(str):
+    sub_share}}. A class (or a topology inside a listed class) with no entry
+    there falls back to ITS NATURAL raw-sumw proportion within the class --
+    i.e. exactly the old single-multiplier-per-class behaviour, generalised
+    rather than replaced (so classes nobody has asked to split, e.g. cb and
+    bbc right now, are numerically unaffected by this change).
+
+    Binary training gets background/signal balance for free from
+    scale_pos_weight = sum(w_bkg)/sum(w_sig); multi:softprob has no such
+    knob, so the background/signal balance has to be baked into
+    sample_weight directly here -- unlike the binary path, this NEVER
+    touches cfg["class_weight_multiplier"] (topology-keyed for S1/S1p, but
+    different numbers entirely); it returns its own lookup instead.
+    """
+    subshare = subshare or {}
+    topo_to_class = {int(k): int(v) for k, v in class_groups.items()}
+    g_topo = pd.Series(w_train_raw).groupby(topo_train).sum()
+    tot = g_topo.sum()
+
+    g_class = {}
+    for t, w in g_topo.items():
+        c = topo_to_class.get(int(t))
+        if c is not None:
+            g_class[c] = g_class.get(c, 0.0) + float(w)
+
+    mult = {}
+    for k_str, class_share in share.items():
+        c = int(k_str)
+        if c not in g_class or g_class[c] <= 0:
+            continue
+        topos = sorted(t for t, cc in topo_to_class.items() if cc == c and t in g_topo.index)
+        sub = subshare.get(k_str, {})
+        for t in topos:
+            s_t = float(sub[str(t)]) if str(t) in sub else float(g_topo[t]) / g_class[c]
+            mult[t] = round(float(class_share) * s_t * tot / float(g_topo[t]), 4)
+
+    # sized to cover every topology class_groups knows about, not just the
+    # ones with a derived multiplier (unlisted topologies default to 1.0 --
+    # e.g. background, code 0, is intentionally handled this way already)
+    lut = np.ones(max(list(mult) + list(topo_to_class) + [0]) + 1, dtype=np.float64)
+    for t, v in mult.items():
+        lut[t] = v
+    return lut, mult
+
+
+def permutation_importance_multiclass(model, X, y, w, feats, repeats, seed, class_names):
+    """Macro one-vs-rest AUC drop (direct multiclass analogue of
+    permutation_importance() above) AND, in the SAME pass, the per-class
+    one-vs-rest AUC drop for every non-background class -- one predict_proba
+    call per (feature, repeat) feeds both, rather than running the shuffle
+    loop 4 separate times (once per class + once for the macro average)."""
+    rng = np.random.default_rng(seed)
+    sig_classes = [(c, cn) for c, cn in enumerate(class_names) if c != 0]
+    base_proba = model.predict_proba(X)
+    base_macro = roc_auc_score(y, base_proba, multi_class="ovr",
+                               average="macro", sample_weight=w)
+    base_c = {cn: roc_auc_score((y == c).astype(np.int8), base_proba[:, c],
+                                sample_weight=w) for c, cn in sig_classes}
+    rows_macro = []
+    rows_c = {cn: [] for _, cn in sig_classes}
+    for i, f in enumerate(feats):
+        d_macro, d_c = [], {cn: [] for _, cn in sig_classes}
+        for _ in range(repeats):
+            Xp = X.copy()
+            rng.shuffle(Xp[:, i])
+            proba_p = model.predict_proba(Xp)
+            d_macro.append(base_macro - roc_auc_score(
+                y, proba_p, multi_class="ovr", average="macro", sample_weight=w))
+            for c, cn in sig_classes:
+                d_c[cn].append(base_c[cn] - roc_auc_score(
+                    (y == c).astype(np.int8), proba_p[:, c], sample_weight=w))
+        rows_macro.append({"feature": f, "auc_drop": float(np.mean(d_macro)),
+                           "auc_drop_err": float(np.std(d_macro))})
+        for _, cn in sig_classes:
+            rows_c[cn].append({"feature": f, "auc_drop": float(np.mean(d_c[cn])),
+                               "auc_drop_err": float(np.std(d_c[cn]))})
+    rows_macro.sort(key=lambda r: -r["auc_drop"])
+    for cn in rows_c:
+        rows_c[cn].sort(key=lambda r: -r["auc_drop"])
+    return base_macro, rows_macro, rows_c
+
+
+def train_one_multiclass(name, feats, tr, va, te, xgb_params, seed, class_groups,
+                         class_names, share, bkg_effs, outdir, cfg,
+                         w_tr_raw, w_va_raw, subshare=None):
+    """4-class (bkg/cb/bb/bbc) sibling of train_one().  Shares tr/va/te with
+    the binary model(s) -- caller passes w_tr_raw/w_va_raw captured BEFORE
+    the binary path's in-place class_weight_multiplier reweight of
+    tr["weight"]/va["weight"], so M3's own weighting starts from the
+    untouched physics weight, not S1's already-reweighted one.
+
+    subshare (optional): WITHIN-class topology sub-shares, e.g. bb =
+    t2(b'b)/Zbb/QCD(bb) at 60/36/4 -- see derive_multiclass_weight_multiplier."""
+    y = {"train": build_multiclass_labels(tr["topology"].to_numpy(), class_groups),
+         "valid": build_multiclass_labels(va["topology"].to_numpy(), class_groups),
+         "test": build_multiclass_labels(te["topology"].to_numpy(), class_groups)}
+    topo_tr = tr["topology"].to_numpy()
+    topo_va = va["topology"].to_numpy()
+
+    lut, mult = derive_multiclass_weight_multiplier(topo_tr, w_tr_raw, class_groups,
+                                                     share, subshare)
+    w = {"train": w_tr_raw * lut[topo_tr],
+         "valid": w_va_raw * lut[topo_va],
+         "test": te["weight"].to_numpy()}          # physical, untouched (like S1's test)
+    print(f"[{name} class_weight_multiplier] derived from real train sumw (by topology): "
+          + ", ".join(f"topo{t}={v:g}" for t, v in sorted(mult.items())))
+
+    params = dict(xgb_params, random_state=seed, objective="multi:softprob",
+                  num_class=len(class_names), eval_metric="mlogloss")
+    print(f"  [{name}] {len(feats)} features | train {len(tr):,} | "
+          f"classes {class_names}")
+
+    model = XGBClassifier(**params)
+    t0 = time.time()
+    model.fit(tr[feats], y["train"], sample_weight=w["train"],
+              eval_set=[(tr[feats], y["train"]), (va[feats], y["valid"])],
+              sample_weight_eval_set=[w["train"], w["valid"]], verbose=100)
+    fit_s = time.time() - t0
+    best_it = int(getattr(model, "best_iteration", params["n_estimators"] - 1))
+
+    mdir = outdir / name
+    mdir.mkdir(parents=True, exist_ok=True)
+    model.save_model(mdir / "model.json")
+    (mdir / "training_history.json").write_text(json.dumps(model.evals_result(), indent=2))
+
+    proba = {s: model.predict_proba(d[feats]) for s, d in
+             (("train", tr), ("valid", va), ("test", te))}
+    pred_te = proba["test"].argmax(axis=1)
+
+    ranking = feature_importance(model, feats)
+    X_te = te[feats].to_numpy(dtype=np.float32)
+    macro_auc, perm, perm_per_class = permutation_importance_multiclass(
+        model, X_te, y["test"], w["test"], feats,
+        cfg.get("permutation_repeats", 3), seed, class_names)
+
+    res = {"features": feats, "n_features": len(feats), "class_names": class_names,
+           "class_weight_multiplier": mult,
+           "best_iteration": best_it, "fit_seconds": round(fit_s, 1),
+           "params": params, "feature_importance": ranking,
+           "permutation_importance": perm, "macro_auc_ovr_test": float(macro_auc),
+           "n_train": int(len(tr))}
+    for s in ("train", "valid", "test"):
+        res[s] = {"log_loss": float(log_loss(y[s], proba[s], sample_weight=w[s],
+                                             labels=list(range(len(class_names))))),
+                  "n": int(len(y[s]))}
+
+    # Overtraining must compare LIKE WITH LIKE (same fix as S1's binary
+    # w_te_ot, 2026-09-13 -- missed here originally). w["train"] pools
+    # topologies with WILDLY different multipliers per class (e.g. bb=109x,
+    # bbc=1249x) while w["test"] is raw physical weight; for a one-vs-rest
+    # "rest" pool spanning multiple topologies, train's reweighted MIX and
+    # test's raw MIX are then completely different compositions even for a
+    # perfectly-generalising model, which reads as huge spurious "bias".
+    # test_w_ot applies the SAME topology multiplier to test, for the
+    # overtraining check ONLY -- AUC/working-points/sig_eff above stay on
+    # raw physical test weight so they remain physically meaningful.
+    topo_te = te["topology"].to_numpy()
+    w_te_ot = te["weight"].to_numpy() * lut[topo_te]
+
+    # per-class (cb/bb/bbc) one-vs-rest AUC + working points + overtraining,
+    # reusing the SAME statistics helpers the binary model uses -- each is
+    # just fed that class's probability column and a (label==c) binary mask,
+    # so no new statistics code was needed for this part.
+    per_class = {}
+    for c, cname in enumerate(class_names):
+        if c == 0:
+            continue    # background is not itself a signal to report a WP for
+        yb = {s: (y[s] == c).astype(np.int8) for s in ("train", "test")}
+        sb = {s: proba[s][:, c] for s in ("train", "test")}
+        wp = wp_table(yb["test"], sb["test"], w["test"], bkg_effs)
+        ref_thr = min(wp, key=lambda x: abs(x["target_bkg_eff"] - 1e-3))["threshold"]
+        ot = overtrain_metrics(sb["train"], yb["train"], w["train"],
+                               sb["test"], yb["test"], w_te_ot,
+                               cfg.get("overtrain_score_cut", 0.6))
+        per_class[cname] = {
+            "auc_ovr": float(roc_auc_score(yb["test"], sb["test"], sample_weight=w["test"])),
+            "working_points": wp,
+            "sig_eff_at_1e-3_bkg": float(
+                w["test"][(yb["test"] == 1) & (sb["test"] >= ref_thr)].sum()
+                / max(w["test"][yb["test"] == 1].sum(), 1e-12)),
+            "overtraining": ot,
+            "permutation_importance": perm_per_class[cname],
+        }
+    res["per_class"] = per_class
+
+    # weighted confusion matrix (rows=true class, cols=predicted=argmax),
+    # row-normalised -- "of the true-label-c test jets, what fraction did the
+    # model call each class".  Physical (raw) test weights throughout.
+    K = len(class_names)
+    conf = np.zeros((K, K))
+    for t in range(K):
+        m = y["test"] == t
+        wsum = w["test"][m].sum()
+        if wsum > 0:
+            for p in range(K):
+                conf[t, p] = float(w["test"][m & (pred_te == p)].sum() / wsum)
+    res["confusion_matrix_row_normalised"] = conf.tolist()
+
+    np.savez_compressed(
+        mdir / "eval.npz",
+        test_proba=proba["test"].astype(np.float32), test_y=y["test"],
+        test_w=w["test"].astype(np.float32),
+        test_w_ot=w_te_ot.astype(np.float32),   # like-for-like vs train (see above)
+        test_topo=topo_te.astype(np.int8),
+        # t3(b'cq) proxy flag (2026-09-13): plain annotation, NOT a topology
+        # code -- see build_trainset.py. bbc has no real proxy of its own
+        # (unlike cb's t2(b'c) proxy), so the score plot uses this as a
+        # rough, explicitly-imperfect reference instead.
+        test_t3bcq_proxy=te["t3bcq_proxy_flag"].to_numpy().astype(bool),
+        train_proba=proba["train"].astype(np.float32), train_y=y["train"],
+        train_w=w["train"].astype(np.float32),
+        train_topo=tr["topology"].to_numpy().astype(np.int8),
+        class_names=np.array(class_names))
+
+    print(f"       macro AUC (OVR, test) {macro_auc:.3f}   best_iter {best_it}   ({fit_s:.0f}s)")
+    for cname, pc in per_class.items():
+        ot = pc["overtraining"]
+        print(f"       {cname:5s} AUC(vs rest) {pc['auc_ovr']:.3f}   "
+              f"sig_eff@1e-3 {pc['sig_eff_at_1e-3_bkg']:.3f}   "
+              f"overtrain {ot['verdict']} (sig {ot['rel_diff_sig_pct']:.1f}% / "
+              f"bkg {ot['rel_diff_bkg_pct']:.1f}%)")
+    print("       top-5 by permutation (macro-AUC drop): "
+          + ", ".join(f"{r['feature'].replace('ak8_gpt_','')}({r['auc_drop']:.4f})"
+                      for r in perm[:5]))
+    return res
 
 
 def add_derived_features(df, cfg):
@@ -363,13 +619,19 @@ def main():
                                        "ak8_gpt_qcd", "ak8_gpt_cc"})
     # merged names (e.g. ak8_gpt_lepq) aren't real parquet columns -- swap them
     # for their raw components on load, then sum into the merged column below.
-    load_cols = sorted((set(["topology", "weight"] + feats_s1p + gpt_all) - set(derived))
-                       | set(derived_raw))
+    load_cols = sorted((set(["topology", "weight", "t3bcq_proxy_flag"] + feats_s1p + gpt_all)
+                        - set(derived)) | set(derived_raw))
 
     print(f"[load] {dsdir}")
     tr = add_derived_features(load_split(dsdir, "train", load_cols), cfg)
     va = add_derived_features(load_split(dsdir, "valid", load_cols), cfg)
     te = add_derived_features(load_split(dsdir, "test", load_cols), cfg)
+    # snapshotted BEFORE any reweighting below -- M3 (multiclass) needs its
+    # OWN independent weight-derivation starting from the untouched physics
+    # weight, not S1's already-reweighted tr["weight"]/va["weight"] (see
+    # train_one_multiclass() docstring).
+    w_tr_raw = tr["weight"].to_numpy().copy()
+    w_va_raw = va["weight"].to_numpy().copy()
 
     # per-class sig sumw retarget (e.g. Wcb was 0.4%, proxy 99% unweighted) --
     # TRAIN + VALID only, so the loss/early-stopping objective is reshaped but
@@ -397,11 +659,33 @@ def main():
                   else cfg.get("train_models", ["S1", "S1p"]))
     for name, feats in (("S1", feats_s1), ("S1p", feats_s1p)):
         if name not in model_list:
-            print(f"  [{name}] skipped (not in {model_list} -- pass --only S1,S1p to include)")
+            print(f"  [{name}] skipped (not in {model_list} -- pass --only S1,M3 to include)")
             continue
         _, _, _, res = train_one(name, feats, tr, va, te, cfg["xgboost"],
                                  cfg["seed"], sig_codes, bkg_effs, outdir, cfg)
         summary["models"][name] = res
+
+    # M3: 4-class multiclass (bkg/cb/bb/bbc), same tr/va/te already in memory
+    # -- no second parquet read.  Uses the SAME feature list as S1 (feats_s1)
+    # so the two architectures are compared on identical inputs.
+    if "M3" in model_list:
+        class_groups = cfg.get("M3_class_groups")
+        class_names = cfg.get("M3_class_names")
+        share = cfg.get("M3_class_weight_share")
+        if not (class_groups and class_names and share):
+            print("  [M3] skipped -- M3_class_groups/M3_class_names/"
+                  "M3_class_weight_share missing from config")
+        else:
+            # M3 gets its OWN xgboost params (more regularised than S1's,
+            # 2026-09-13) -- falls back to S1's if M3_xgboost isn't set.
+            m3_xgb = cfg.get("M3_xgboost", cfg["xgboost"])
+            subshare = cfg.get("M3_topo_subshare")
+            summary["models"]["M3"] = train_one_multiclass(
+                "M3", feats_s1, tr, va, te, m3_xgb, cfg["seed"],
+                class_groups, class_names, share, bkg_effs, outdir, cfg,
+                w_tr_raw, w_va_raw, subshare)
+    else:
+        print(f"  [M3] skipped (not in {model_list} -- pass --only S1,M3 to include)")
 
     y_te = (te["topology"] > 0).astype(np.int8).to_numpy()
     w_te = te["weight"].to_numpy()
@@ -443,6 +727,22 @@ def main():
             print(f"       bkg_eff {wp['target_bkg_eff']:<6} -> sig_eff {wp['signal_eff']:.3f}")
         pc = r["test"]["per_class_signal_eff_at_1e-3"]
         print("       per-class @1e-3: " + "  ".join(f"{k} {v:.3f}" for k, v in pc.items()))
+    if "M3" in summary["models"]:
+        r = summary["models"]["M3"]
+        print(f"  M3   macro AUC (OVR, test) {r['macro_auc_ovr_test']:.3f}"
+              f"   best_iter {r['best_iteration']}")
+        for cname, pc in r["per_class"].items():
+            ot = pc["overtraining"]
+            print(f"       {cname:5s} AUC(vs rest) {pc['auc_ovr']:.3f}   "
+                  f"sig_eff@1e-3 {pc['sig_eff_at_1e-3_bkg']:.3f}   "
+                  f"overtrain {ot['verdict']} (sig {ot['rel_diff_sig_pct']:.1f}% / "
+                  f"bkg {ot['rel_diff_bkg_pct']:.1f}%)")
+        print("       confusion matrix (row=true, col=pred, row-normalised, test):")
+        names = r["class_names"]
+        print("            " + "".join(f"{n:>8s}" for n in names))
+        for i, n in enumerate(names):
+            print(f"       {n:5s}" + "".join(
+                f"{r['confusion_matrix_row_normalised'][i][j]:8.3f}" for j in range(len(names))))
     for k, v in summary["comparison_test_auc"].items():
         print(f"  {k:24s} test AUC {v:.3f}")
     if "S1" in summary["models"]:

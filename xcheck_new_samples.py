@@ -53,23 +53,21 @@ def main():
     for k in added:
         print(f"   + {k:40s} {bn[k]}")
 
-    # cross-check against what Make_plots.py actually reads
+    # cross-check against what 04_Make_plots.py actually reads. Read by PATH,
+    # not `import` (2026-09-13: renamed with a numeric prefix for the
+    # pipeline ordering, so it's no longer a valid module name -- and this
+    # only ever needed the source text for the regex grep below, not an
+    # executed module).
     try:
-        import Make_plots as M
-        want = set()
-        for attr in ("_CACHE_ALWAYS_COLUMNS",):
-            want |= set(getattr(M, attr, set()))
-        # the uproot read list is built in build_derived_array via a big
-        # `branches_to_read` list -- grep the source for the literal names
         import re, pathlib
-        src = pathlib.Path(M.__file__).read_text()
+        src = (pathlib.Path(__file__).resolve().parent / "04_Make_plots.py").read_text()
         lit = set(re.findall(r'"(ak8_[a-z0-9_]+|[a-z]+_[a-z0-9_]+)"', src))
         used_missing = sorted((set(missing)) & lit)
-        print(f"\n--- of the missing branches, {len(used_missing)} appear as string literals in Make_plots.py ---")
+        print(f"\n--- of the missing branches, {len(used_missing)} appear as string literals in 04_Make_plots.py ---")
         for k in used_missing:
             print(f"   !! {k}")
     except Exception as e:
-        print(f"\n(could not cross-check against Make_plots.py: {e})")
+        print(f"\n(could not cross-check against 04_Make_plots.py: {e})")
 
 if __name__ == "__main__":
     main()
