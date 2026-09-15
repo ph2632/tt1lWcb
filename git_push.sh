@@ -202,6 +202,24 @@ echo -e "${YELLOW}Pushing to github/${BRANCH} (GitHub) ...${NC}"
 # "OK". Use PIPESTATUS[0] (bash) to check git push's own exit code instead.
 git push -u github "$BRANCH" 2>&1 | tee /tmp/git_push_github.$$.log
 gh_status=${PIPESTATUS[0]}
+
+# 2026-09-15, user: "tune the output to avoid false alarm messages" -- a
+# non-zero push exit is not always a real failure (GitHub's own ref-lock
+# race can report "rejected" for a commit that landed anyway, seen 2026-
+# 09-15). Rather than guess from the error text, SELF-VERIFY: ask GitHub
+# directly what commit its branch is actually at and compare to local HEAD.
+# If they already match, the push demonstrably succeeded -- report OK and
+# skip the diagnostics below entirely, instead of a misleading FAILED.
+if [ "$gh_status" -ne 0 ]; then
+    remote_sha="$(git ls-remote github "$BRANCH" 2>/dev/null | cut -f1)"
+    local_sha="$(git rev-parse HEAD)"
+    if [ -n "$remote_sha" ] && [ "$remote_sha" = "$local_sha" ]; then
+        gh_status=0
+        echo -e "${YELLOW}  (push reported an error, but github/${BRANCH} already matches${NC}"
+        echo -e "${YELLOW}   local HEAD ($local_sha) -- treating as success.)${NC}"
+    fi
+fi
+
 if [ "$gh_status" -eq 0 ]; then
     echo -e "${GREEN}  GitHub push OK.${NC}"
 else
@@ -211,6 +229,12 @@ else
         echo -e "${RED}     Create an EMPTY repo named 'tt1lWcb' at https://github.com/new${NC}"
         echo -e "${RED}     (owner: ph2632; do NOT add a README/license/.gitignore there),${NC}"
         echo -e "${RED}     then re-run this script.${NC}"
+    elif grep -qi "cannot lock ref" /tmp/git_push_github.$$.log; then
+        # confirmed a REAL mismatch above (self-verify didn't clear it) --
+        # a genuine second writer racing this push, not just a report glitch.
+        echo -e "${RED}  -> GitHub ref-lock conflict, and the branch does NOT match local${NC}"
+        echo -e "${RED}     HEAD -- something else pushed to github/${BRANCH} concurrently.${NC}"
+        echo -e "${RED}     Just re-run this script.${NC}"
     elif grep -qi "non-fast-forward\|fetch first\|rejected" /tmp/git_push_github.$$.log; then
         echo -e "${RED}  -> the GitHub repo has commits this local repo doesn't (e.g. it was${NC}"
         echo -e "${RED}     initialised with a README). Resolve manually, e.g.:${NC}"
