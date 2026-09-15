@@ -102,7 +102,7 @@ def _done_banner(t0, output):
 SQ = 900                                   # square canvas side
 TXT = 0.029                                # one common in-plot text size
 MODEL = "S1"                               # S1' dropped
-PRETTY = {"S1": "S_{1}"}
+PRETTY = {"S1": "S_{1}(bc)"}
 # One distinct hue per ROC curve: grey/black for the two untrained raw sums,
 # then green / red / purple for the reference taggers and blue / orange / cyan
 # for S1,S2,S3.  No hue is reused, so a curve is identifiable by colour alone.
@@ -129,21 +129,23 @@ CMP_STYLE = {"raw_cb": 2, "raw_cb_bb": 7, "raw_sum_bc_bb_topbwc": 7,
              "Dbc3_bc_plus_bb": 1,
              "S2": 1, "S3": 1}
 
-# S2/S3/S4 are the SAME trained S1 model evaluated against a restricted signal
-# definition -- the background is untouched and nothing is retrained.  They
-# answer "how cleanly does the one tagger isolate THIS topology", which is the
-# same construction the old "S1 no t2(b'c)" curve used.
-#   topology codes: 1 W(cb)  2 t2(b'c)  3 t2(b'b)  4 t3(b'bc)  5 t2(b'c) proxy
-SUBSET_DEF = {"S2": (1, 3, 6, 7), "S3": (1,)}   # S2 bb-family: +Z(bb)-adj, +QCD(bb) (2026-09-13)
-SUBSET_LAB = {"S2": "S_{2}: cb+bb",
-              "S3": "S_{3}: cb"}
-SUBSET_ORDER = ["S2", "S3"]
-# the merged panel overlays the three signal definitions as red curves,
-# distinguished by line style only
-DEF_STYLE = {"S1": 1, "S2": 2, "S3": 3}
-DEF_MARKER = {"S1": 20, "S2": 21, "S3": 22}
-DEF_LAB = {"S1": "S_{1}: cb+bb+t^{2}(bc)+Zbb",
-           "S2": "S_{2}: cb+bb", "S3": "S_{3}: cb"}
+# 2026-09-15, user: "S1, S2, S3 have no other definitions" -- the restricted-
+# signal-subset overlay this used to draw (S2 = cb+bb subset, S3 = cb-only
+# subset, both re-scorings of the SAME S1 model, no retrain) is RETIRED. It
+# predates M3 and collided with the now-established meaning of S1/S2/S3
+# (the three separate M3-based taggers, S1(bc)/S2(bb)/S3(bbc)) -- e.g. the
+# overtrain panel's 3rd row used to read "S3: cb" where "S3" now means the
+# bbc tagger elsewhere in this same report. SUBSET_DEF/SUBSET_LAB/
+# SUBSET_ORDER kept only as empty/trivial stubs so any stray reference
+# fails loudly rather than silently reintroducing the old curves.
+SUBSET_DEF = {}
+SUBSET_LAB = {}
+SUBSET_ORDER = []
+# the merged panel used to overlay 3 signal definitions (S1/S2/S3 subsets)
+# as red curves distinguished by line style; only S1(bc) itself remains.
+DEF_STYLE = {"S1": 1}
+DEF_MARKER = {"S1": 20}
+DEF_LAB = {"S1": "S_{1}(bc)"}
 
 # Tagger-input labels, in the 04_Make_plots.py notation.  These are the
 # MASS-DECORRELATED ak8_gpt_* scores of a generic massive resonance X, so
@@ -339,42 +341,23 @@ def roc_figure(outdir, summary, cfg, out_png, presel=None):
                   xoff=0.96, yoff=1.06)
     frame.GetYaxis().SetLabelOffset(0.005)   # tick numbers 1% closer
 
-    # legend order: the untrained raw sums first (cumulative), then the old and
-    # 3-class Dbc models, then S1 itself last.
+    # 2026-09-15, user: "the ROCs are old and likely irrelevant" -- dropped
+    # the comparison overlay against the pre-M3 baselines (raw GloParT sums,
+    # Youpeng's old/3-class Dbc models) AND the S2/S3 restricted-signal-
+    # subset re-scorings (see the SUBSET_* retirement note above). This now
+    # shows exactly one curve: S1(bc) itself, full positive-class definition.
     # entry = (label, colour, style, y, score, w, signal classes, full score).
-    # The cmp_*.npz arrays are built from the same test dataframe, in the same
-    # row order, as eval.npz -- so eval's test_topo applies to them too and
-    # every curve can get the 2-bin significance.  The last field is the
-    # UNMASKED score of that curve, which the significance must use (the
-    # plotted score may be subset-masked, and is a different discriminant
-    # entirely for the baselines).
     entries = []
-    for key in CMP_ORDER:
-        f = outdir / f"cmp_{key}.npz"
-        if f.exists():
-            d = np.load(f)
-            entries.append((CMPLAB[key], COL[key], CMP_STYLE[key],
-                            d["y"], d["score"], d["w"], (1, 2, 3, 4, 6, 7), d["score"]))
     f = outdir / MODEL / "eval.npz"
     if f.exists():
         e = np.load(f)
-        entries.append(("S_{1}: cb+bb+t^{2}(bc)", COL[MODEL], 1,
+        entries.append((PRETTY["S1"], COL[MODEL], 1,
                         e["test_y"], e["test_score"], e["test_w"],
                         (1, 2, 3, 4, 6, 7), e["test_score"]))
-        # S2/S3/S4: the SAME S1 model, re-scored against a restricted signal
-        # definition (background untouched).  These are not separate trainings
-        # -- they show how well the one tagger isolates each topology.
-        topo = e["test_topo"]
-        for key in SUBSET_ORDER:
-            cls = SUBSET_DEF[key]
-            m = (topo == 0) | np.isin(topo, cls)
-            if int(np.isin(topo, cls).sum()) < 20:
-                continue
-            entries.append((SUBSET_LAB[key], COL[key], CMP_STYLE[key],
-                            e["test_y"][m], e["test_score"][m], e["test_w"][m],
-                            cls, e["test_score"]))
 
-    lg = _legend(0.510, 0.130, 0.810, 0.445, 0.0303)   # +1% right (2026-09-13)
+    # box shrunk to fit ONE row (2026-09-15) -- was sized for up to 8 entries
+    # back when the old comparison/subset overlay was drawn here.
+    lg = _legend(0.510, 0.360, 0.810, 0.445, 0.0303)   # +1% right (2026-09-13)
     lg.SetFillStyle(1001); lg.SetFillColor(ROOT.kWhite); lg.SetMargin(0.16)
     keep, rows = [], []
     topo_all = e["test_topo"] if f.exists() else None
@@ -399,7 +382,7 @@ def roc_figure(outdir, summary, cfg, out_png, presel=None):
                 mk.SetMarkerColor(col); mk.SetMarkerSize(1.7)
                 mk.Draw(); keep.append(mk)
         lg.AddEntry(g, text, "l")
-    pvw = ROOT.TPave(0.505, 0.125, 0.970, 0.485, 0, "NDC")   # +1% right (2026-09-13)
+    pvw = ROOT.TPave(0.505, 0.355, 0.970, 0.485, 0, "NDC")   # shrunk with lg (2026-09-15)
     pvw.SetFillColor(ROOT.kWhite); pvw.SetFillStyle(1001); pvw.SetBorderSize(0)
     pvw.Draw(); ROOT.SetOwnership(pvw, False)
     lg.Draw()
@@ -407,7 +390,7 @@ def roc_figure(outdir, summary, cfg, out_png, presel=None):
     t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(0.0303)
     # AUC / significance as columns on the legend's own row grid, so the
     # numbers line up regardless of how long each label is
-    y1, y2, n = 0.130, 0.445, len(rows)
+    y1, y2, n = 0.360, 0.445, len(rows)
     # +1% right (tied to lg's new x2=0.810) and 1% less gap between the two
     # columns than before (was 0.800/0.895 -> net x_z unchanged) (2026-09-13)
     x_auc, x_z = 0.810, 0.895
@@ -506,8 +489,9 @@ def overtrain_figure(outdir, name, summary, cfg, out_png, sig_codes,
     # differ and the curves separate for a reason unrelated to overtraining.
     # one (train, test, numbers) set per signal definition; the background is
     # common to all of them, so it is built once
-    defs = [("S1", tuple(k for k in sig_codes if int(k) != 5))] + \
-           [(k, SUBSET_DEF[k]) for k in cfg.get("panel_subsets", SUBSET_ORDER)]
+    # 2026-09-15, user: S2/S3 restricted-subset rows retired, see the
+    # SUBSET_* note above -- only S1(bc) itself is drawn now.
+    defs = [("S1", tuple(k for k in sig_codes if int(k) != 5))]
     sig_sets, ot_by = [], {}
     for dn, dcls in defs:
         m_tr = np.isin(e["train_topo"], dcls); m_te = np.isin(e["test_topo"], dcls)
@@ -787,8 +771,9 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
     # class shares with the proxy dropped -- proxy is W->cs background, and on
     # raw physics weights it is 99% of topo>0, so an unweighted sum would show
     # the proxy shape rather than the Vcb signal.
-    defs = [("S1", all_true)] + [(k, SUBSET_DEF[k])
-                                 for k in cfg.get("panel_subsets", SUBSET_ORDER)]
+    # 2026-09-15, user: S2/S3 restricted-subset totals retired, see the
+    # SUBSET_* note above -- only S1(bc)'s own total is drawn now.
+    defs = [("S1", all_true)]
     sig_m = np.isin(topo, all_true)
     n_bkg = int((topo == 0).sum()); n_sig = int(sig_m.sum())
     cwm = summary["config"].get("class_weight_multiplier") or \
