@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import mplhep as hep
 
 from sklearn.metrics import roc_curve, auc
-from train_bdt.dbc_tools import DbcEvaluator, Dbc3ClassEvaluator, S1Evaluator
+from train_bdt.dbc_tools import DbcEvaluator, Dbc3ClassEvaluator, S1Evaluator, M3Evaluator
 
 
 def _dir_readable(path):
@@ -245,7 +245,19 @@ class Config:
         #   model hash/mtime check, so the v24 cache still had score_S1
         #   baked in from the OLD model. Forces a full re-derive so MAT
         #   plots pick up the new one.
-        self.cache_tag = "derived_v25_s1retrain_v1"
+        # v26 (derived_v26_m3score_v1, 2026-09-14): + score_S2/score_S3 (M3
+        #   multiclass P(bb)/P(bbc), M3Evaluator) -- new cached fields, AND
+        #   both S1 and M3 are being retrained again this turn (dataset-level
+        #   weight capping for Zbb/QCD(bb) changes S1's training too), so a
+        #   full re-derive is needed regardless of the new columns.
+        # v27 (derived_v27_qcdbb_v1, 2026-09-14): + ak4_hflav (new raw
+        #   branch) and mat_cat code 30 = QCD(bb) carved out of 'rest'
+        #   (gen-matched genuine QCD-origin bb-bar, same >=2 AK4 with
+        #   ak4_hflav==5 dR<0.8 definition as topology 7 in
+        #   build_trainset.py) -- for the new REGIONS-mode m(J) plots and
+        #   any other MAT plot's background breakdown. New raw branch +
+        #   changed mat_cat values -> full re-derive.
+        self.cache_tag = "derived_v27_qcdbb_v1"
 
         # ------------------------------------------------------------------
         # Switches
@@ -274,6 +286,13 @@ class Config:
         # Tied to ONE trained run -- re-point after any retrain you want
         # reflected here (02_train_tagger.py overwrites model.json in place).
         self.s1_model_path = "./S1_tagger/output/presel_v3_kp50_zbb/S1/model.json"
+        # this project's own M3 multiclass (bkg/cb/bb/bbc) tagger (2026-09-14,
+        # user: "3 taggers only: S1(bc), S2(bb), S3(bbc)"); see M3Evaluator.
+        # score_S2/score_S3 = M3's P(bb)/P(bbc) columns. score_S1 stays the
+        # EXISTING binary S1 model above (its own dedicated, more-mature
+        # cb tagger), just relabelled "S1(bc)" for display -- not switched to
+        # M3's cb column, so no change to any existing S1-dependent plot/cut.
+        self.m3_model_path = "./S1_tagger/output/presel_v3_kp50_zbb/M3/model.json"
 
         # ------------------------------------------------------------------
         # Sample catalog
@@ -352,7 +371,9 @@ class Config:
             "score_Dbc": r"$D_{bc}$",
             "score_Dbc3_bc": r"$D_{bc}$ (3cl)",
             "score_Dbc3_bb": r"$D_{bb}$ (3cl)",
-            "score_S1": r"$S_{1}$",
+            "score_S1": r"$S_{1}(bc)$",
+            "score_S2": r"$S_{2}(bb)$",
+            "score_S3": r"$S_{3}(bbc)$",
             "score_SC": r"$S_{\mathrm{EVT}}$",
 
             "score_cata_w_qq_norm": r"EC $W \to qq'$ score",
@@ -477,6 +498,7 @@ class Config:
             "ak4_pt",
             "ak4_eta",
             "ak4_phi",
+            "ak4_hflav",
             "ak4_tag",
             "ak4_pn_c",
             "ak4_pn_b",
@@ -1056,6 +1078,14 @@ def columns_for_cache(cfg):
         if mode.startswith("MAT"):
             specs = build_mat_plot_settings(getattr(cfg, "mat_sel", "PRE"),
                                             getattr(cfg, "signal_only", False))
+        elif mode.startswith("REGIONS"):
+            # 2026-09-14: 6-region composite m(J) plot -- its cut strings
+            # (score_S1/S2/S3 among them) and var (ak8_sdmass_0) are NOT
+            # part of build_plot_settings()'s ALL-mode spec list, so without
+            # this branch they'd be pruned out of the cache read entirely.
+            _region_cfgs, _composite_cfg = build_region_mass_settings(
+                getattr(cfg, "signal_only", False))
+            specs = _region_cfgs + [_composite_cfg]
         else:
             specs = build_plot_settings()
         # ROC settings share the cache; include their fields even though the
@@ -1116,6 +1146,7 @@ class DataManager:
         )
         self.dbc3_eval = Dbc3ClassEvaluator(model_path=self.cfg.dbc3_model_path)
         self.s1_eval = S1Evaluator(model_path=self.cfg.s1_model_path)
+        self.m3_eval = M3Evaluator(model_path=self.cfg.m3_model_path)
 
         # Columns to pull from the derived parquet cache (see columns_for_cache).
         # None -> read every column (old behaviour / WCB_LOAD_ALL_COLS=1).
@@ -2658,6 +2689,14 @@ class DataManager:
         score_S1 = self.s1_eval.get_score(_s1_feats)
 
         # ------------------------------------------------------------------
+        # M3 multiclass tagger (this project's own XGBoost model, cb/bb/bbc
+        # one-vs-rest columns) -- score_S2/score_S3 = P(bb)/P(bbc), applied
+        # at load time exactly like score_S1 above (2026-09-14). Re-uses
+        # _s1_feats since M3Evaluator.RAW_INPUTS == S1Evaluator.RAW_INPUTS.
+        # ------------------------------------------------------------------
+        _, score_S2, score_S3 = self.m3_eval.get_scores(_s1_feats)
+
+        # ------------------------------------------------------------------
         # True category as int8 code
         # ------------------------------------------------------------------
         true_cat = self.make_true_category(ak8_type, n_c, is_qcd)
@@ -2798,6 +2837,29 @@ class DataManager:
         mat_cat[_in_rest & _z_merged & (z_decay == 5)] = 15
         # Everything else hadronic-Z stays mat_cat == 3 ("Z resolved" in 'rest',
         # like W-resolved).  gluon/light/c/b jets from every process also here.
+
+        # --- QCD(bb), carved out of 'rest' (2026-09-14, user) ---------------
+        # Genuine gen-matched QCD-origin bb-bar (e.g. gluon splitting): >=2 AK4
+        # jets with real hadron-flavour truth (ak4_hflav==5) geometrically
+        # inside J's cone (dR<0.8, pT>20) -- the SAME definition as topology
+        # 7/QCDBB_CODE in 01_build_trainset.py (see its comment there for the
+        # full derivation). Applied ONLY within mat_cat==3 ("rest"), exactly
+        # like the Z-merged carve-out just above, so no other category is
+        # touched. mat_cat code 30 = QCD(bb); requires ak4_hflav in the raw
+        # branch list (added to common_branches -- absent in older cache
+        # tags, in which case this silently stays all-False and everything
+        # that would be QCD(bb) simply stays pooled in 'rest' as before).
+        if "ak4_hflav" in raw.fields:
+            _q_dphi = np.abs(raw["ak4_phi"] - ak8_phi_0)
+            _q_dphi = ak.where(_q_dphi > np.pi, 2.0 * np.pi - _q_dphi, _q_dphi)
+            _q_dR = np.hypot(raw["ak4_eta"] - ak8_eta_0, _q_dphi)
+            _q_match = ((_q_dR < 0.8) & (raw["ak4_pt"] > 20.0)
+                        & (raw["ak4_hflav"] == 5))
+            n_bflav_in_cone = ak.to_numpy(ak.sum(_q_match, axis=-1))
+            is_qcd_bb = (n_bflav_in_cone >= 2) & (mat_cat == 3)
+        else:
+            is_qcd_bb = np.zeros(n, dtype=bool)
+        mat_cat[is_qcd_bb] = 30
 
         # ------------------------------------------------------------------
         # Derived: W transverse mass and W mass from lepton + MET
@@ -3738,6 +3800,8 @@ class DataManager:
             "score_Dbc3_bc": score_Dbc3_bc,
             "score_Dbc3_bb": score_Dbc3_bb,
             "score_S1": score_S1,
+            "score_S2": score_S2,
+            "score_S3": score_S3,
             "score_SC": score_SC,
 
             "score_cata_w_qq_norm": score_cata_w_qq_norm,
@@ -4220,6 +4284,10 @@ class Histogrammer:
                              # qq' -> "Zlight" (all three green); resolved Z ->
                              # Rest (V-resolved).
                              (13, "Zlight"), (14, "Zcc"), (15, "Zbb"),
+                             # QCD(bb): genuine gen-matched QCD-origin bb-bar,
+                             # carved out of 'rest' (2026-09-14, user) -- same
+                             # definition as topology 7 in build_trainset.py.
+                             (30, "QCD_bb"),
                              (3, "Rest"))
                 per = scatter_hist_by_category(
                     values, weights, mat_cat, bins, [c for c, _ in _code_key])
@@ -4606,7 +4674,7 @@ class Plotter:
                      "Wcq", "Wqq_light",
                      "Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq",
-                     "Rest", "Zbb", "Zcc", "Zlight"]
+                     "QCD_bb", "Rest", "Zbb", "Zcc", "Zlight"]
         # Subsets of Wcb / Cat_Top_bc (events with mt == -1) -- drawn as dotted
         # lines, but NOT counted in the grand total or the S/sqrt(S+B) bkg sum.
         _SUBSET_KEYS = ("Wcb_nomt", "Cat_Top_bc_nomt")
@@ -4647,6 +4715,10 @@ class Plotter:
             "Cat_Top_bq":   r"$t^2(b'q)$",
             "Cat_Top_bqqc": r"$t^3(b'cq)$",
             "Cat_Top_bqq":  r"$t^3(b'qq)$",
+            # QCD(bb): genuine gen-matched QCD-origin bb-bar, carved out of
+            # 'rest' (2026-09-14, user) -- same definition as topology 7 in
+            # build_trainset.py (>=2 AK4 with ak4_hflav==5, dR<0.8 of J).
+            "QCD_bb": r"QCD($b\bar b$)",
             "Rest": r"Rest: $g,q,c,b$, $V^{\mathrm{rsd}}$",
             # merged hadronic Z -- was one pooled "Zhf" line, split
             # 2026-09-12 (S1_tagger found the tagger cannot separate Z->bb
@@ -4865,6 +4937,10 @@ class Plotter:
             # t^3(b',b,c) fully-merged W->cb top -- SIGNAL, yellow solid
             # (2026-09-04 user: distinct colour, all 5 signal lines solid lw 2).
             "Cat_Top_bbc": {"color": _c_sig["Cat_Top_bbc"], "linestyle": "-", "linewidth": 2.0, "zorder": 9},
+            # QCD(bb), carved out of 'rest' (2026-09-14, user) -- distinct
+            # brown/orange, solid, so it reads as its own physics process
+            # rather than a grey catch-all like the remaining Rest line.
+            "QCD_bb":      {"color": "#B8600B", "linestyle": "-", "linewidth": 1.8, "zorder": 5},
             "Rest":        {"color": "#9C9CA1", "linestyle": _ls2, "linewidth": 1.5, "zorder": 2},
             # merged hadronic Z -- the 3 LIGHTEST of the green V ramp, SOLID
             # lw 2.  Resolved Z stays in grey Rest.
@@ -6468,12 +6544,19 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("ttreco_n_bL_out_ja",     "n_bL_out_ja",            -0.5, 5.5,   6, r"# loose-$b$ AK4 jets outside the $J$ cone", False),  # commented out on request
 
         # ---- classifier / discriminant outputs ------------------------------
-        ("score_Dbc",              "score_Dbc",              0.0, 1.0, 50, r"$D_{bc}(J)$",                 True),
-        # Youpeng's 3-class GloParT-node model, applied at load time (2026-09-13)
-        ("score_Dbc3_bc",          "score_Dbc3_bc",          0.0, 1.0, 50, r"$D_{bc}$ (3cl)",              True),
-        ("score_Dbc3_bb",          "score_Dbc3_bb",          0.0, 1.0, 50, r"$D_{bb}$ (3cl)",              True),
-        # this project's own S1 boosted-cb tagger, applied at load time (2026-09-13)
-        ("score_S1",               "score_S1",               0.0, 1.0, 50, r"$S_{1}$ (BDT fine-tuned)",    True),
+        # 2026-09-14, user: "S1, Dbc, Dbc(J), Dbb are unclear -- there should
+        # be 3 taggers only: S1(bc), S2(bb), S3(bbc)". Consolidated the old
+        # 4-plot mix (this project's own binary S1 tagger alongside Youpeng's
+        # separate old-8node/3-class Dbc/Dbc3 models -- score_Dbc/Dbc3_bc/
+        # Dbc3_bb are STILL computed and cached, just no longer listed as
+        # MAT-plot specs here; score_Dbc also still drives the SR/JB
+        # selection cuts elsewhere, untouched) down to exactly the project's
+        # own 3 taggers, one per physics target: S1(bc) = the existing
+        # dedicated binary cb tagger; S2(bb)/S3(bbc) = the new M3 multiclass
+        # model's P(bb)/P(bbc) one-vs-rest columns (M3Evaluator).
+        ("score_S1",               "score_S1",               0.0, 1.0, 50, r"$S_{1}(bc)$ (BDT fine-tuned)", True),
+        ("score_S2",               "score_S2",               0.0, 1.0, 50, r"$S_{2}(bb)$ (M3 multiclass)",  True),
+        ("score_S3",               "score_S3",               0.0, 1.0, 50, r"$S_{3}(bbc)$ (M3 multiclass)", True),
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
@@ -6735,6 +6818,170 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     return [m(*s) for s in specs]
 
 
+# --------------------------------------------------------------------------- #
+# 6-region composite m(J) plot, 2026-09-14 (user).
+#
+# User's framing: reuse the EXACT mechanism of the existing
+# ttreco_mJ_jstar_cat composite spec above (composite x-axis, dashed
+# vertical block separators, per-block condition captions, rendered once
+# via draw_matching -- "m(J) per j* case", 6 real blocks + 1 residual) but
+# swap what defines each block: instead of a j*-flavour sub-population of
+# ONE shared m(J) range (mutually-exclusive per-event, built as a single
+# derived column in build_derived_array), each of the 6 blocks here is a
+# DIFFERENT PHASE-SPACE REGION -- Preselection and SR, each combined with
+# one of the 3 new taggers' working point (S1(bc)>0.8, S2(bb)>0.6,
+# S3(bbc)>0.5). Events legitimately appear in MULTIPLE blocks (every SR
+# event also passes Preselection) -- that overlap is the whole point of
+# comparing the phase spaces side by side, so this can NOT be one derived
+# column like mJ_jstar_cat; each block is filled independently (its own
+# cut string) and the resulting bin-content arrays are concatenated AFTER
+# filling, in draw() below.
+# --------------------------------------------------------------------------- #
+def build_region_mass_settings(signal_only=False):
+    """Returns (region_cfgs, composite_cfg).
+
+    region_cfgs (6): plain m(J) plot_cfg dicts (0-250 GeV, 25 bins each,
+    matching the standalone ak8_sdmass_0 spec's binning), one per region,
+    cut = Preselection/SR x S1(bc)>0.8/S2(bb)>0.6/S3(bbc)>0.5. Filled via
+    stream_fill_histograms exactly like any other MAT spec; the last 3
+    (index 3-5, the SR-based ones) are ALSO drawn standalone by the caller
+    ("also plot the SD mass at SR for (a)...(c)").
+
+    composite_cfg: the merged 6-block plot's cfg (bins/vlines/xticks/
+    block_labels already built to lay the 6 regions side by side on one
+    composite x-axis) -- "cut" is a placeholder ('1'); the composite is
+    never filled directly, only assembled from region_cfgs' already-filled
+    histograms (see _merge_region_hists / the REGIONS dispatch in main()).
+    """
+    # Mirrors build_mat_plot_settings's _SELECTIONS exactly -- that dict is
+    # local to that function, not importable, so reconstructed here.
+    _COMMON = ("(ak8_tau21_0 > 0) and (ak8_tau21_0 < 0.65) and "
+               "(dR_lep_ak8 > 1.3)")
+    _MJ12 = "(ak8_sdmass_0 > 40) and (ak8_sdmass_sub_mass_0 < 100)"
+    PRE = "(ak8_pt[0] > 200) and " + _MJ12 + " and " + _COMMON
+    SR = "(ak8_pt[0] > 200) and (score_Dbc > 0.9) and " + _MJ12 + " and " + _COMMON
+
+    LO, HI, NB = 0.0, 250.0, 25
+    _bins1 = np.linspace(LO, HI, NB + 1)
+    WIDTH = HI - LO
+
+    _REGIONS = [
+        ("PRE_S1", PRE + " and (score_S1 > 0.8)", "PRE  S1(bc)>0.8"),
+        ("PRE_S2", PRE + " and (score_S2 > 0.6)", "PRE  S2(bb)>0.6"),
+        ("PRE_S3", PRE + " and (score_S3 > 0.5)", "PRE  S3(bbc)>0.5"),
+        ("SR_S1",  SR + " and (score_S1 > 0.8)",  "SR  S1(bc)>0.8"),
+        ("SR_S2",  SR + " and (score_S2 > 0.6)",  "SR  S2(bb)>0.6"),
+        ("SR_S3",  SR + " and (score_S3 > 0.5)",  "SR  S3(bbc)>0.5"),
+    ]
+
+    def _one(tag, cut, label):
+        return {
+            "name": f"MAT_sdmass_{tag}",
+            "var": "ak8_sdmass_0",
+            "var_mode": "event",
+            "mode": "mat",
+            "bins": _bins1,
+            "logx": False,
+            "xlabel": r"$m_{\mathrm{SD}}(J)$ [GeV]",
+            "xlim": (LO, HI),
+            "xticks": None,
+            "xticklabels": None,
+            "xtick_rotation": None,
+            "caption": None,
+            "vlines": None,
+            "block_labels": None,
+            "cut": cut,
+            "logy": False,
+            "truth_only": False,
+            "ylim_bottom": 5e-4,
+            "ylim_top": 4.0,
+            "ratio_ylim": (0.0, 4.0),
+            "hide_total_signal": False,
+            "sig_ymax": None,
+            "sigonly_ymax": None,
+            "_normalize": False,
+            "_signal_only": signal_only,
+            "_bkg_only": False,
+            # not a real PRE/SR/JB key on purpose -- draw_matching falls back
+            # to using the string itself as both the filename suffix (empty,
+            # since it's not in that lookup) and the on-plot region label.
+            "_sel": label,
+        }
+
+    region_cfgs = [_one(tag, cut, lbl) for tag, cut, lbl in _REGIONS]
+
+    # ---- composite: all 6 side by side on one x-axis --------------------
+    n_blk = len(_REGIONS)
+    comp_bins = np.concatenate(
+        [_bins1] + [_bins1[1:] + i * WIDTH for i in range(1, n_blk)])
+    comp_vlines = [i * WIDTH for i in range(1, n_blk)]
+    _tick_x = [LO + 0.2 * WIDTH, LO + 0.4 * WIDTH, LO + 0.6 * WIDTH, LO + 0.8 * WIDTH]
+    comp_xticks, comp_xticklabels = [], []
+    for i in range(n_blk):
+        for x in _tick_x:
+            comp_xticks.append(i * WIDTH + x)
+            comp_xticklabels.append(f"{x:.0f}")
+    # y=0.50 (was 0.72, 2026-09-14): the generic truth_only caption
+    # ("gen-truth axis: per-bin S/sqrt(S+B) shown...", draw_matching
+    # ~line 5114) occupies the top ~0.72-0.86 band of the ratio pad, and was
+    # visually colliding with these block labels. Two-line, shorter text
+    # (vs the single-line double-spaced label used for the standalone
+    # plots' top annotation) so 6 of them fit the pad width without overlap.
+    comp_block_labels = [(i * WIDTH + 0.5 * WIDTH, lbl.replace("  ", "\n"), 0.50)
+                          for i, (_, _, lbl) in enumerate(_REGIONS)]
+
+    composite_cfg = {
+        "name": "MAT_sdmass_regions",
+        "var": "ak8_sdmass_0",
+        "var_mode": "event",
+        "mode": "mat",
+        "bins": comp_bins,
+        "logx": False,
+        "xlabel": r"$m_{\mathrm{SD}}(J)$ per region [GeV]",
+        "xlim": (comp_bins[0], comp_bins[-1]),
+        "xticks": comp_xticks,
+        "xticklabels": comp_xticklabels,
+        "xtick_rotation": 0,
+        "caption": None,
+        "vlines": comp_vlines,
+        "block_labels": comp_block_labels,
+        "cut": "1",   # placeholder -- composite is assembled, never filled directly
+        "logy": False,
+        # 1-bin S/sqrt(S+B) window optimisation would be meaningless sliding
+        # across 6 unrelated regions concatenated together -- suppress it,
+        # same as every other composite/categorical spec in this file.
+        "truth_only": True,
+        "ylim_bottom": 5e-4,
+        "ylim_top": 4.0,
+        "ratio_ylim": (0.0, 4.0),
+        "hide_total_signal": False,
+        "sig_ymax": None,
+        "sigonly_ymax": None,
+        "_normalize": False,
+        "_signal_only": signal_only,
+        "_bkg_only": False,
+        "_sel": "6 regions",
+    }
+    return region_cfgs, composite_cfg
+
+
+def _merge_region_hists(accs, nb):
+    """Concatenate `nb`-bin per-region (hist_data, hist_var) pairs into one
+    composite array per category key, in block order. A key missing from a
+    given region's hist_data (that category simply had no entries under
+    that region's cut) is zero-padded for that block, not dropped."""
+    comp_data, comp_var = {}, {}
+    all_keys = set()
+    for hd, _ in accs:
+        all_keys.update(hd.keys())
+    for key in all_keys:
+        parts_d = [np.asarray(hd.get(key, np.zeros(nb))) for hd, _ in accs]
+        parts_v = [np.asarray(hv.get(key, np.zeros(nb))) for _, hv in accs]
+        comp_data[key] = np.concatenate(parts_d)
+        comp_var[key] = np.concatenate(parts_v)
+    return comp_data, comp_var
+
+
 def build_roc_settings():
     return [
         {
@@ -6900,7 +7147,7 @@ def parse_args():
         nargs="?",
         default="ALL",
         type=str.upper,
-        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG"],
+        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG", "REGIONS", "REGIONS-SIGNAL"],
         help="ALL (default): run the normal Data/MC batch plots. "
              "MAT: matching-truth overlay only (Wcb vs Cat_Top_bc vs Rest, "
              "with a ratio panel).  "
@@ -6908,7 +7155,11 @@ def parse_args():
              "just the 5 red W->cb lines (loads only ttbar-powheg, fast).  "
              "MAT-BKG: the mirror -- loads every sample EXCEPT ttbar-powheg, "
              "draws just the background lines, lower pad = per-bin component "
-             "fraction (PNG suffix _bkg).",
+             "fraction (PNG suffix _bkg).  "
+             "REGIONS: single composite m(J) plot, one block per phase-space "
+             "region (Preselection / SR, each x S1(bc)>0.8 / S2(bb)>0.6 / "
+             "S3(bbc)>0.5 -- 6 blocks total), S+B.  REGIONS-SIGNAL: same, "
+             "signal only.  Also writes 3 standalone SR-region m(J) plots.",
     )
     # 2nd/3rd positional tokens for MAT: one picks the y-axis (ABS|NORM), the
     # other the selection (PRE|SR|JB).  Order-independent, both optional, e.g.
@@ -6978,7 +7229,7 @@ def main():
     # RSS under the lxplus memory cgroup.
     cfg.plot_mode = args.mode
     cfg.mat_sel = getattr(args, "sel", "PRE")
-    cfg.signal_only = (args.mode == "MAT-SIGNAL")
+    cfg.signal_only = args.mode in ("MAT-SIGNAL", "REGIONS-SIGNAL")
     cfg.bkg_only = (args.mode == "MAT-BKG")
     ensure_dir(cfg.figure_path)
     ensure_dir(cfg.cache_path)
@@ -7124,6 +7375,52 @@ def main():
             run_gpt_score_montage(cfg.figure_path, _msfx)
         # full mSD / pT panels: run `montage_mat.sh <dir> <suffix>` by hand.
         # run_mat_montage(cfg.figure_path, _msfx)
+        return
+
+    # ------- REGIONS mode: 6-region composite m(J) plot (2026-09-14) --------
+    if args.mode in ("REGIONS", "REGIONS-SIGNAL"):
+        signal_only = (args.mode == "REGIONS-SIGNAL")
+        region_cfgs, composite_cfg = build_region_mass_settings(signal_only)
+        for i, p in enumerate(region_cfgs):
+            p["_progress"] = f"REGIONS {i + 1}/{len(region_cfgs)}"
+
+        _first = manager.materialize(sample_metas[0]) if sample_metas else None
+        t_fill0 = time.time()
+        print("=" * 100)
+        print(f"[INFO] Filling {len(region_cfgs)} region m(J) histograms over "
+              f"{len(sample_metas)} samples (streaming, one array resident)")
+        print("=" * 100)
+        accs = stream_fill_histograms(manager, sample_metas, region_cfgs,
+                                      hist_maker, first_sample=_first)
+        t_fill = time.time() - t_fill0
+
+        print("=" * 100)
+        print("[INFO] Drawing 3 standalone SR-region m(J) plots "
+              "(also requested individually, not just in the composite)")
+        print("=" * 100)
+        for p, (hd, hv) in zip(region_cfgs[3:6], accs[3:6]):
+            if len(hd) == 0:
+                print(f"[WARN] {p['name']}: empty, skip.")
+                continue
+            plotter.draw_matching(hd, p, hv)
+
+        print("[INFO] Drawing the single composite 6-region m(J) plot")
+        comp_data, comp_var = _merge_region_hists(accs, nb=25)
+        if comp_data:
+            plotter.draw_matching(comp_data, composite_cfg, comp_var)
+        else:
+            print("[WARN] composite region plot: empty, skip.")
+
+        t_total = time.time() - t_total0
+        n = len(plotter.saved_pngs)
+        print("=" * 100)
+        print(f"[DONE] {n} plots in {fmt_hms(t_total)}")
+        print(f"[TIME]   list : {fmt_hms(t_load)}  ({t_load:.1f}s)")
+        print(f"[TIME]   fill : {fmt_hms(t_fill)}  ({t_fill:.1f}s)")
+        print(f"[DONE] Figures saved to: {cfg.figure_path}")
+        for p in plotter.saved_pngs:
+            print(f"       {os.path.basename(p)}")
+        print("=" * 100)
         return
 
     plot_settings = build_plot_settings()

@@ -359,6 +359,36 @@ def main():
                 keep &= (special | thin)
                 weight = np.where(special, weight, weight / keep_p)  # ... keep sum(w) intact for bkg
 
+                # Weight-tail capping for Zbb/QCD(bb) (2026-09-14, user: "Now
+                # M3 is overtrained ... investigate what is wrong"): these two
+                # topologies' per-event weight is severely skewed -- verified
+                # on the built dataset (train split): topo6 (z_bb) top 1% of
+                # events carry ~39% of total sumw (effective sample size only
+                # 1820/136000 = 1.3% of raw N); topo7 (qcd_bb) top 1% carry
+                # ~47% (ESS 157/179609 = 0.09%). Almost certainly a pT-hat/HT
+                # generator-weight-tail artifact, not physics -- a handful of
+                # extreme-weight jets land differently in every train/test
+                # split by pure chance, which is what was driving M3 bb's
+                # overtraining bias (topo6 sig bias 9.3%, topo7 15.3%, vs
+                # topo3's clean 0.4%). Capped at 15x the per-topology median
+                # and rescaled to restore each topology's original total
+                # sumw -- both constants derived ONCE from the full
+                # presel_v3_kp50_zbb train split (this build streams
+                # file-by-file, so an exact percentile isn't available at
+                # write time; see the investigation in the 2026-09-14 chat
+                # turn for the derivation). Affects 0.24% of z_bb jets and
+                # 0.37% of qcd_bb jets; raises effective sample size to
+                # ~70000/~69000 (near the raw event count -- the skew is
+                # resolved). Applied on |weight| to correctly handle any
+                # signed (NLO negative-weight) events.
+                ZBB_WCAP, ZBB_WRESCALE = 0.00913, 1.6892
+                QCDBB_WCAP, QCDBB_WRESCALE = 0.60331, 2.0121
+                for code, cap, rescale in ((ZBB_CODE, ZBB_WCAP, ZBB_WRESCALE),
+                                           (QCDBB_CODE, QCDBB_WCAP, QCDBB_WRESCALE)):
+                    m = topo == code
+                    capped = np.minimum(np.abs(weight), cap) * rescale
+                    weight = np.where(m, np.sign(weight) * capped, weight)
+
                 # t3(b'cq) proxy flag (2026-09-13, user): same idea as the
                 # t2(b'c) proxy, but for the fully-merged t3(b'bc) signal --
                 # a Cabibbo-favoured W->cs event with the SAME 3-prong

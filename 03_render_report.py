@@ -192,6 +192,11 @@ TOPO_LAB = {1: "Wcb", 2: "t^{2}(b'c)", 3: "t^{2}b'b", 4: "t^{3}(b'bc)",
 # topology above (cb -> Wcb's azure, bb -> t2(b'b)'s green, bbc -> t3(b'bc)'s
 # magenta), so M3 plots read consistently with every other plot in this file.
 M3_COL = {"cb": TOPO_COL[1], "bb": TOPO_COL[3], "bbc": TOPO_COL[4]}
+# 2026-09-14, user: "S1, Dbc, Dbc(J), Dbb are unclear -- there should be 3
+# taggers only: S1(bc), S2(bb), S3(bbc)". Internal keys (cname: cb/bb/bbc,
+# used for dict lookups and file names) are UNCHANGED; only the human-
+# readable text drawn ON the plots switches to this naming.
+M3_DISP = {"cb": "S1(bc)", "bb": "S2(bb)", "bbc": "S3(bbc)"}
 
 TOP_MARGIN = 0.065     # all four figures (was 0.085)
 RIGHT_MARGIN = 0.025   # all four figures (was 0.035)
@@ -661,7 +666,7 @@ def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15,
 
     lg = _legend(0.618, 0.555, 0.965, 0.670, TXT)
     lg.AddEntry(h_prm, "#DeltaAUC  (ranking)", "f")
-    lg.AddEntry(h_imp, "%Imp  gain (TMVA)", "f")
+    lg.AddEntry(h_imp, "%Imp  gain (XGBoost)", "f")
     lg.Draw()
 
     ot = m["overtraining"]
@@ -709,6 +714,32 @@ def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15,
         # 0.420-0.878 span / full TXT size
         x0, x1 = 0.360, 0.955                      # first / last column centre
         step = (x1 - x0) / max(len(codes) - 1, 1)
+        # 2026-09-15, user: this table was the raw class_weight_share CONFIG
+        # echoed verbatim -- the TARGET (sums to 102% by design: it is the
+        # OVERALL positive-class share across all 7 topologies at once, a
+        # different quantity from M3's per-class subshare tables, which sum
+        # to 100% of ONE class's own budget -- not comparable/interchangeable,
+        # and previously nothing on the plot said which one this was). Now
+        # also shows the ACTUAL achieved train-weighted fraction (grey, 3rd
+        # row) computed from eval.npz -- the same real-outcome check M3's
+        # per-class table already does -- so a mismatch between "target" and
+        # "meas" (e.g. a multiplier not converging, or a bug) is visible
+        # directly on the plot instead of assumed.
+        _meas = {}
+        try:
+            _e1 = np.load(outdir / name / "eval.npz")
+            _topo_tr, _w_tr = _e1["train_topo"], _e1["train_w"]
+            _tot1 = sum(_w_tr[_topo_tr == int(c)].sum() for c in codes) or 1.0
+            _meas = {c: 100.0 * _w_tr[_topo_tr == int(c)].sum() / _tot1 for c in codes}
+        except Exception:
+            pass
+        if _meas:
+            _hdr = ROOT.TLatex(); _hdr.SetNDC(); _hdr.SetTextFont(42)
+            _hdr.SetTextSize(TXT * 0.78); _hdr.SetTextColor(ROOT.kGray + 2)
+            _hdr.SetTextAlign(31)
+            _hdr.DrawLatex(x1, y_top + 0.040,
+                          "#it{target train-weight share  (measured)}")
+            ROOT.SetOwnership(_hdr, False)
         tt = ROOT.TLatex(); tt.SetNDC(); tt.SetTextFont(42); tt.SetTextSize(TXT * 0.88)
         tt.SetTextAlign(21)                        # centred on the column
         for i, code in enumerate(codes):          # NB: not 'c' -- that is the canvas
@@ -716,9 +747,15 @@ def permimp_figure(outdir, name, summary, cfg, out_png, ntop=15,
             tt.SetTextColor(TOPO_COL[int(code)])
             tt.DrawLatex(x, y_top, TOPO_LAB[int(code)].replace(" proxy", " prx"))
             tt.DrawLatex(x, y_top - 0.036, "%.0f%%" % (100 * float(share[code])))
+            if _meas:
+                tt.SetTextColor(ROOT.kGray + 2)
+                tt.SetTextSize(TXT * 0.72)
+                tt.DrawLatex(x, y_top - 0.066, "(%.0f%%)" % _meas[code])
+                tt.SetTextSize(TXT * 0.88)
+                tt.SetTextColor(TOPO_COL[int(code)])
         tt.SetTextColor(ROOT.kBlack)
         ROOT.SetOwnership(tt, False)
-        y_top -= 0.036 * 2 + 0.014                 # run info sits below the table
+        y_top -= 0.036 * 2 + 0.030 + 0.014          # run info sits below the table
 
     t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(TXT)
     t.SetTextAlign(31)
@@ -908,7 +945,7 @@ def m3_roc_figure(outdir, cfg, out_png, presel=None):
         if c_idx == 0:
             continue
         yb = (y_te == c_idx).astype(np.int8)
-        entries.append((f"M3 {cname} (vs rest)", M3_COL[cname], 1, yb, proba_te[:, c_idx], w_te))
+        entries.append((f"{M3_DISP[cname]} (vs rest)", M3_COL[cname], 1, yb, proba_te[:, c_idx], w_te))
 
     # restricted-definition subset curves (2026-09-13, user), same pattern as
     # S1's S2/S3 subset ROCs: keep bkg + ONLY the named topologies (drop
@@ -999,7 +1036,7 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     c.SetTopMargin(TOP_MARGIN); c.SetRightMargin(0.025)
     c.SetLeftMargin(0.095); c.SetBottomMargin(0.075)
     c.SetTicks(1, 1); c.SetLogy()
-    frame = _axes(c.DrawFrame(lo, 3e-3, hi, 0.5), f"P({cname}) score",
+    frame = _axes(c.DrawFrame(lo, 3e-3, hi, 0.5), f"{M3_DISP[cname]} score",
                   "N_{jets} norm. to 1", tsize=0.036, xoff=1.05, yoff=1.32)
     frame.GetYaxis().SetLabelOffset(0.005)
     # train histograms now ALSO carry error bars (2026-09-13, user), not just
@@ -1010,7 +1047,7 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     ot = summary["models"][name]["per_class"][cname]["overtraining"]
     y0, dy = 0.835, 0.040
     t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(TXT)
-    t.DrawLatex(0.320, y0 + 0.048, f"#bf{{Overtraining test -- M3 {cname}}}   70% train / 15% test")
+    t.DrawLatex(0.320, y0 + 0.048, f"#bf{{Overtraining test -- {M3_DISP[cname]}}}   70% train / 15% test")
     x0 = 0.340; xb, xk, xv = x0 + 0.260, x0 + 0.380, x0 + 0.480
     # "Test"/"Train" centred over the legend's swatch columns below, same
     # convention as the binary overtrain_figure (2026-09-13)
@@ -1022,7 +1059,7 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     t.DrawLatex(x0, y0 - dy, "bkg (rest)")
     t.DrawLatex(xb, y0 - dy, "%.1f%%" % ot["rel_diff_bkg_pct"])
     t.DrawLatex(xk, y0 - dy, "%.2f" % ot["ks_bkg_p"])
-    t.DrawLatex(x0, y0 - 2 * dy, cname)
+    t.DrawLatex(x0, y0 - 2 * dy, M3_DISP[cname])
     t.DrawLatex(xb, y0 - 2 * dy, "%.1f%%" % ot["rel_diff_sig_pct"])
     t.DrawLatex(xk, y0 - 2 * dy, "%.2f" % ot["ks_sig_p"])
     okd = ot["verdict"] == "OK"
@@ -1043,29 +1080,45 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
 
 
 def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg, out_png, ntop=15):
-    """Ranking bars for ONE M3 class's one-vs-rest permutation importance.
-    Single series only (this class's dAUC) -- unlike the binary
-    permimp_figure's dAUC+gain pair, XGBoost's gain accounting does not
-    cleanly separate by class in a shared multiclass booster, so no gain
-    overlay is drawn here."""
+    """Ranking bars for ONE M3 class's one-vs-rest permutation importance,
+    PLUS (2026-09-15, user: "prepare the code so 2 bars/feature next
+    iteration") a 2nd bar = this feature's GLOBAL XGBoost gain importance
+    (m["feature_importance"], the SAME one binary permimp_figure plots) --
+    unlike the per-class dAUC series, gain is NOT separable per one-vs-rest
+    class in a shared multiclass booster (one tree can split on a feature
+    for any/all classes at once), so this bar is identical across cb/bb/bbc
+    panels for a given feature -- labelled explicitly as "(global)" so it
+    is not mistaken for a class-specific number. Data already exists in
+    summary.json from the last training run -- this is a pure rendering
+    change, no retrain needed for it to appear."""
     m = summary["models"][name]
     pc = m["per_class"][cname]
     perm = {r["feature"]: max(r["auc_drop"], 0.0) for r in pc["permutation_importance"]}
+    gain = {r["feature"]: r["gain"] for r in m["feature_importance"]}
     p_tot = sum(perm.values()) or 1.0
+    g_tot = sum(gain.values()) or 1.0
     pim = {f: 100.0 * v / p_tot for f, v in perm.items()}
-    ranked = sorted(pim, key=lambda f: -pim[f])
+    gim = {f: 100.0 * gain.get(f, 0.0) / g_tot for f in perm}
+    ranked = sorted(pim, key=lambda f: -pim[f])          # RANK BY dAUC (per-class)
     top = ranked[:ntop][::-1]
     n = len(top)
     nb_bins = n + 1   # +1 empty bin at the top, same convention as permimp_figure
 
     h = ROOT.TH1F(f"prm_m3_{cname}", "", nb_bins, 0, nb_bins)
-    h.Sumw2()
+    h_g = ROOT.TH1F(f"gim_m3_{cname}", "", nb_bins, 0, nb_bins)
+    h.Sumw2(); h_g.Sumw2()
     for i, f in enumerate(top, 1):
         h.SetBinContent(i, pim[f])
+        h_g.SetBinContent(i, gim[f])
         h.GetXaxis().SetBinLabel(i, node_label(f))
     col = M3_COL[cname]
+    # thin side-by-side bars per feature, same geometry as the binary
+    # permimp_figure's dAUC+gain pair.
     h.SetFillColor(col); h.SetLineColor(col); h.SetFillStyle(1001)
-    h.SetBarWidth(0.55); h.SetBarOffset(0.22); h.SetLineWidth(1); h.SetMarkerSize(0)
+    h.SetBarWidth(0.28); h.SetBarOffset(0.50); h.SetLineWidth(1); h.SetMarkerSize(0)
+    h_g.SetFillColor(ROOT.kOrange + 1); h_g.SetLineColor(ROOT.kOrange + 1)
+    h_g.SetFillStyle(1001)
+    h_g.SetBarWidth(0.28); h_g.SetBarOffset(0.21); h_g.SetLineWidth(1); h_g.SetMarkerSize(0)
 
     c = ROOT.TCanvas(f"pi_m3_{cname}", "", SQ, SQ)
     c.SetLeftMargin(MARGIN_RANK - 0.010); c.SetRightMargin(RIGHT_MARGIN)
@@ -1074,13 +1127,20 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
     h.GetYaxis().SetTitleSize(0.046); h.GetYaxis().SetLabelSize(LSIZE)
     h.GetYaxis().SetTitleOffset(0.95)
     h.GetXaxis().SetLabelSize(0.050); h.GetXaxis().SetLabelOffset(0.005)
-    h.SetMaximum(1.1 * max(pim[f] for f in top)); h.SetMinimum(0.0)
+    h.SetMaximum(1.1 * max(max(pim[f] for f in top), max(gim[f] for f in top)))
+    h.SetMinimum(0.0)
     h.Draw("HBAR")
+    h_g.Draw("HBAR SAME")
+
+    lg = _legend(0.618, 0.555, 0.965, 0.670, TXT)
+    lg.AddEntry(h, "#DeltaAUC vs rest  (this class)", "f")
+    lg.AddEntry(h_g, "%Imp gain  (global)", "f")
+    lg.Draw()
 
     ot = pc["overtraining"]
     lines = [
         "#bf{M3 -- %s}  ranked by #DeltaAUC vs rest   (%d of %d params)"
-        % (cname, n, m["n_features"]),
+        % (M3_DISP[cname], n, m["n_features"]),
         "AUC(vs rest) test %.3f    bias B %.1f%%  [%s]"
         % (pc["auc_ovr"], ot["rel_diff_bkg_pct"], ot["verdict"]),
     ]
@@ -1106,7 +1166,7 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
         cap = ROOT.TLatex(); cap.SetNDC(); cap.SetTextFont(42)
         cap.SetTextSize(TXT * 0.92); cap.SetTextAlign(31)
         cap.DrawLatex(0.955, 0.905 - 0.036 * len(lines) - 0.018,
-                     "#it{%s signal composition (train, weighted):}" % cname)
+                     "#it{%s signal composition (train, weighted):}" % M3_DISP[cname])
 
         y_top = 0.905 - 0.036 * len(lines) - 0.018 - 0.044
         x0, x1 = 0.630, 0.955
@@ -1123,11 +1183,12 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
 
     cms_header(cfg, c)
     c.RedrawAxis(); c.SaveAs(str(out_png))
-    return [h]
+    return [h, h_g]
 
 
 def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
-                    proxy_mask, proxy_label, show_own_components=True):
+                    proxy_mask, proxy_label, show_own_components=True,
+                    exclude_codes=()):
     """One-vs-rest score composition for ONE M3 class, ratio-to-proxy pad
     style like the binary score_figure ("S/proxy-inspection", user's name
     for this plot type).
@@ -1151,6 +1212,15 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     constituents, drawing them twice (once as "component", once folded into
     "proxy") would be redundant/confusing; only the total and t2(b'b) itself
     are still meaningful to show.
+
+    exclude_codes (2026-09-15, user: "confusing -- t2(b'c) prx AND t2(b'c)
+    proxy?"): drop these topology codes from the per-topology h_cls overlay
+    even when show_own_components=True. cb's proxy_mask IS topology 5, one
+    of cb's own my_codes -- without this it was drawn TWICE, once as the
+    black dashed proxy-reference line (intentional self-consistency check,
+    ratio == 1 by construction) and AGAIN as its own coloured component line
+    with a near-identical but not-identical label ("prx" vs "proxy"). Now
+    passed as (5,) for cb so it appears only once (the black reference).
     """
     e = np.load(outdir / name / "eval.npz")
     s, w, topo = e["test_proba"][:, class_idx], e["test_w"], e["test_topo"]
@@ -1171,6 +1241,7 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     h_bkg = mk("bkg", topo == 0, ROOT.kGray + 1, 4)
     h_tot = mk("tot", np.isin(topo, my_codes), M3_COL[cname], 4)
     show_codes = my_codes if show_own_components else [c for c in my_codes if c == 3]
+    show_codes = [c for c in show_codes if c not in exclude_codes]
     h_cls = {c: mk(f"c{c}", topo == c, TOPO_COL[c], 3, 2) for c in show_codes
              if (topo == c).sum() > 20}
     h_prx = mk("prx", proxy_mask, ROOT.kBlack, 4, 1)
@@ -1202,8 +1273,10 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
         h.Draw("HIST SAME")
 
     lg = _legend(0.335, 0.610, 0.790, 0.840, 0.0294 * 1.05 / P1_H)
-    lg.SetNColumns(2); lg.SetMargin(0.16); lg.SetColumnSeparation(-0.27)
-    left = [(h_bkg, "BKG %.2fM jets" % (n_bkg / 1e6)), (h_tot, f"M3 {cname} (total)"),
+    # column separation was -0.27 (compressed, 2026-09-15 user: "give more
+    # space between the 2 columns") -- now a small POSITIVE gap instead.
+    lg.SetNColumns(2); lg.SetMargin(0.16); lg.SetColumnSeparation(0.06)
+    left = [(h_bkg, "BKG %.2fM jets" % (n_bkg / 1e6)), (h_tot, f"{M3_DISP[cname]} (total)"),
             (h_prx, proxy_label)]
     right = [(h, TOPO_LAB[c]) for c, h in h_cls.items()]
     for i in range(max(len(left), len(right))):
@@ -1218,13 +1291,24 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
 
     p2.cd()
     f2 = p2.DrawFrame(0.0, 0.0, 1.0, 2.0)
-    f2.GetXaxis().SetTitle(f"P({cname}) score")
+    f2.GetXaxis().SetTitle(f"{M3_DISP[cname]} score")
     f2.GetYaxis().SetTitle("Signal / proxy")
     f2.GetXaxis().SetTitleSize(TSIZE_X_RATIO / P2_H); f2.GetXaxis().SetLabelSize(LSIZE / P2_H)
     f2.GetXaxis().SetTitleOffset(1.12)
     f2.GetYaxis().SetTitleSize(TSIZE_Y_RATIO / P2_H); f2.GetYaxis().SetLabelSize(LSIZE / P2_H)
     f2.GetYaxis().SetTitleOffset(0.97); f2.GetYaxis().SetNdivisions(505)
     f2.GetYaxis().SetLabelOffset(0.005)
+    # 2026-09-15, user: "unclear what the lower ratio pads are, what is the
+    # numerator and denominator" -- spell it out. Denominator is ALWAYS the
+    # black dashed proxy_label curve (h_prx); numerator is whichever
+    # same-coloured curve from the top pad the ratio line matches.
+    _rcap = ROOT.TLatex(); _rcap.SetNDC(); _rcap.SetTextFont(42)
+    _rcap.SetTextSize(TXT * 0.80); _rcap.SetTextColor(ROOT.kGray + 2)
+    _rcap.SetTextAlign(13)
+    _rcap.DrawLatex(0.150, 0.965,
+                    "#it{curve = (top-pad line of the same colour) / (black "
+                    + proxy_label + " line)}")
+    ROOT.SetOwnership(_rcap, False)
     ratios = []
     for cc, h in [("tot", h_tot)] + list(h_cls.items()):
         r = h.Clone(f"r_m3_{cname}_{cc}")
@@ -1314,10 +1398,17 @@ def build_report(cfg, outdir):
         # of these three is different.
         e_m3 = np.load(outdir / "M3" / "eval.npz")
         _topo_m3 = e_m3["test_topo"]
+        # 2026-09-15, user: "t2(b'c) prx" vs "t2(b'c) proxy" as TWO separate
+        # legend entries was confusing -- they were the SAME topology-5
+        # population drawn twice (once as this black proxy-reference line,
+        # once again as its own coloured component inside h_cls). Full word
+        # "proxy" now used consistently everywhere (not abbreviated "prx"),
+        # and cb's own topology-5 component is excluded from h_cls (4th
+        # tuple element) so it only appears once, as this reference line.
         m3_proxy = {
-            "cb":  (_topo_m3 == 5, "t^{2}(b'c) prx", True),
-            "bb":  (np.isin(_topo_m3, (6, 7)), "Zbb+QCD(bb)", False),
-            "bbc": (e_m3["test_t3bcq_proxy"], "t^{3}(b'cq) prx", True),
+            "cb":  (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,)),
+            "bb":  (np.isin(_topo_m3, (6, 7)), "Zbb+QCD(bb)", False, ()),
+            "bbc": (e_m3["test_t3bcq_proxy"], "t^{3}(b'cq) proxy", True, ()),
         }
 
         m3_singles = {}   # cname -> (overtrain, permimp, score) paths
@@ -1327,9 +1418,10 @@ def build_report(cfg, outdir):
             sc3 = outdir / f"score_M3_{cname}.png"
             keep += m3_overtrain_figure(outdir, "M3", cname, c_idx, summary, cfg, ov3)
             keep += m3_permimp_figure(outdir, "M3", cname, c_idx, class_groups, summary, cfg, pi3)
-            pmask, plabel, pshow = m3_proxy.get(cname, (_topo_m3 == 5, "t^{2}(b'c) prx", True))
+            pmask, plabel, pshow, pexcl = m3_proxy.get(
+                cname, (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,)))
             keep += m3_score_figure(outdir, "M3", cname, c_idx, class_groups, cfg, sc3,
-                                    pmask, plabel, pshow)
+                                    pmask, plabel, pshow, exclude_codes=pexcl)
             m3_singles[cname] = (ov3, pi3, sc3)
 
         panel_m3 = outdir / "panel_M3.png"

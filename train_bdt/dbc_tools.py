@@ -277,3 +277,51 @@ class S1Evaluator:
         X = pd.DataFrame(cols)[self.FEATURES]
         proba = self.model.predict_proba(X)
         return np.ascontiguousarray(proba[:, 1], dtype=np.float32)
+
+
+class M3Evaluator:
+    """This project's M3 multiclass tagger (tt1lWcb/02_train_tagger.py):
+    4-class (bkg/cb/bb/bbc) native XGBoost multi:softprob booster, over the
+    SAME 22 ak8_gpt_* features as S1Evaluator (02_train_tagger.py's main()
+    passes M3 the identical feats_s1 list -- verified 2026-09-14). Loaded
+    exactly like S1Evaluator (XGBClassifier + load_model), the only
+    difference being predict_proba returns 4 columns here instead of 2.
+
+    Tied to ONE specific trained run (model_path); re-point it after any
+    retrain you want reflected here (M3's model.json is overwritten in
+    place by 02_train_tagger.py on every run under the same run_tag).
+    """
+
+    LEPQ_COMPONENTS = S1Evaluator.LEPQ_COMPONENTS
+    FEATURES = S1Evaluator.FEATURES
+    RAW_INPUTS = S1Evaluator.RAW_INPUTS
+
+    def __init__(self, model_path):
+        model_path = os.path.abspath(model_path)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"M3 model not found: {model_path}")
+        self.model = XGBClassifier()
+        self.model.load_model(model_path)
+
+    def get_scores(self, feature_map):
+        """feature_map: dict of {name: 1D array}, one entry per name in
+        RAW_INPUTS (all must have the same length). Returns (p_cb, p_bb,
+        p_bbc) as float32 1D arrays -- class order bkg/cb/bb/bbc, columns
+        1/2/3, matching S1_tagger/config.json's M3_class_names."""
+        n = None
+        cols = {}
+        for name in self.RAW_INPUTS:
+            arr = np.asarray(feature_map[name], dtype=np.float32)
+            if arr.ndim != 1:
+                raise ValueError(f"{name} must be 1D, got shape={arr.shape}")
+            if n is None:
+                n = len(arr)
+            elif len(arr) != n:
+                raise ValueError(f"Length mismatch: {name} has length {len(arr)}, expected {n}")
+            cols[name] = arr
+        cols["ak8_gpt_lepq"] = np.sum([cols[c] for c in self.LEPQ_COMPONENTS], axis=0)
+        X = pd.DataFrame(cols)[self.FEATURES]
+        proba = self.model.predict_proba(X)
+        return (np.ascontiguousarray(proba[:, 1], dtype=np.float32),
+                np.ascontiguousarray(proba[:, 2], dtype=np.float32),
+                np.ascontiguousarray(proba[:, 3], dtype=np.float32))
