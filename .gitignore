@@ -28,7 +28,7 @@ score_parquet_swqq_bdt
 *.onnx
 *.pb
 
-# ---- generated plots / outputs -----------------------------------------
+# ---- generated plots / outputs -- CODE ONLY in this repo (2026-09-15) ---
 *.png
 *.pdf
 *.eps

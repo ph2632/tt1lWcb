@@ -5,7 +5,8 @@
 # =============================================================================
 # Makes THIS directory its own standalone git repo (independent of the parent
 # WWW repo), adds every file in the tree that is not excluded by .gitignore,
-# commits, and pushes to BOTH GitLab (CERN) and GitHub.
+# commits, and pushes to BOTH GitLab (CERN) and GitHub. Code only -- .gitignore
+# excludes generated outputs (*.png/*.pdf/*.root/*.npz/... -- see below).
 #
 # Usage: ./git_push.sh "Your commit message"
 #        ./git_push.sh                 (default message with timestamp)
@@ -15,18 +16,23 @@
 #             for a password.
 #   GitHub -- SSH key (git@github.com:ph2632/tt1lWcb.git).  Verified working
 #             on this machine (2026-09-15): `ssh -T git@github.com` auths as
-#             user ph2632. The repo must already exist and be empty/related
-#             on GitHub -- create it at https://github.com/new (name
-#             "tt1lWcb", do NOT initialise with a README/license/.gitignore,
-#             or the first push will be rejected as non-fast-forward) BEFORE
-#             running this script for the first time.
+#             user ph2632. The repo must already exist on GitHub (create it
+#             empty at https://github.com/new, name "tt1lWcb", no README/
+#             license/.gitignore) before running this script for the first
+#             time.
 #
 # One commit, pushed to both remotes. A failure on one remote does not skip
-# the other (2026-09-15) -- the script's own exit code is nonzero if EITHER
-# push failed, so calling code can still detect trouble.
+# the other; the script's own exit code is nonzero if EITHER push failed.
+#
+# Output (2026-09-15, user: "minimum verbosity but reporting the file
+# changes"): quiet by default -- the only routine output is the list of
+# changed files (git status --short) and a one-line OK/FAILED per remote.
+# Setup actions (first-time repo init, adding a remote) still print one line
+# since those only ever happen once. On a push failure the real git error
+# text is shown, followed by a diagnosis.
 # =============================================================================
 
-set -e  # exit on error (still used for the setup steps before the pushes)
+set -e  # exit on error (setup steps only -- relaxed before the pushes, see below)
 
 # --- always operate on the directory this script lives in ---------------------
 cd "$(dirname "$(readlink -f "$0")")"
@@ -39,7 +45,6 @@ GITHUB_REPO="git@github.com:ph2632/tt1lWcb.git"
 BRANCH="master"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-echo -e "${GREEN}=== Git Push Script  (${REPO_DIR}) ===${NC}"
 
 # Commit message
 if [ -n "$1" ]; then
@@ -49,18 +54,16 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Step 1: make sure THIS dir is its own git repo.
-#   The parent (.../WWW) is also a git repo, so a missing/!broken .git here
+# Step 1: make sure THIS dir is its own git repo (silent unless first-time).
+#   The parent (.../WWW) is also a git repo, so a missing/broken .git here
 #   would make `git add` operate on the parent.  We insist on a real local
 #   .git (one that has a HEAD file); a leftover empty skeleton is wiped.
 # -----------------------------------------------------------------------------
 if [ ! -f .git/HEAD ]; then
-    if [ -d .git ]; then
-        echo -e "${YELLOW}Removing incomplete .git skeleton...${NC}"
-        rm -rf .git
-    fi
-    echo -e "${YELLOW}Initializing a fresh git repository here...${NC}"
-    git init -b "$BRANCH" 2>/dev/null || { git init && git checkout -b "$BRANCH" 2>/dev/null || true; }
+    [ -d .git ] && rm -rf .git
+    git init -b "$BRANCH" >/dev/null 2>&1 \
+        || { git init >/dev/null && git checkout -b "$BRANCH" >/dev/null 2>&1 || true; }
+    echo -e "${YELLOW}Initialized fresh git repository here.${NC}"
 fi
 
 # hard safety check: the repo root must be this directory, never the parent
@@ -71,7 +74,7 @@ if [ "$TOPLEVEL" != "$REPO_DIR" ]; then
     exit 1
 fi
 
-# remotes: "origin" = GitLab (unchanged), "github" = GitHub (new, 2026-09-15)
+# remotes: "origin" = GitLab, "github" = GitHub (silent unless newly added)
 if ! git remote | grep -q '^origin$'; then
     git remote add origin "$GITLAB_REPO"
     echo -e "${YELLOW}Added remote origin -> ${GITLAB_REPO}${NC}"
@@ -86,9 +89,10 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Step 2: .gitignore  (GitLab rejects files > 100 MB; keep the repo to code)
+# Step 2: .gitignore (silent write every run -- GitLab rejects files > 100 MB,
+# and per 2026-09-15 user instruction this repo is CODE ONLY: no generated
+# plots (*.png/*.pdf/...) or data/model blobs are ever tracked).
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}Writing .gitignore...${NC}"
 cat > .gitignore << 'EOF'
 # ---- environments / caches -------------------------------------------------
 .venv/
@@ -120,7 +124,7 @@ score_parquet_swqq_bdt
 *.onnx
 *.pb
 
-# ---- generated plots / outputs -----------------------------------------
+# ---- generated plots / outputs -- CODE ONLY in this repo (2026-09-15) ---
 *.png
 *.pdf
 *.eps
@@ -153,100 +157,102 @@ BU_*/
 EOF
 
 # -----------------------------------------------------------------------------
-# Step 3: stage
+# Step 3: stage, report the file changes (the one thing this script always
+# prints), guard against large files slipping past .gitignore.
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}Staging files (respecting .gitignore)...${NC}"
 git add -A
-
-# drop any AFS temp / previously-tracked junk that slipped in
 git rm -r --cached --ignore-unmatch '.__afs*' '#*#' > /dev/null 2>&1 || true
 
-echo -e "${YELLOW}Staged:${NC}"
-git status --short
+CHANGES="$(git status --short)"
+if [ -n "$CHANGES" ]; then
+    echo "$CHANGES"
+else
+    echo "(no file changes)"
+fi
 
-# guard: warn on any staged file > 5 MB
-echo -e "${YELLOW}Checking for large staged files...${NC}"
 git diff --cached --name-only --diff-filter=ACM | while read -r f; do
     [ -f "$f" ] || continue
     kb=$(du -k "$f" | cut -f1)
     if [ "$kb" -gt 5120 ]; then
-        echo -e "${RED}  WARNING: large file staged: $f  (${kb} kB) — add it to .gitignore${NC}"
+        echo -e "${RED}  WARNING: large file staged: $f  (${kb} kB) -- add it to .gitignore${NC}"
     fi
 done
 
 # -----------------------------------------------------------------------------
-# Step 4: commit + push
+# Step 4: commit + push (quiet -- errors still surface in full)
 # -----------------------------------------------------------------------------
-echo -e "${YELLOW}Committing: ${COMMIT_MSG}${NC}"
-git commit -m "$COMMIT_MSG" || echo -e "${YELLOW}Nothing to commit (working tree clean)${NC}"
-
-# set -e is relaxed here on purpose: a failure pushing to ONE remote must
-# not skip the other (2026-09-15) -- each push is checked explicitly instead,
-# and the script's own exit code reflects whether either one failed.
-set +e
-FAILED=0
-
-echo -e "${YELLOW}Pushing to origin/${BRANCH} (GitLab) ...${NC}"
-git push -u origin "$BRANCH" || git push --set-upstream origin "$BRANCH"
-if [ $? -ne 0 ]; then
-    echo -e "${RED}  GitLab push FAILED.${NC}"
-    FAILED=1
+if git commit -q -m "$COMMIT_MSG" > /dev/null 2>&1; then
+    echo -e "${GREEN}Committed:${NC} ${COMMIT_MSG}"
 else
-    echo -e "${GREEN}  GitLab push OK.${NC}"
+    echo -e "${YELLOW}Nothing to commit.${NC}"
 fi
 
-echo -e "${YELLOW}Pushing to github/${BRANCH} (GitHub) ...${NC}"
-# 2026-09-15 bugfix: `cmd | tee file` exits with TEE's status, not cmd's --
-# `if git push ... | tee ...; then` was reading tee's (near-always 0) exit
-# code, so a genuinely failed push ("Repository not found") still printed
-# "OK". Use PIPESTATUS[0] (bash) to check git push's own exit code instead.
-git push -u github "$BRANCH" 2>&1 | tee /tmp/git_push_github.$$.log
-gh_status=${PIPESTATUS[0]}
+# set -e relaxed here on purpose: a failure pushing to ONE remote must not
+# skip the other -- each push is checked explicitly, and the script's own
+# exit code reflects whether either one failed.
+set +e
+FAILED=0
+LOG="/tmp/git_push.$$.log"
+SEP="---------------------------------------"
+
+echo "$SEP"
+echo -e "${YELLOW}GitLab${NC}  (origin -> gitlab.cern.ch/agapitos/tt1lWcb)"
+git push -q -u origin "$BRANCH" 2>"$LOG"
+if [ $? -ne 0 ]; then
+    echo -e "${RED}GitLab push FAILED:${NC}"
+    cat "$LOG"
+    FAILED=1
+else
+    echo -e "${GREEN}GitLab: OK${NC}"
+fi
+
+echo "$SEP"
+echo -e "${YELLOW}GitHub${NC}  (github -> github.com/ph2632/tt1lWcb)"
+git push -q -u github "$BRANCH" 2>"$LOG"
+gh_status=$?
 
 # 2026-09-15, user: "tune the output to avoid false alarm messages" -- a
 # non-zero push exit is not always a real failure (GitHub's own ref-lock
-# race can report "rejected" for a commit that landed anyway, seen 2026-
-# 09-15). Rather than guess from the error text, SELF-VERIFY: ask GitHub
-# directly what commit its branch is actually at and compare to local HEAD.
-# If they already match, the push demonstrably succeeded -- report OK and
-# skip the diagnostics below entirely, instead of a misleading FAILED.
+# race can report "rejected" for a commit that landed anyway, seen once).
+# SELF-VERIFY instead of guessing from the error text: ask GitHub directly
+# what commit its branch is actually at and compare to local HEAD. If they
+# already match, the push demonstrably succeeded.
 if [ "$gh_status" -ne 0 ]; then
     remote_sha="$(git ls-remote github "$BRANCH" 2>/dev/null | cut -f1)"
     local_sha="$(git rev-parse HEAD)"
     if [ -n "$remote_sha" ] && [ "$remote_sha" = "$local_sha" ]; then
         gh_status=0
-        echo -e "${YELLOW}  (push reported an error, but github/${BRANCH} already matches${NC}"
-        echo -e "${YELLOW}   local HEAD ($local_sha) -- treating as success.)${NC}"
+        echo -e "${YELLOW}(GitHub reported an error, but github/${BRANCH} already matches local HEAD -- treating as success.)${NC}"
     fi
 fi
 
 if [ "$gh_status" -eq 0 ]; then
-    echo -e "${GREEN}  GitHub push OK.${NC}"
+    echo -e "${GREEN}GitHub: OK${NC}"
 else
-    echo -e "${RED}  GitHub push FAILED.${NC}"
-    if grep -qi "repository not found" /tmp/git_push_github.$$.log; then
-        echo -e "${RED}  -> the repo does not exist yet (or the SSH key has no access).${NC}"
-        echo -e "${RED}     Create an EMPTY repo named 'tt1lWcb' at https://github.com/new${NC}"
-        echo -e "${RED}     (owner: ph2632; do NOT add a README/license/.gitignore there),${NC}"
-        echo -e "${RED}     then re-run this script.${NC}"
-    elif grep -qi "cannot lock ref" /tmp/git_push_github.$$.log; then
+    echo -e "${RED}GitHub push FAILED:${NC}"
+    cat "$LOG"
+    if grep -qi "repository not found" "$LOG"; then
+        echo -e "${RED}-> repo doesn't exist yet (or the SSH key has no access).${NC}"
+        echo -e "${RED}   Create an EMPTY repo named 'tt1lWcb' at https://github.com/new${NC}"
+        echo -e "${RED}   (owner: ph2632; no README/license/.gitignore there), then re-run.${NC}"
+    elif grep -qi "cannot lock ref" "$LOG"; then
         # confirmed a REAL mismatch above (self-verify didn't clear it) --
         # a genuine second writer racing this push, not just a report glitch.
-        echo -e "${RED}  -> GitHub ref-lock conflict, and the branch does NOT match local${NC}"
-        echo -e "${RED}     HEAD -- something else pushed to github/${BRANCH} concurrently.${NC}"
-        echo -e "${RED}     Just re-run this script.${NC}"
-    elif grep -qi "non-fast-forward\|fetch first\|rejected" /tmp/git_push_github.$$.log; then
-        echo -e "${RED}  -> the GitHub repo has commits this local repo doesn't (e.g. it was${NC}"
-        echo -e "${RED}     initialised with a README). Resolve manually, e.g.:${NC}"
-        echo -e "${RED}       git fetch github && git merge --allow-unrelated-histories github/${BRANCH}${NC}"
+        echo -e "${RED}-> ref-lock conflict and github/${BRANCH} does NOT match local HEAD --${NC}"
+        echo -e "${RED}   something else pushed there concurrently. Just re-run this script.${NC}"
+    elif grep -qi "non-fast-forward\|fetch first\|rejected" "$LOG"; then
+        echo -e "${RED}-> the GitHub repo has commits this local repo doesn't (e.g. it was${NC}"
+        echo -e "${RED}   initialised with a README). Resolve manually, e.g.:${NC}"
+        echo -e "${RED}     git fetch github && git merge --allow-unrelated-histories github/${BRANCH}${NC}"
     fi
     FAILED=1
 fi
-rm -f /tmp/git_push_github.$$.log
+rm -f "$LOG"
+echo "$SEP"
 
 if [ "$FAILED" -eq 0 ]; then
-    echo -e "${GREEN}=== Done! Pushed to GitLab and GitHub. ===${NC}"
+    echo -e "${GREEN}Done -- pushed to GitLab and GitHub.${NC}"
 else
-    echo -e "${RED}=== Done, but at least one remote push FAILED -- see above. ===${NC}"
+    echo -e "${RED}Done, but at least one remote push FAILED -- see above.${NC}"
 fi
 exit "$FAILED"
