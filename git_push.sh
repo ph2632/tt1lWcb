@@ -196,7 +196,13 @@ else
 fi
 
 echo -e "${YELLOW}Pushing to github/${BRANCH} (GitHub) ...${NC}"
-if git push -u github "$BRANCH" 2>&1 | tee /tmp/git_push_github.$$.log; then
+# 2026-09-15 bugfix: `cmd | tee file` exits with TEE's status, not cmd's --
+# `if git push ... | tee ...; then` was reading tee's (near-always 0) exit
+# code, so a genuinely failed push ("Repository not found") still printed
+# "OK". Use PIPESTATUS[0] (bash) to check git push's own exit code instead.
+git push -u github "$BRANCH" 2>&1 | tee /tmp/git_push_github.$$.log
+gh_status=${PIPESTATUS[0]}
+if [ "$gh_status" -eq 0 ]; then
     echo -e "${GREEN}  GitHub push OK.${NC}"
 else
     echo -e "${RED}  GitHub push FAILED.${NC}"
