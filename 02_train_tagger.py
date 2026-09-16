@@ -44,6 +44,32 @@ import pandas as pd
 from scipy.stats import ks_2samp
 from sklearn.metrics import roc_auc_score, roc_curve, log_loss
 from xgboost import XGBClassifier
+from xgboost.callback import TrainingCallback
+
+
+class TimedEval(TrainingCallback):
+    """Same per-N-round eval line XGBoost's own verbose=N already prints,
+    PLUS wall-clock elapsed time since fit() started (2026-09-15, user:
+    "place the outputs with the run time every 100 cycles"). Replaces
+    verbose=100 (pass verbose=False alongside this callback, or XGBoost
+    prints its own line too and you get duplicates)."""
+
+    def __init__(self, period=100):
+        self.period = period
+        self.t0 = None
+
+    def before_training(self, model):
+        self.t0 = time.time()
+        return model
+
+    def after_iteration(self, model, epoch, evals_log):
+        if epoch % self.period == 0:
+            dt = time.time() - self.t0
+            parts = [f"{dname}-{mname}:{vals[-1]:.5f}"
+                     for dname, metrics in evals_log.items()
+                     for mname, vals in metrics.items()]
+            print(f"[{epoch}]\t" + "\t".join(parts) + f"\tt={dt:6.1f}s")
+        return False   # never stop training ourselves
 
 HERE = Path(__file__).resolve().parent
 PKG = HERE / "S1_tagger"          # config.json / output live here
@@ -63,6 +89,47 @@ def load_split(dsdir, sub, columns):
         raise SystemExit(f"no parquet parts in {dsdir/sub} -- run 01_build_trainset.py first")
     return pd.concat((pd.read_parquet(p, columns=columns) for p in paths),
                      ignore_index=True)
+
+
+def cap_topo0_weight(tr, va, te, k=20.0):
+    """2026-09-16, user: investigate + heal the wild (>100%) overtraining
+    bias on M3's bb-class check. Root cause (confirmed by cross-referencing
+    the raw parquet's "sample" column against per-event weight): topology 0
+    ("true bkg") pools MULTIPLE background MC samples (QCD, Z+jet, W+jet,
+    diboson, single-top, ttbar variants, ttW) with wildly different
+    xsec/Nevents ratios, unlike every SIGNAL topology (1-7), which all come
+    from the single ttbar-powheg sample and have a uniform weight scale.
+    A handful of QCD_merged_Skim.root events survive preselection (101 raw
+    events total) with weight up to 3807 vs the topo-0 median of 0.28 --
+    Kish's effective-N for topo=0 collapses from 1.41M raw train events to
+    only ~5,400 EFFECTIVE events (sumw^2/sumw2) because 2 single events
+    carry as much weight as ~150k typical ones. That statistical collapse
+    (not a BDT hyperparameter problem) is what makes any bias/significance
+    number touching topo=0 wildly unstable between train and test splits --
+    whichever split a given freak event happens to land in swings the
+    result by itself.
+
+    Fix: cap any topo=0 event's weight at k times topo=0's OWN train-split
+    median (measured: k=20 already recovers Neff 5.4k -> ~650k while only
+    reweighting ~0.1% of events and removing ~18% of topo=0's total sumw --
+    that 18% was itself an artifact of the same handful of freak events, not
+    real background yield). The cap is measured ONCE on train and applied
+    identically (same absolute threshold) to valid/test, so no split-
+    dependent leakage. Signal topologies are untouched -- they don't have
+    this problem (checked: their max/median ratios are O(1-4), not O(10^4)).
+    """
+    med = float(tr.loc[tr["topology"] == 0, "weight"].median())
+    cap = med * k
+    for name, df in (("train", tr), ("valid", va), ("test", te)):
+        m = df["topology"] == 0
+        n_hit = int((df.loc[m, "weight"] > cap).sum())
+        sumw_before = float(df.loc[m, "weight"].sum())
+        df.loc[m, "weight"] = df.loc[m, "weight"].clip(upper=cap)
+        sumw_after = float(df.loc[m, "weight"].sum())
+        print(f"  [weight-cap] {name}: topo=0 cap={cap:.3f} (20x train median {med:.3f}) "
+              f"-- capped {n_hit}/{int(m.sum())} events, sumw {sumw_before:.1f} -> {sumw_after:.1f} "
+              f"({100*(1-sumw_after/max(sumw_before,1e-12)):.1f}% removed)")
+    return cap
 
 
 def class_weight_lookup(cfg):
@@ -245,11 +312,11 @@ def train_one_multiclass(name, feats, tr, va, te, xgb_params, seed, class_groups
     print(f"  [{name}] {len(feats)} features | train {len(tr):,} | "
           f"classes {class_names}")
 
-    model = XGBClassifier(**params)
+    model = XGBClassifier(**params, callbacks=[TimedEval(100)])
     t0 = time.time()
     model.fit(tr[feats], y["train"], sample_weight=w["train"],
               eval_set=[(tr[feats], y["train"]), (va[feats], y["valid"])],
-              sample_weight_eval_set=[w["train"], w["valid"]], verbose=100)
+              sample_weight_eval_set=[w["train"], w["valid"]], verbose=False)
     fit_s = time.time() - t0
     best_it = int(getattr(model, "best_iteration", params["n_estimators"] - 1))
 
@@ -483,15 +550,15 @@ def train_one(name, feats, tr, va, te, xgb_params, seed, sig_codes, bkg_effs,
     print(f"  [{name}] {len(feats)} features | train {len(tr):,} "
           f"(sig {int(y['train'].sum()):,}) | scale_pos_weight {spw:.0f}")
 
-    model = XGBClassifier(**params)
+    model = XGBClassifier(**params, callbacks=[TimedEval(100)])
     t0 = time.time()
-    # verbose=100 (was False, 2026-09-13): fit on 5M+ rows for ~2500-2900
-    # rounds takes 45-65 min with ZERO console output otherwise, which reads
-    # as "hung" -- this just prints eval AUC every 100 rounds, no effect on
-    # the fit itself.
+    # TimedEval (2026-09-15, was verbose=100 since 2026-09-13): fit on 5M+
+    # rows for ~2500-2900 rounds takes 45-65 min with ZERO console output
+    # otherwise, which reads as "hung" -- this prints eval AUC + wall time
+    # every 100 rounds, no effect on the fit itself.
     model.fit(tr[feats], y["train"], sample_weight=w["train"],
               eval_set=[(tr[feats], y["train"]), (va[feats], y["valid"])],
-              sample_weight_eval_set=[w["train"], w["valid"]], verbose=100)
+              sample_weight_eval_set=[w["train"], w["valid"]], verbose=False)
     fit_s = time.time() - t0
     best_it = int(getattr(model, "best_iteration", params["n_estimators"] - 1))
 
@@ -588,6 +655,24 @@ def main():
     args = ap.parse_args()
     cfg = json.loads(args.config.read_text())
 
+    # 2026-09-15: n_jobs is NOT "more is better" for this workload -- measured
+    # directly on this node (M3_xgboost params, 14% train subsample, 400
+    # rounds each): n_jobs=6 -> 0.104s/round (best), 8 -> 0.115s, but
+    # 12 -> 0.316s (3x slower) and 16 -> 0.837s (8x slower than 6!). depth=2
+    # trees are cheap per split, so this is memory-bandwidth-bound, not
+    # core-bound -- more threads past a small number just adds contention/
+    # false-sharing overhead. (Earlier same-day attempt used
+    # os.sched_getaffinity(0) directly, i.e. ALL detected cores -- that was
+    # the wrong direction entirely; the fix isn't "detect the node's core
+    # count", it's "cap well below it regardless of node size".) Still uses
+    # sched_getaffinity so a genuinely core-constrained slot (<6 available)
+    # doesn't request more than it has.
+    _n_jobs = min(len(os.sched_getaffinity(0)), 6)
+    for _blk in ("xgboost", "M3_xgboost"):
+        if _blk in cfg:
+            cfg[_blk]["n_jobs"] = _n_jobs
+    print(f"[cpu] n_jobs={_n_jobs} (capped at 6 -- measured optimum, see comment)")
+
     dsdir = Path(os.environ.get("S1_DATA_DIR", cfg["data_dir"])) / cfg["dataset_tag"]
     outdir = PKG / cfg["output_dir"] / cfg.get("run_tag", cfg["dataset_tag"])
     outdir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +711,12 @@ def main():
     tr = add_derived_features(load_split(dsdir, "train", load_cols), cfg)
     va = add_derived_features(load_split(dsdir, "valid", load_cols), cfg)
     te = add_derived_features(load_split(dsdir, "test", load_cols), cfg)
+    # 2026-09-16, user: investigate + heal M3 bb-class's wild overtraining
+    # bias -- see cap_topo0_weight() docstring for the full root-cause
+    # analysis (a handful of freak-weight QCD/Z+jet/W+jet events collapsing
+    # topo=0's effective statistics). Applied BEFORE any reweighting below,
+    # so every downstream sumw-derived multiplier sees the healed weight.
+    cap_topo0_weight(tr, va, te)
     # snapshotted BEFORE any reweighting below -- M3 (multiclass) needs its
     # OWN independent weight-derivation starting from the untouched physics
     # weight, not S1's already-reweighted tr["weight"]/va["weight"] (see
@@ -657,13 +748,42 @@ def main():
 
     model_list = ([m.strip() for m in args.only.split(",")] if args.only
                   else cfg.get("train_models", ["S1", "S1p"]))
-    for name, feats in (("S1", feats_s1), ("S1p", feats_s1p)):
-        if name not in model_list:
-            print(f"  [{name}] skipped (not in {model_list} -- pass --only S1,M3 to include)")
-            continue
-        _, _, _, res = train_one(name, feats, tr, va, te, cfg["xgboost"],
-                                 cfg["seed"], sig_codes, bkg_effs, outdir, cfg)
-        summary["models"][name] = res
+
+    # 2026-09-15 bugfix: summary.json is written FRESH every run (the dict
+    # literal above), so a model skipped THIS run (e.g. S1, parked below)
+    # simply has no entry -- even though its model.json/eval.npz are still
+    # sitting on disk untouched. 03_render_report.py hard-requires an "S1"
+    # entry and exits immediately without one. Carry forward any PRIOR
+    # summary.json's entry for a model not in model_list this run, so the
+    # render step keeps working off the still-valid last-trained artifacts
+    # instead of breaking every time a model is intentionally skipped.
+    _prev_summary_f = outdir / "summary.json"
+    if _prev_summary_f.exists():
+        try:
+            _prev = json.loads(_prev_summary_f.read_text())
+            for _mname, _mres in _prev.get("models", {}).items():
+                if _mname not in model_list and (outdir / _mname / "eval.npz").exists():
+                    summary["models"][_mname] = _mres
+                    print(f"  [{_mname}] carried forward from prior summary.json "
+                          f"(not retrained this run, artifacts on disk unchanged)")
+        except Exception as _e:
+            print(f"[WARN] could not carry forward prior summary.json ({_e})")
+
+    # 2026-09-15, user: "Comment out the Train S1 model completely. I want to
+    # keep only the M3 for the moment (3 classes, each binary)." -- M3's 3
+    # one-vs-rest columns (cb/bb/bbc) now cover what S1 targeted, so the
+    # separate binary S1 tagger is parked. The already-trained S1/model.json
+    # is untouched and still usable by 04_Make_plots.py (score_S1) -- this
+    # only stops RE-training it. Re-enable by uncommenting + restoring
+    # "S1" to config.json's train_models (or --only S1) when needed again.
+    # for name, feats in (("S1", feats_s1), ("S1p", feats_s1p)):
+    #     if name not in model_list:
+    #         print(f"  [{name}] skipped (not in {model_list} -- pass --only S1,M3 to include)")
+    #         continue
+    #     _, _, _, res = train_one(name, feats, tr, va, te, cfg["xgboost"],
+    #                              cfg["seed"], sig_codes, bkg_effs, outdir, cfg)
+    #     summary["models"][name] = res
+    print("  [S1] disabled (2026-09-15, user) -- training M3 only this run")
 
     # M3: 4-class multiclass (bkg/cb/bb/bbc), same tr/va/te already in memory
     # -- no second parquet read.  Uses the SAME feature list as S1 (feats_s1)
