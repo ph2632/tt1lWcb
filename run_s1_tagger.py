@@ -18,7 +18,7 @@ in sync by hand.
 Drives the 3-step pipeline (each step also runs standalone):
   dataset -> 01_build_trainset.py   per-jet training parquet (venv)
   train   -> 02_train_tagger.py     XGBoost S1 tagger + summary.json (venv)
-  plots   -> 03_render_report.py    PyROOT panel + figures (self-bootstraps
+  plots   -> 03_Training_report_plots.py    PyROOT panel + figures (self-bootstraps
                                      into an LCG view; no separate interpreter
                                      handling needed here since 2026-09-13)
 
@@ -44,7 +44,7 @@ VENV = HERE / ".venv" / "bin" / "python"
 STEPS = ("dataset", "train", "plots")
 STEP_SCRIPT = {"dataset": HERE / "01_build_trainset.py",
                "train": HERE / "02_train_tagger.py",
-               "plots": HERE / "03_render_report.py"}
+               "plots": HERE / "03_Training_report_plots.py"}
 
 
 def sh(cmd):
@@ -126,7 +126,7 @@ def main():
     if "train" in steps:
         sh([str(VENV), str(STEP_SCRIPT["train"]), "--config", str(cfg_path), "--no-report"])
     if "plots" in steps:
-        # 03_render_report.py self-bootstraps into an LCG view if PyROOT isn't
+        # 03_Training_report_plots.py self-bootstraps into an LCG view if PyROOT isn't
         # importable in VENV, so no separate interpreter handling is needed
         # here (2026-09-13; previously this step forced its own LCG source).
         sh([str(VENV), str(STEP_SCRIPT["plots"]), "--config", str(cfg_path)])

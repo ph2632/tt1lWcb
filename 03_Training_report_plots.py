@@ -7,23 +7,51 @@ Reads only summary.json + the per-model eval.npz / cmp_*.npz written by
 in the venv.
 
 Step 3/3 of the S1 tagger pipeline: 01_build_trainset.py -> 02_train_tagger.py
--> 03_render_report.py (or run_s1_tagger.py to drive all three).
+-> 03_Training_report_plots.py (or run_s1_tagger.py to drive all three).
+Renamed from 03_render_report.py, 2026-09-16.
 
 S1' was dropped as a carried tagger (substructure added ~0 AUC), so everything
-here is S1-only.
+S1-labelled here is S1-only. M3 (the 4-class bkg/cb/bb/bbc multiclass model)
+is the tagger actually trained each run -- see the "M3" figures below.
 
 Figures (all square canvases, frameless legends, CMS Simulation + lumi):
-  roc.png             raw-sum baselines / old Dbc / 3-class Dbc / S1
-  overtrain_S1.png    train (filled) vs test (points) + KS and |t-tr|/t
-  permimp_S1.png      permutation importance, one bar per input
-  score_S1.png        score by W->cb topology + ratio pad (component/total)
-  panel_S1.png        2x2 montage of the four; the four singles are KEPT as
-                      their own png files and published alongside it
+  roc.png                  raw-sum baselines / old Dbc / 3-class Dbc / S1
+  permimp_S1.png            S1 permutation importance, one bar per input
+  score_S1.png              S1 score by W->cb topology + ratio pad
+  roc_M3_{cb,bb,bbc}.png    per-class M3 ROC (nested signal definitions;
+                            bbc gets 2 curves, cb/bb get 3 -- bbc has only
+                            ONE constituent topology, no natural
+                            intermediate narrowing like cb/bb have)
+  overtrain_M3_{cb,bb,bbc}.png / permimp_M3_{cb,bb,bbc}.png /
+  score_M3_{cb,bb,bbc}.png  per-class M3 figures
+  panel_M3.png              3x4 montage of the above: rows =
+                            roc/overtrain/ranking/score, cols = cb/bb/bbc
+                            (roc row added 2026-09-16; previously kept OUT
+                            of the panel per an earlier instruction, now
+                            reversed)
+
+  2026-09-16: panel.png (the old 2x2-turned-1x3 S1-only montage) is RETIRED
+  -- a remnant of the retired 1-class S1 binary model (see 02_train_tagger.py:
+  "S1 disabled ... training M3 only this run"). roc.png/permimp_S1.png/
+  score_S1.png are still produced and published individually; panel_M3.png
+  is the current per-class equivalent.
+
+Published filenames use the fixed TaggerTrain_PRE_ prefix (2026-09-16, user:
+"this naming should be enough" -- the gallery is a live dashboard at a fixed
+URL per figure, not a per-run archive, so no run tag is embedded at all),
+EXCEPT permimp_M3_{cb,bb,bbc}.png, which the user explicitly asked back onto
+the tag-qualified TaggerTrain_M3cl_<tag>_ prefix right after that blanket
+switch -- see _publish_prefix()/_tagged_prefix() below. Both went through
+S1_tagger_<tag>_* -> TaggerTrain_M3cl_<tag>_* first, all the same day.
+
+Runtime: every figure/panel produced is timed, and a final report (name,
+size, seconds, path) prints at the end of build_report() -- see `produced`
+and _report_produced() below.
 
 Run (from anywhere, any shell -- it re-execs itself under an LCG view if
 PyROOT is not already importable; override the view with $S1_LCG_VIEW):
 
-  python3 03_render_report.py [--config S1_tagger/config.json]
+  python3 03_Training_report_plots.py [--config S1_tagger/config.json]
 """
 import argparse
 import json
@@ -46,8 +74,8 @@ def _bootstrap_lcg():
     The login shell here is tcsh but LCG ships a bash setup.sh, so
     'source setup.sh && python3 ...' aborts before running anything.  Rather
     than depend on the caller's shell, sourcing is done in an explicit bash
-    subshell -- so plain 'python 03_render_report.py' works from tcsh, bash,
-    or the project venv.
+    subshell -- so plain 'python 03_Training_report_plots.py' works from tcsh,
+    bash, or the project venv.
     """
     try:
         import ROOT  # noqa: F401
@@ -56,14 +84,14 @@ def _bootstrap_lcg():
         pass
     if os.environ.get("_S1_LCG_REEXEC"):        # already tried -- don't loop
         raise SystemExit(
-            "[03_render_report] PyROOT still missing after sourcing "
+            "[03_Training_report_plots] PyROOT still missing after sourcing "
             f"{LCG_VIEW}. Set $S1_LCG_VIEW to a view that provides ROOT.")
     setup = Path(LCG_VIEW) / "setup.sh"
     if not setup.exists():
         raise SystemExit(
-            f"[03_render_report] no PyROOT and no LCG view at {setup}. "
+            f"[03_Training_report_plots] no PyROOT and no LCG view at {setup}. "
             "Set $S1_LCG_VIEW to an LCG view that provides ROOT.")
-    print(f"[03_render_report] no PyROOT here -- re-exec under {LCG_VIEW}",
+    print(f"[03_Training_report_plots] no PyROOT here -- re-exec under {LCG_VIEW}",
           flush=True)
     os.environ["_S1_LCG_REEXEC"] = "1"
     argv = " ".join(shlex.quote(a) for a in sys.argv)
@@ -156,28 +184,52 @@ DEF_LAB = {"S1": "#splitline{( cb, b'c, b'c-prx,}{b'b, b'bc, Zbb, QCDbb ) jets}"
 # Left column below is the exact ntuple branch suffix.
 NODE_LABEL = {
     # 2-prong nodes are defined on a GENERIC resonance X (no parent-flavour
-    # assumption -> X(bc) covers W->cb and H+->cb alike).  The top / W / QCD
-    # nodes below are defined on the actual SM particles, so X(cs) and W(cs)
+    # assumption -> X->bc covers W->cb and H+->cb alike).  The top / W / QCD
+    # nodes below are defined on the actual SM particles, so X->cs and W->cs
     # are genuinely different hypotheses, not a relabelling of one another.
-    "bb": "bb", "cc": "cc", "bc": "bc", "bs": "bs", "cs": "cs",
-    "qq": "qq", "ss": "ss", "tauhtauh": "#tau_{h}#tau_{h}",
+    # 2026-09-16, user: decay-arrow notation ("#rightarrow", no parentheses)
+    # throughout, replacing the earlier "Parent(products)" style -- e.g.
+    # t^2(b'c) -> t^2#rightarrow b'c, W(qq) -> W#rightarrow qq. X->bc/bs/cs/
+    # qq/ss keep the parent-agnostic "X" (mixed-flavour pair: W, H+, or a
+    # BSM resonance could all produce it -- W->qq IS one member of the
+    # X->qq set, not a separate thing, unlike the top-originated-only
+    # W->qq/cs nodes below).
+    # bb/cc are SAME-flavour pairs: charge conservation forbids a W (net
+    # charge +-1) from decaying to a same-flavour qqbar (net charge 0), so
+    # only a neutral resonance can -- user: "for same flavor only Z has
+    # been used in the training", confirmed for bb (01_build_trainset.py's
+    # explicit Z(bb)-adj signal-adjacent class, ZBB_CODE); cc has no
+    # equivalent explicitly-trained Z->cc adjacent class, so "Z->cc" here
+    # is the same charge-conservation argument applied by analogy, not a
+    # claim that Z->cc was itself modelled.
+    "bb": "Z#rightarrow bb", "cc": "Z#rightarrow cc",
+    "bc": "X#rightarrow bc", "bs": "X#rightarrow bs", "cs": "X#rightarrow cs",
+    "qq": "X#rightarrow qq", "ss": "X#rightarrow ss",
+    # 2026-09-16, user: same charge-conservation logic as bb/cc -- a W
+    # can't decay to a same-flavour tau pair either, so this is Z-only too.
+    "tauhtauh": "Z#rightarrow #tau_{h}#tau_{h}",
+    # QCD(...) is NOT a decay -- it tags the FLAVOUR CONTENT of a QCD
+    # multijet-background jet ("this jet contains a b", "a bb pair", ...),
+    # not a parent particle decaying to those products, so it keeps its
+    # parenthetical form rather than taking an arrow.
     "qcdb": "QCD(b)", "qcdbb": "QCD(bb)", "qcdc": "QCD(c)",
     "qcdcc": "QCD(cc)", "qcdothers": "QCD(oth)",
     "qcd": "QCD(sum)",   # parent softmax sum of the 5 above (2026-09-13, +feature)
     # t -> b W with the b IN the jet
-    "topbwc": "t^{2}(b'c)", "topbwq": "t^{2}(b'q)", "topbws": "t^{2}(b's)",
-    "topbwqq": "t^{3}(b'qq)", "topbwcs": "t^{3}(b'cs)",
-    "topbwev": "t^{2}(b'e#nu)", "topbwmv": "t^{2}(b'#mu#nu)",
-    "topbwtauev": "t^{2}(b'#tau_{e}#nu)",
-    "topbwtauhv": "t^{2}(b'#tau_{h}#nu)",
-    "topbwtaumv": "t^{2}(b'#tau_{#mu}#nu)",
+    "topbwc": "t^{2}#rightarrow b'c", "topbwq": "t^{2}#rightarrow b'q",
+    "topbws": "t^{2}#rightarrow b's",
+    "topbwqq": "t^{3}#rightarrow b'qq", "topbwcs": "t^{3}#rightarrow b'cs",
+    "topbwev": "t^{2}#rightarrow b'e#nu", "topbwmv": "t^{2}#rightarrow b'#mu#nu",
+    "topbwtauev": "t^{2}#rightarrow b'#tau_{e}#nu",
+    "topbwtauhv": "t^{2}#rightarrow b'#tau_{h}#nu",
+    "topbwtaumv": "t^{2}#rightarrow b'#tau_{#mu}#nu",
     # t -> W with the b OUTSIDE the jet: only the W decay products merge
-    "topwqq": "W(qq)", "topwcs": "W(cs)",
-    "topwev": "W(e#nu)", "topwmv": "W(#mu#nu)",
-    "topwtauev": "W(#tau_{e}#nu)", "topwtauhv": "W(#tau_{h}#nu)",
-    "topwtaumv": "W(#tau_{#mu}#nu)",
+    "topwqq": "W#rightarrow qq", "topwcs": "W#rightarrow cs",
+    "topwev": "W#rightarrow e#nu", "topwmv": "W#rightarrow #mu#nu",
+    "topwtauev": "W#rightarrow #tau_{e}#nu", "topwtauhv": "W#rightarrow #tau_{h}#nu",
+    "topwtaumv": "W#rightarrow #tau_{#mu}#nu",
     # the 10 leptonic top/W categories, merged into one input at train time
-    "lepq": "t(lq)",
+    "lepq": "t#rightarrow lq",
     "ak8_tau21": "#tau_{21}", "ak8_tau32": "#tau_{32}",
     "ak8_nConstituents": "N_{constit}",
 }
@@ -191,8 +243,11 @@ TOPO_COL = {1: ROOT.kAzure + 2, 2: ROOT.kOrange + 7,
             3: ROOT.kGreen + 2, 4: ROOT.kMagenta + 1, 5: ROOT.kCyan + 2,
             6: ROOT.kBlue + 2, 7: ROOT.kRed + 1}
 # short forms (no parens) for Wcb/t2b'b/Zbb, 2026-09-13 -- saves legend width
+# 2026-09-16, user: "Zbb adj" -> "Zbb" -- no other "Zbb" label anywhere in
+# these plots, so the "adj" (adjacent/geometric-match) qualifier is dropped
+# as unnecessary disambiguation.
 TOPO_LAB = {1: "Wcb", 2: "t^{2}(b'c)", 3: "t^{2}b'b", 4: "t^{3}(b'bc)",
-            5: "t^{2}(b'c) proxy", 6: "Zbb adj", 7: "QCD(bb)"}
+            5: "t^{2}(b'c) proxy", 6: "Zbb", 7: "QCD(bb)"}
 # M3 (multiclass) per-class colour = the colour of that group's eponymous
 # topology above (cb -> Wcb's azure, bb -> t2(b'b)'s green, bbc -> t3(b'bc)'s
 # magenta), so M3 plots read consistently with every other plot in this file.
@@ -348,6 +403,28 @@ def best_1bin_cut(score, w, sig_mask, bkg_mask, nbins=100):
     sig_2bin's 2-category FOM -- one cut, one number, for reading a
     working point straight off a score distribution plot.
 
+    2026-09-16, user: "I think the evaluation is not correct" for D_bbc --
+    checked thoroughly against sig_2bin() above and ../Hgg/Root_plot.py's
+    optimize_n_bins()/bin_sig(). Found ONE real gap: sig_2bin AND Hgg's
+    bin_sig both REQUIRE b >= 1 (at least 1 weighted background "event")
+    before accepting a candidate threshold -- this function had no such
+    floor, so in principle it could pick a cut where the background side
+    has fallen to a handful of MC events (statistically meaningless).
+    Fixed here for consistency, though verified NOT to change the current
+    D_bbc numbers (its chosen cut=0.76 has b=69 weighted / 1410 raw test
+    events -- nowhere near the floor). D_bbc's own LOW significance (~0.12)
+    is real physics, not a bug: its test-split weighted signal yield is
+    only ~4 "events" (t3(b'bc), the rarest of the 3 M3 signal classes by
+    construction -- a fully-merged 3-prong top decay), and a Kish
+    effective-sample-size check on those weights (2099/2132 raw events)
+    confirms this is genuine low cross-section, not a weight-tail
+    artifact. A half-test-split honesty check (optimise the cut on one
+    half, evaluate on the other) shows cb/bb reproduce cleanly (agree to
+    <1%) while bbc's honest out-of-sample Z (0.074) sits below its
+    in-sample Z (0.095) by ~25% -- a real but modest look-elsewhere effect
+    from scanning 100 thresholds on a small sample, inherent to how rare
+    this class is, not something a code fix removes.
+
     Returns (best threshold, eff_sig at that threshold, eff_bkg at that
     threshold).
     """
@@ -360,7 +437,7 @@ def best_1bin_cut(score, w, sig_mask, bkg_mask, nbins=100):
     best_z, best_thr = -1.0, 0.5
     for j in range(1, nbins):
         s, b = cs[j], cb[j]
-        if s <= 0:
+        if s <= 0 or b < 1.0:          # same floor as sig_2bin()/Hgg's bin_sig()
             continue
         z = s / np.sqrt(s + b) if (s + b) > 0 else 0.0
         if z > best_z:
@@ -561,7 +638,7 @@ def overtrain_figure(outdir, name, summary, cfg, out_png, sig_codes,
         s_te = e["test_y"] == 1;  b_te = e["test_y"] == 0
     else:
         if "train_topo" not in e.files:
-            raise SystemExit("[03_render_report] eval.npz has no train_topo -- "
+            raise SystemExit("[03_Training_report_plots] eval.npz has no train_topo -- "
                              "retrain so the S2/S3 panels can be built")
         s_tr = np.isin(e["train_topo"], subset); b_tr = e["train_topo"] == 0
         s_te = np.isin(e["test_topo"], subset);  b_te = e["test_topo"] == 0
@@ -1119,6 +1196,25 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     nb, lo, hi = 30, 0.0, 1.0
     y_tr, y_te = e["train_y"], e["test_y"]
     w_tr, w_te = e["train_w"], e["test_w"]
+    # 2026-09-16, user: "evidence of overtraining for the targeted jets and
+    # undertraining for the remaining jets" -- root cause found: this
+    # function was comparing train (class-multiplier-reweighted, e.g. bb
+    # 109x/bbc 1249x baked into w_tr already) against test's RAW physics
+    # weight. Train's "rest" pool is then a totally different MIXTURE than
+    # test's "rest" pool (dominated by whichever topologies carry the
+    # biggest multiplier), so the shapes and the bias/KS numbers diverge for
+    # a reason that has nothing to do with actual overtraining -- exactly
+    # the failure mode the binary overtrain_figure() above already guards
+    # against via test_w_ot (see its "compare like with like" comment);
+    # that same fix was never carried over here. w_te_ot is used ONLY for
+    # the drawn score shapes + the bias/KS check below; the physical
+    # working-point efficiencies (best_1bin_cut, further down) stay on the
+    # untouched physics w_te, since THOSE must mean real per-jet efficiency,
+    # not a loss-shaping mixture.
+    # Measured effect on this cb panel (score>0.5): Rest bias 27.2% FAIL ->
+    # 2.3% OK; D_cb bias 8.1% WARN -> 1.1% OK -- i.e. the "FAIL" was this
+    # weight mismatch, not the model.
+    w_te_ot = e["test_w_ot"] if "test_w_ot" in e.files else e["test_w"]
     s_tr, s_te = e["train_proba"][:, class_idx], e["test_proba"][:, class_idx]
     yb_tr = (y_tr == class_idx).astype(np.int8)
     yb_te = (y_te == class_idx).astype(np.int8)
@@ -1132,8 +1228,8 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
             h.Scale(1.0 / h.Integral())
         return h
 
-    h_str = mk("str", s_tr, w_tr, yb_tr == 1); h_ste = mk("ste", s_te, w_te, yb_te == 1)
-    h_btr = mk("btr", s_tr, w_tr, yb_tr == 0); h_bte = mk("bte", s_te, w_te, yb_te == 0)
+    h_str = mk("str", s_tr, w_tr, yb_tr == 1); h_ste = mk("ste", s_te, w_te_ot, yb_te == 1)
+    h_btr = mk("btr", s_tr, w_tr, yb_tr == 0); h_bte = mk("bte", s_te, w_te_ot, yb_te == 0)
     col = M3_COL[cname]
     h_str.SetLineColor(col); h_str.SetLineWidth(3); h_str.SetMarkerColor(col)
     h_str.SetMarkerSize(0)   # error bars only (2026-09-13, user) -- no marker dot
@@ -1162,22 +1258,43 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     c.SetLeftMargin(0.095); c.SetBottomMargin(0.075)
     c.SetTicks(1, 1); c.SetLogy()
     comp = M3_COMPONENTS[cname]
+    # 2026-09-16, user: "x-axis title 0.5% higher" / "y-axis title 0.5%
+    # lower", THEN (same day, presumably the first nudge read as too
+    # subtle) "x-axis title 1% higher" / "y-axis title 1% lower" again --
+    # treated as an ADDITIONAL, compounding nudge on top of the first one,
+    # not a replacement (0.995*0.99 / 1.005*1.01 total). xoff/yoff are
+    # TAxis::SetTitleOffset multipliers (not raw NDC fractions): xoff DOWN
+    # moves the X title up (offset multiplies the gap BELOW the frame --
+    # smaller gap = higher/closer to the axis); yoff UP moves the Y title
+    # further from the frame (offset multiplies the horizontal gap for a
+    # rotated Y title -- this is the only continuous knob SetTitleOffset
+    # gives on that axis).
     frame = _axes(c.DrawFrame(lo, y_lo, hi, y_hi),
                   f"{M3_DISP[cname]}( {comp} / rest )",
-                  "N_{jets} norm. to 1", tsize=0.036, xoff=1.05, yoff=1.315)
+                  "N_{jets} norm. to 1", tsize=0.036,
+                  xoff=1.05 * 0.995 * 0.99, yoff=1.315 * 1.005 * 1.01)
     frame.GetYaxis().SetLabelOffset(0.005)   # tick numbers 1% closer
     frame.GetXaxis().SetLabelOffset(-0.005)  # x-axis tick numbers 1% closer
-    # train histograms now ALSO carry error bars (2026-09-13, user), not just
-    # the outline/fill -- "HIST E1" draws both together.
-    h_btr.Draw("HIST E1 SAME"); h_bte.Draw("E1 SAME")
-    h_str.Draw("HIST E1 SAME"); h_ste.Draw("E1 SAME")
+    # 2026-09-16, user: "no horizontal lines, only vertical errorbars" --
+    # "E1" adds small perpendicular end-cap ticks to every error bar; plain
+    # "E" draws the vertical error bar alone. Train histograms now ALSO
+    # carry error bars (2026-09-13, user), not just the outline/fill --
+    # "HIST E" draws both together.
+    h_btr.Draw("HIST E SAME"); h_bte.Draw("E SAME")
+    h_str.Draw("HIST E SAME"); h_ste.Draw("E SAME")
 
     # 2026-09-16, user: "evaluate the 1-bin optimal cut of this variable" --
     # single score>=thr working point maximising S/sqrt(S+B) on the TEST
     # sample, marked with a dashed grey vertical line + efficiencies quoted
-    # next to it.
+    # next to it. Stays on the RAW physics w_te (not w_te_ot) -- this is a
+    # physical per-jet efficiency, not the loss-shaping mixture check below.
     cut_thr, cut_eff_s, cut_eff_b = best_1bin_cut(s_te, w_te, yb_te == 1, yb_te == 0)
-    ln = ROOT.TLine(cut_thr, y_lo, cut_thr, y_hi)
+    # 2026-09-16, user: "extend at 2/3 of the y-axis length" -- was the full
+    # frame height; on this log-y axis, "2/3 of the length" means 2/3 of the
+    # log10(y_hi/y_lo) span from the bottom, so it now stops just below the
+    # legend box instead of running all the way to the top.
+    y_line_top = y_lo * (y_hi / y_lo) ** (2.0 / 3.0)
+    ln = ROOT.TLine(cut_thr, y_lo, cut_thr, y_line_top)
     ln.SetLineColor(ROOT.kGray + 2); ln.SetLineStyle(2); ln.SetLineWidth(2)
     ln.Draw(); ROOT.SetOwnership(ln, False)
     # 2026-09-16 bugfix, user: the annotation used to sit in DATA coordinates
@@ -1188,7 +1305,8 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # 2026-09-16, user: "the line at lower 1/3 of y-axis range, eff values on
     # its right" -- text placed at the NDC height corresponding to 1/3 up the
     # log-scale y-axis (bottom margin 0.075, top margin TOP_MARGIN=0.065), to
-    # the right of the line; the line itself still spans the full frame.
+    # the right of the line; the line itself now spans 2/3 of the frame (see
+    # y_line_top above), not the full height.
     x_ndc = min(0.095 + cut_thr * (1.0 - 0.095 - 0.025) + 0.015, 0.860)
     y_ndc = 0.075 + (1.0 / 3.0) * (1.0 - TOP_MARGIN - 0.075) - 0.10
     t_cut = ROOT.TLatex(); t_cut.SetNDC(True); t_cut.SetTextFont(42)
@@ -1205,7 +1323,7 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # value would otherwise stay silently frozen at the old cut).
     OT_SCORE_CUT = 0.5
     ot = subset_overtrain(s_tr, w_tr, yb_tr == 1, yb_tr == 0,
-                          s_te, w_te, yb_te == 1, yb_te == 0, OT_SCORE_CUT)
+                          s_te, w_te_ot, yb_te == 1, yb_te == 0, OT_SCORE_CUT)
 
     def row_verdict(bias):
         return "OK" if bias < 5.0 else ("WARN" if bias < 15.0 else "FAIL")
@@ -1226,10 +1344,14 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # sample (Rest/D_cb, Test/Train) and, for Test only, its bias/KS/verdict.
     # 2026-09-16, user: legend shifted 20% right; verdict word now coloured
     # (green/orange/red for OK/WARN/FAIL) instead of plain text.
-    pvw = ROOT.TPave(0.245, 0.690, 0.730, 0.860, 0, "NDC")
+    # 2026-09-16, user: "legend (numbers) 0.5% lower", then again "1%
+    # lower" the same day -- additive, whole box (and its white backing
+    # pave) shifted down by 0.005 + 0.010 = 0.015 NDC total.
+    _LG_DY = 0.005 + 0.010
+    pvw = ROOT.TPave(0.245, 0.690 - _LG_DY, 0.730, 0.860 - _LG_DY, 0, "NDC")
     pvw.SetFillColor(ROOT.kWhite); pvw.SetFillStyle(1001); pvw.SetBorderSize(0)
     pvw.Draw(); ROOT.SetOwnership(pvw, False)
-    lg = _legend(0.250, 0.695, 0.725, 0.855, TXT * 0.85)
+    lg = _legend(0.250, 0.695 - _LG_DY, 0.725, 0.855 - _LG_DY, TXT * 0.85)
     lg.SetMargin(0.16)
     # 2026-09-16, user: "at the train entries note the components" -- Test
     # rows stay compact (bias/KS/verdict); Train rows spell out their own
@@ -1250,7 +1372,26 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     return [h_btr, h_bte, h_str, h_ste]
 
 
-def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg, out_png, ntop=22):
+def m3_permimp_ranked_top(summary, name, cname, ntop=22):
+    """Shared helper: the ranked-by-dAUC top features + their pim/gim %
+    for ONE class -- factored out of m3_permimp_figure() so build_report()
+    can pre-compute the SAME numbers for cb/bb/bbc up front, to find the
+    common x-axis max (see shared_max below)."""
+    m = summary["models"][name]
+    pc = m["per_class"][cname]
+    perm = {r["feature"]: max(r["auc_drop"], 0.0) for r in pc["permutation_importance"]}
+    gain = {r["feature"]: r["gain"] for r in m["feature_importance"]}
+    p_tot = sum(perm.values()) or 1.0
+    g_tot = sum(gain.values()) or 1.0
+    pim = {f: 100.0 * v / p_tot for f, v in perm.items()}
+    gim = {f: 100.0 * gain.get(f, 0.0) / g_tot for f in perm}
+    ranked = sorted(pim, key=lambda f: -pim[f])
+    top = ranked[:ntop][::-1]
+    return top, pim, gim
+
+
+def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg, out_png,
+                      ntop=22, shared_max=None):
     """Ranking bars for ONE M3 class's one-vs-rest permutation importance,
     PLUS (2026-09-15, user: "prepare the code so 2 bars/feature next
     iteration") a 2nd bar = this feature's GLOBAL XGBoost gain importance
@@ -1261,17 +1402,22 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
     panels for a given feature -- labelled explicitly as "(global)" so it
     is not mistaken for a class-specific number. Data already exists in
     summary.json from the last training run -- this is a pure rendering
-    change, no retrain needed for it to appear."""
+    change, no retrain needed for it to appear.
+
+    2026-09-17, user: "the orange bars are the same across all 3 classes?
+    ... why is this not strictly true in these plots?" -- they WERE always
+    numerically identical (one shared m["feature_importance"] list), but
+    each panel auto-scaled its OWN x-axis to 1.1x ITS OWN tallest bar, so
+    the same 8.5% gain bar was drawn a different VISUAL length in a panel
+    whose blue bars happened to be much taller/shorter -- e.g. bbc's frame
+    topped out at 20.8% vs cb's 32.4%, stretching bbc's bars ~56% longer
+    for the identical underlying number. `shared_max`, when given (see
+    build_report(), which pre-computes it across cb+bb+bbc together),
+    overrides the per-panel scale so equal numbers are drawn as equal
+    lengths across all three."""
+    top, pim, gim = m3_permimp_ranked_top(summary, name, cname, ntop)
     m = summary["models"][name]
     pc = m["per_class"][cname]
-    perm = {r["feature"]: max(r["auc_drop"], 0.0) for r in pc["permutation_importance"]}
-    gain = {r["feature"]: r["gain"] for r in m["feature_importance"]}
-    p_tot = sum(perm.values()) or 1.0
-    g_tot = sum(gain.values()) or 1.0
-    pim = {f: 100.0 * v / p_tot for f, v in perm.items()}
-    gim = {f: 100.0 * gain.get(f, 0.0) / g_tot for f in perm}
-    ranked = sorted(pim, key=lambda f: -pim[f])          # RANK BY dAUC (per-class)
-    top = ranked[:ntop][::-1]
     n = len(top)
     # 2026-09-15, user: 2 empty bins at the top now (was 1) -- more headroom
     # for the text block, and room to show all 22 features (was capped at
@@ -1307,7 +1453,11 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
     h.GetYaxis().SetTitleSize(0.040); h.GetYaxis().SetLabelSize(LSIZE)
     h.GetYaxis().SetTitleOffset(0.95)
     h.GetXaxis().SetLabelSize(0.050); h.GetXaxis().SetLabelOffset(0.005)
-    h.SetMaximum(1.1 * max(max(pim[f] for f in top), max(gim[f] for f in top)))
+    # 2026-09-17, user: "make tick marks a bit smaller all around the
+    # panel" -- ROOT's default tick length (~0.03) shrunk on both axes.
+    h.GetXaxis().SetTickLength(0.015); h.GetYaxis().SetTickLength(0.015)
+    own_max = 1.1 * max(max(pim[f] for f in top), max(gim[f] for f in top))
+    h.SetMaximum(shared_max if shared_max is not None else own_max)
     h.SetMinimum(0.0)
     h.Draw("HBAR")
     h_g.Draw("HBAR SAME")
@@ -1317,23 +1467,99 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
     # the right so text never touches the frame (RIGHT_MARGIN puts the
     # frame's own right edge at 1-0.025=0.975 -- 0.965 left only a 1%
     # gap, easy to touch at some font/DPI combinations).
+    # 2026-09-16, user: "shift the legend 2% to the left" -- both x-edges.
     Y0 = 0.860
-    lg = _legend(0.600, Y0 - 0.350, 0.950, Y0 - 0.235, TXT)
-    lg.AddEntry(h, "#DeltaAUC vs rest  (this class)", "f")
-    lg.AddEntry(h_g, "%Imp gain  (global)", "f")
+    LG_DX = -0.02
+    lg = _legend(0.600 + LG_DX, Y0 - 0.350, 0.950 + LG_DX, Y0 - 0.235, TXT)
+    # 2026-09-17, user: "(this class)" redundant (the header line already
+    # names the class); "%Imp gain (global)" unclear -- renamed to state
+    # what it actually is (a training-time XGBoost stat, model-wide).
+    lg.AddEntry(h, "#DeltaAUC vs rest", "f")
+    lg.AddEntry(h_g, "Gain importance (model-wide)", "f")
     lg.Draw()
 
+    # 2026-09-16, user: "below the legend, list the parameters used in the
+    # BDT/XGBoost, parameters that are subject to choice and optimization"
+    # -- pulled straight from summary.json's stored "params" for THIS
+    # model/run (same source binary permimp_figure's info box already
+    # reads); no retrain needed, pure rendering addition. Left-aligned at
+    # the legend's own (shifted) left edge, directly beneath it.
+    # 2026-09-16, user: "text to be larger, and also make the values form
+    # separate columns vertically ordered like a table" -- redesigned as a
+    # 2-column name/value table (was 1-2 abbreviated values crammed per
+    # prose line) at a bigger font; there is ample room below the legend
+    # down to the bottom margin, so 8 rows at the larger size still fits
+    # with no clipping (checked against the frame's right edge too).
+    p = m["params"]
+    bdt_rows = [
+        ("trees", "%d" % p["n_estimators"]),
+        ("stop", "%d" % m["best_iteration"]),
+        ("depth", "%d" % p["max_depth"]),
+        ("learning rate", "%.2f" % p["learning_rate"]),
+        ("subsample", "%.2f" % p["subsample"]),
+        ("colsample", "%.2f" % p["colsample_bytree"]),
+        ("min_child_w", "%.0f" % p["min_child_weight"]),
+        ("L2", "%.0f" % p.get("reg_lambda", 0.0)),
+    ]
+    # 2026-09-17, user: "shift the XGBoost parameters 3% lower and 3% to
+    # the right" -- moves the header, name/value rows, AND the white
+    # backing pave together (all anchored off x_bdt/y_bdt0 below).
+    x_bdt = 0.600 + LG_DX + 0.03
+    y_bdt0 = Y0 - 0.350 - 0.038 - 0.03
+    # 2026-09-16 bugfix: the table is now 8 rows (was 5 short prose lines)
+    # and reaches low enough to cross into REAL bar content for classes
+    # whose lowest-ranked feature still has a long %Imp-gain bar (seen on
+    # bbc's "bb" row) -- the composition row/legend above sit in the
+    # deliberately-EMPTY reserved top bins and never needed this, but the
+    # table's new extent does. White backing pave, sized to the table's own
+    # footprint, painted after the bars so it can't be crossed by one.
+    pvw_bdt = ROOT.TPave(x_bdt - 0.010, y_bdt0 - 0.032 * len(bdt_rows) - 0.012,
+                        x_bdt + 0.300, y_bdt0 + 0.014, 0, "NDC")
+    pvw_bdt.SetFillColor(ROOT.kWhite); pvw_bdt.SetFillStyle(1001); pvw_bdt.SetBorderSize(0)
+    pvw_bdt.Draw(); ROOT.SetOwnership(pvw_bdt, False)
+    t_hdr = ROOT.TLatex(); t_hdr.SetNDC(); t_hdr.SetTextFont(42)
+    t_hdr.SetTextSize(TXT * 0.95); t_hdr.SetTextAlign(11)
+    t_hdr.DrawLatex(x_bdt, y_bdt0, "#bf{XGBoost parameters (M3):}")
+    ROOT.SetOwnership(t_hdr, False)
+    t_name = ROOT.TLatex(); t_name.SetNDC(); t_name.SetTextFont(42)
+    t_name.SetTextSize(TXT * 0.88); t_name.SetTextAlign(11)
+    t_val = ROOT.TLatex(); t_val.SetNDC(); t_val.SetTextFont(42)
+    t_val.SetTextSize(TXT * 0.88); t_val.SetTextAlign(11)
+    # NB: loop var deliberately NOT called "name" -- this function's own
+    # `name` parameter (e.g. "M3") is still needed below for eval.npz's
+    # path, and reusing it here silently overwrote it (2026-09-16 bugfix:
+    # broke "outdir / name / eval.npz" into a bogus "outdir / L2 / eval.npz").
+    for i, (pname, val) in enumerate(bdt_rows, 1):
+        y = y_bdt0 - 0.032 * i
+        t_name.DrawLatex(x_bdt, y, pname)
+        t_val.DrawLatex(x_bdt + 0.220, y, val)   # clear of "learning rate", the longest name
+    ROOT.SetOwnership(t_name, False); ROOT.SetOwnership(t_val, False)
+
     ot = pc["overtraining"]
+    # 2026-09-16, user: "shift the text 'M3 -- Dbb....' 3% higher. Same for
+    # the line below 'AUC(vs rest) test.....'", then again "0.5% higher"
+    # the same day -- additive, both lines share one anchor (Y0_HDR), so
+    # shifting it by +0.03 + 0.005 moves them together.
+    # 2026-09-17, user: "place the 2nd text row ... 0.5% higher" -- this
+    # time ONLY line 2, independent of line 1, so line 2 gets its own
+    # extra +0.005 on top of the shared anchor (line spacing shrinks from
+    # 0.036 to 0.031 -- line 2 moves up, line 1 doesn't).
+    Y0_HDR = Y0 + 0.03 + 0.005
+    y_line2 = Y0_HDR - 0.036 + 0.005
+    # 2026-09-17, user: "AUC (vs rest) test 0.981..." -> "AUC test: 0.981,
+    # Bias B:... S:..." -- reworded, and the signal-side bias (previously
+    # missing from this line; only bkg bias was shown) added alongside it.
     lines = [
-        "#bf{M3 -- %s}  ranked by #DeltaAUC vs rest   (%d of %d params)"
-        % (M3_DISP[cname], n, m["n_features"]),
-        "AUC(vs rest) test %.3f    bias B %.1f%%  [%s]"
-        % (pc["auc_ovr"], ot["rel_diff_bkg_pct"], ot["verdict"]),
+        # 2026-09-17, user: "(22 of 22 params)" dropped -- ntop==n_features
+        # always here (all 22 shown), so the count added nothing.
+        "#bf{M3 -- %s}  ranked by #DeltaAUC vs rest" % M3_DISP[cname],
+        "AUC test: %.3f,   Bias B: %.1f%%   S: %.1f%%  [%s]"
+        % (pc["auc_ovr"], ot["rel_diff_bkg_pct"], ot["rel_diff_sig_pct"], ot["verdict"]),
     ]
     t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(TXT)
     t.SetTextAlign(31)
-    for i, ln in enumerate(lines):
-        t.DrawLatex(0.950, Y0 - 0.036 * i, ln)
+    t.DrawLatex(0.950, Y0_HDR, lines[0])
+    t.DrawLatex(0.950, y_line2, lines[1])
     ROOT.SetOwnership(t, False)
 
     # topology composition of THIS class's own train-split signal, shown as
@@ -1344,19 +1570,39 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
     # echoes M3_topo_subshare's own config target back (e.g. cb's 60/20/20
     # verbatim) rather than showing anything about the actual data. Plain
     # counts show the real, physical imbalance the multiplier corrects for.
+    # 2026-09-16, user (same day, after the subshare-scan discussion):
+    # "stick to 60/20/20 but use these % in the table" -- reverses the
+    # 2026-09-15 choice above BACK to the config's chosen TARGET share
+    # (the same M3_topo_subshare[str(class_idx)] the multiplier is derived
+    # from), because the point right now is comparing that target itself
+    # across scan variants, not the raw data composition it corrects for.
+    # Falls back to the raw jet-count fraction for any class with no
+    # M3_topo_subshare entry (bbc today -- trivially 100% either way,
+    # since it has only one constituent topology).
     my_codes = sorted(int(k) for k, v in class_groups.items() if int(v) == class_idx)
     if my_codes:
-        e = np.load(outdir / name / "eval.npz")
-        topo = e["train_topo"]
-        tot_n = sum(int((topo == tc).sum()) for tc in my_codes) or 1
-        frac = {tc: 100.0 * int((topo == tc).sum()) / tot_n for tc in my_codes}
+        target_share = (cfg.get("M3_topo_subshare") or {}).get(str(class_idx))
+        if target_share:
+            frac = {tc: 100.0 * float(target_share.get(str(tc), 0.0)) for tc in my_codes}
+            row_label = "Weighted yields:"
+        else:
+            e = np.load(outdir / name / "eval.npz")
+            topo = e["train_topo"]
+            tot_n = sum(int((topo == tc).sum()) for tc in my_codes) or 1
+            frac = {tc: 100.0 * int((topo == tc).sum()) / tot_n for tc in my_codes}
+            row_label = "jet fraction:"
 
-        cap = ROOT.TLatex(); cap.SetNDC(); cap.SetTextFont(42)
-        cap.SetTextSize(TXT * 0.92); cap.SetTextAlign(31)
-        cap.DrawLatex(0.950, Y0 - 0.036 * len(lines) - 0.018,
-                     "#it{%s signal composition (train, jet yield):}" % M3_DISP[cname])
-
-        y_top = Y0 - 0.036 * len(lines) - 0.018 - 0.044
+        # 2026-09-16, user: dropped the standalone "<class> signal
+        # composition (train, jet yield):" caption line entirely -- a
+        # compact label now sits to the LEFT of the coloured percentage row
+        # instead (row 1 = topology names as before, row 2 = the label
+        # above + "  8%  40%  53%").
+        # 2026-09-16, user (same day): "place the component % & text 10%
+        # lower" -- both rows share this one y_top anchor, so -0.10 moves
+        # the whole composition block down together. Anchored off y_line2
+        # (not a fixed line-count formula) so it keeps the same gap below
+        # line 2 regardless of exactly where line 2 itself sits.
+        y_top = y_line2 - 0.030 - 0.10
         x0, x1 = 0.625, 0.950
         step = (x1 - x0) / len(my_codes)
         tt = ROOT.TLatex(); tt.SetNDC(); tt.SetTextFont(42); tt.SetTextSize(TXT)
@@ -1367,7 +1613,12 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
             tt.DrawLatex(x, y_top, TOPO_LAB[tc].replace(" proxy", " prx"))
             tt.DrawLatex(x, y_top - 0.036, "%.0f%%" % frac[tc])
         tt.SetTextColor(ROOT.kBlack)
-        ROOT.SetOwnership(cap, False); ROOT.SetOwnership(tt, False)
+
+        lbl = ROOT.TLatex(); lbl.SetNDC(); lbl.SetTextFont(42)
+        lbl.SetTextSize(TXT * 0.88); lbl.SetTextAlign(31); lbl.SetTextColor(ROOT.kBlack)
+        # 2026-09-17, user: "also move this text 2% to the right".
+        lbl.DrawLatex(x0 - 0.020 + 0.02, y_top - 0.036, row_label)
+        ROOT.SetOwnership(tt, False); ROOT.SetOwnership(lbl, False)
 
     cms_header(cfg, c)
     c.RedrawAxis(); c.SaveAs(str(out_png))
@@ -1521,10 +1772,78 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
 
 
 # --------------------------------------------------------------------------- #
+def _publish_prefix(tag):
+    """Gallery filename prefix (2026-09-16, user: "TaggerTrain_M3cl_<tag>_
+    -> TaggerTrain_PRE_ ... this naming should be enough" -- the gallery is
+    a live dashboard at a fixed URL per figure, not a per-run archive, so
+    the run tag is dropped entirely rather than abbreviated again).
+    `tag` is accepted (and ignored) only so call sites don't need to change
+    if a tag-qualified scheme is ever wanted back. Shared by build_report()
+    (every published filename) and main()'s closing banner, so the two can
+    never drift apart.
+
+    NB: publishing under this ONE fixed name means a later run with a
+    DIFFERENT dataset_tag/run_tag silently overwrites these files -- fine
+    for "always show the latest training" but worth knowing if two tags are
+    ever compared side by side."""
+    return "TaggerTrain_PRE"
+
+
+def _tagged_prefix(tag):
+    """Tag-qualified gallery prefix (TaggerTrain_M3cl_<tag>_, trailing
+    "_zbb" dropped as redundant) -- 2026-09-16, user: "Rename these plots to
+    'TaggerTrain_M3cl_presel_v3_kp50_permimp_M3_bb' accordingly", given
+    right after the blanket switch to the fixed _publish_prefix() above.
+    Used ONLY for permimp_M3_{cb,bb,bbc}.png; every other figure stays on
+    the fixed TaggerTrain_PRE_ prefix."""
+    publish_tag = tag[:-len("_zbb")] if tag.endswith("_zbb") else tag
+    return f"TaggerTrain_M3cl_{publish_tag}"
+
+
+def _timed_call(produced, label, path, fn, *args, **kwargs):
+    """Call fn(*args, **kwargs) -- one of the *_figure()/montage() calls that
+    draws + saves `path` -- time it, and record (label, path, seconds) in
+    `produced`. This is the runtime keeper behind the end-of-run
+    files-produced report (2026-09-16, user: "place some runtime keeper and
+    report at the end"). Returns fn's own return value unchanged (every
+    *_figure() returns its "keep alive" list of ROOT objects)."""
+    t0 = time.time()
+    result = fn(*args, **kwargs)
+    produced.append((label, Path(path), time.time() - t0))
+    return result
+
+
+def _report_produced(produced, all_published, gallery):
+    """End-of-run report (2026-09-16, user request): every figure/panel
+    produced this run (name, size, render time, local path under
+    S1_tagger/output/<tag>/), then every file actually published/stored
+    into the gallery (name -> local source)."""
+    print("\n==== files produced ====")
+    for label, path, dt in produced:
+        kb = path.stat().st_size / 1024.0 if path.exists() else 0.0
+        print(f"  {label:24s} {kb:7.1f} KB   {dt:6.2f}s   {path}")
+    tot_kb = sum(p.stat().st_size for _, p, _ in produced if p.exists()) / 1024.0
+    tot_s = sum(dt for _, _, dt in produced)
+    print(f"  -- {len(produced)} files, {tot_kb / 1024.0:.2f} MB, "
+          f"{tot_s:.1f}s total render time")
+
+    print("\n==== files published/stored (gallery) ====")
+    for gname, src in all_published.items():
+        gpath = gallery / gname
+        kb = gpath.stat().st_size / 1024.0 if gpath.exists() else 0.0
+        print(f"  {gname:52s} {kb:7.1f} KB   <- {src.name}")
+    print(f"  -- {len(all_published)} files -> {gallery}")
+
+
 def build_report(cfg, outdir):
     outdir = Path(outdir)
     summary = json.loads((outdir / "summary.json").read_text())
     tag = cfg.get("run_tag", cfg["dataset_tag"])
+    # 2026-09-16, user: "the zbb is redundant" -- dropped from the PUBLISHED
+    # gallery filename only; dataset_tag/run_tag and the on-disk output dir
+    # (S1_tagger/output/<tag>/) are UNCHANGED, still presel_v3_kp50_zbb.
+    PUBLISH_PREFIX = _publish_prefix(tag)
+    PERMIMP_PREFIX = _tagged_prefix(tag)   # permimp_M3_{cb,bb,bbc} only, see docstring
     ds_meta = json.loads((Path(summary["dataset_dir"]) / "dataset_complete.json").read_text())
     sig_codes = {int(k): v for k, v in ds_meta["signal_codes"].items()}
     if MODEL not in summary["models"] or not (outdir / MODEL / "eval.npz").exists():
@@ -1532,8 +1851,12 @@ def build_report(cfg, outdir):
 
     cms_style()
     keep = []
+    produced = []          # (label, path, seconds) -- runtime keeper, see _report_produced
+    all_published = {}     # gallery_name -> local src path, S1 + M3 sections combined
+
     roc = outdir / "roc.png"
-    keep += roc_figure(outdir, summary, cfg, roc, ds_meta.get('preselection_used'))
+    keep += _timed_call(produced, "roc.png", roc, roc_figure,
+                        outdir, summary, cfg, roc, ds_meta.get('preselection_used'))
 
     # One panel per signal definition.  All three share the SAME model, so the
     # ROC (which shows all of them together) and the input ranking are common;
@@ -1544,40 +1867,49 @@ def build_report(cfg, outdir):
     # red curves distinguished by line style.
     pi = outdir / f"permimp_{MODEL}.png"
     sc = outdir / f"score_{MODEL}.png"
-    keep += permimp_figure(outdir, MODEL, summary, cfg, pi)
-    keep += score_figure(outdir, MODEL, summary, cfg, sig_codes, sc)
+    keep += _timed_call(produced, f"permimp_{MODEL}.png", pi,
+                        permimp_figure, outdir, MODEL, summary, cfg, pi)
+    keep += _timed_call(produced, f"score_{MODEL}.png", sc,
+                        score_figure, outdir, MODEL, summary, cfg, sig_codes, sc)
 
     # 2026-09-16, user: "delete the [old S1 overtrain plot]" -- it could never
     # be labelled correctly (S1's binary training target is ALL 7 topologies
     # as one signal bucket, not any single named subset), and the genuinely
     # correct per-class version already exists as overtrain_M3_{cb,bb,bbc}.png
-    # (m3_overtrain_figure). Dropped from generation + panel (now 1x3, not
-    # 2x2) + publishing; any stale published copy is removed below.
-    panel = outdir / "panel.png"
+    # (m3_overtrain_figure).
+    #
+    # 2026-09-16, user: "I think the ..._panel.png is a remnant from the past
+    # where I used a 1-class model; if this is the case, comment this out" --
+    # confirmed: this 1x3 montage (roc+permimp_S1+score_S1) is the last
+    # surviving artifact of the retired 1-class S1 binary tagger
+    # (02_train_tagger.py: "S1 disabled ... training M3 only this run").
+    # RETIRED here -- generation + publishing of panel.png dropped entirely.
+    # roc.png/permimp_S1.png/score_S1.png themselves are STILL produced and
+    # published individually below (roc.png is the only place the raw-sum /
+    # old-Dbc / 3-class-Dbc / S1 comparison lives; permimp_S1/score_S1
+    # describe the still-carried-forward S1 model artifacts on disk) -- only
+    # the S1-only MONTAGE was the dead remnant.
+    # panel = outdir / "panel.png"
+    # montage([str(roc), str(pi), str(sc),
+    #          "-tile", "3x1", "-geometry", f"{SQ}x{SQ}+0+0",
+    #          "-background", "white", str(panel)])
     singles = [roc, pi, sc]
-    montage([str(roc), str(pi), str(sc),
-             "-tile", "3x1", "-geometry", f"{SQ}x{SQ}+0+0",
-             "-background", "white", str(panel)])
-    published = {f"S1_tagger_{tag}_panel.png": panel,
-                 f"S1_tagger_{tag}_roc.png": roc,
-                 f"S1_tagger_{tag}_permimp.png": pi,
-                 f"S1_tagger_{tag}_score.png": sc}
+    published = {f"{PUBLISH_PREFIX}_roc.png": roc,
+                 f"{PUBLISH_PREFIX}_permimp.png": pi,
+                 f"{PUBLISH_PREFIX}_score.png": sc}
     for gname, src in published.items():
         shutil.copyfile(src, GALLERY / gname)
-    stale_ov = GALLERY / f"S1_tagger_{tag}_overtrain.png"
-    if stale_ov.exists():
-        stale_ov.unlink()
-        print(f"  removed stale {stale_ov.name} (old S1 overtrain plot retired)")
+    all_published.update(published)
 
-    print(f"  wrote {panel.name}  ({panel.stat().st_size // 1024} KB)")
+    print(f"  wrote {len(singles)} S1 figures (panel.png retired, see comment):")
     for f_ in singles:
         print(f"        {f_.name}  ({f_.stat().st_size // 1024} KB)")
-    print(f"  published {len(published)} -> {GALLERY}/S1_tagger_{tag}_*.png")
+    print(f"  published {len(published)} -> {GALLERY}/{PUBLISH_PREFIX}_*.png")
 
-    # M3 (multiclass): ROC kept SEPARATE (user's instruction), overtrain /
-    # ranking / score drawn once per class (cb/bb/bbc) and tiled into a 3x3
-    # panel -- see the "M3 (multiclass) figures" block above for why this is
-    # shaped differently from S1's 2x2.
+    # M3 (multiclass): roc / overtrain / ranking / score drawn once per
+    # class (cb/bb/bbc) and tiled into a 3x4 panel (roc row added
+    # 2026-09-16) -- see the "M3 (multiclass) figures" block above for why
+    # this is shaped differently from S1's 1x3.
     if "M3" in summary["models"] and (outdir / "M3" / "eval.npz").exists():
         class_names = cfg.get("M3_class_names", ["bkg", "cb", "bb", "bbc"])
         class_groups = cfg.get("M3_class_groups", {})
@@ -1590,7 +1922,8 @@ def build_report(cfg, outdir):
         # using D_bb's OWN score (not D_cb's) throughout.
         _presel = ds_meta.get('preselection_used')
         roc_m3_cb = outdir / "roc_M3_cb.png"
-        keep += m3_roc_figure(
+        keep += _timed_call(
+            produced, "roc_M3_cb.png", roc_m3_cb, m3_roc_figure,
             outdir, cfg, roc_m3_cb, sig_classes, "cb",
             curves=[("D_{cb}( cb, b'c, b'c-prx / rest )", (1, 2, 5)),
                     ("D_{cb}( cb, b'c / rest )", (1, 2)),
@@ -1600,12 +1933,26 @@ def build_report(cfg, outdir):
         # guessed -- bb's components are physically distinct processes with
         # no natural cb-style narrowing order).
         roc_m3_bb = outdir / "roc_M3_bb.png"
-        keep += m3_roc_figure(
+        keep += _timed_call(
+            produced, "roc_M3_bb.png", roc_m3_bb, m3_roc_figure,
             outdir, cfg, roc_m3_bb, sig_classes, "bb",
             curves=[("D_{bb}( b'b, Zbb, QCDbb / rest )", (3, 6, 7)),
                     ("D_{bb}( b'b / rest )", (3,)),
                     ("D_{bb}( cb, b'c, b'b, b'bc / rest )", (1, 2, 3, 4))],
             colors=[ROOT.kGreen + 4, ROOT.kGreen + 2, ROOT.kGreen + 0],
+            presel=_presel)
+        # 2026-09-16, user: "the ROC curve for D_bbc is missing; add it
+        # alongside the rest" -- 2 curves (bbc's own class vs the same wide
+        # cb/b'c/b'b/b'bc comparison the cb/bb panels already carry; bbc has
+        # only ONE constituent topology (4), unlike cb/bb's multi-topology
+        # narrowing, so there is no natural 3rd intermediate definition).
+        roc_m3_bbc = outdir / "roc_M3_bbc.png"
+        keep += _timed_call(
+            produced, "roc_M3_bbc.png", roc_m3_bbc, m3_roc_figure,
+            outdir, cfg, roc_m3_bbc, sig_classes, "bbc",
+            curves=[("D_{bbc}( b'bc / rest )", (4,)),
+                    ("D_{bbc}( cb, b'c, b'b, b'bc / rest )", (1, 2, 3, 4))],
+            colors=[ROOT.kMagenta + 3, ROOT.kMagenta + 1],
             presel=_presel)
 
         # per-class proxy reference for the score/S-proxy-inspection plot
@@ -1626,54 +1973,99 @@ def build_report(cfg, outdir):
             "bbc": (e_m3["test_t3bcq_proxy"], "t^{3}(b'cq) proxy", True, ()),
         }
 
+        # 2026-09-17, user: "the orange bars are the same across all 3
+        # classes ... why is this not strictly true in these plots?" --
+        # they were numerically identical but drawn at 3 different
+        # per-panel x-axis scales. Pre-compute one COMMON max (1.1x the
+        # single tallest bar across cb+bb+bbc together) so equal numbers
+        # come out as equal bar lengths in every panel.
+        _permimp_max = 0.0
+        for _c_idx, _cn in sig_classes:
+            _top, _pim, _gim = m3_permimp_ranked_top(summary, "M3", _cn)
+            _permimp_max = max(_permimp_max,
+                               max(_pim[f] for f in _top), max(_gim[f] for f in _top))
+        permimp_shared_max = 1.1 * _permimp_max
+
         m3_singles = {}   # cname -> (overtrain, permimp, score) paths
         for c_idx, cname in sig_classes:
             ov3 = outdir / f"overtrain_M3_{cname}.png"
             pi3 = outdir / f"permimp_M3_{cname}.png"
             sc3 = outdir / f"score_M3_{cname}.png"
-            keep += m3_overtrain_figure(outdir, "M3", cname, c_idx, summary, cfg, ov3)
-            keep += m3_permimp_figure(outdir, "M3", cname, c_idx, class_groups, summary, cfg, pi3)
+            keep += _timed_call(produced, f"overtrain_M3_{cname}.png", ov3,
+                                m3_overtrain_figure, outdir, "M3", cname, c_idx, summary, cfg, ov3)
+            keep += _timed_call(produced, f"permimp_M3_{cname}.png", pi3,
+                                m3_permimp_figure, outdir, "M3", cname, c_idx, class_groups, summary, cfg, pi3,
+                                shared_max=permimp_shared_max)
             pmask, plabel, pshow, pexcl = m3_proxy.get(
                 cname, (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,)))
-            keep += m3_score_figure(outdir, "M3", cname, c_idx, class_groups, cfg, sc3,
-                                    pmask, plabel, pshow, exclude_codes=pexcl)
+            keep += _timed_call(produced, f"score_M3_{cname}.png", sc3,
+                                m3_score_figure, outdir, "M3", cname, c_idx, class_groups, cfg, sc3,
+                                pmask, plabel, pshow, exclude_codes=pexcl)
             m3_singles[cname] = (ov3, pi3, sc3)
 
         panel_m3 = outdir / "panel_M3.png"
-        # rows = plot type (overtrain / ranking / score), columns = class
-        # (cb, bb, bbc), in that fixed order regardless of dict iteration --
-        # a stated design choice, not derived from anything upstream.
+        # rows = plot type (ROC / overtrain / ranking / score), columns =
+        # class (cb, bb, bbc), in that fixed order regardless of dict
+        # iteration -- a stated design choice, not derived from anything
+        # upstream. 2026-09-16, user: "add the 3 ROC plots on top of this
+        # panel ... 3x4 panel now" -- ROC row added back in as row 1 (it
+        # was previously kept OUT of the panel per an earlier instruction,
+        # now reversed).
         order = [cn for cn in ("cb", "bb", "bbc") if cn in m3_singles]
+        roc_m3 = {"cb": roc_m3_cb, "bb": roc_m3_bb, "bbc": roc_m3_bbc}
+        tile_row_roc = [str(roc_m3[cn]) for cn in order]
         tile_row_ov = [str(m3_singles[cn][0]) for cn in order]
         tile_row_pi = [str(m3_singles[cn][1]) for cn in order]
         tile_row_sc = [str(m3_singles[cn][2]) for cn in order]
-        montage(tile_row_ov + tile_row_pi + tile_row_sc +
-                ["-tile", "3x3", "-geometry", f"{SQ}x{SQ}+0+0",
-                 "-background", "white", str(panel_m3)])
+        _timed_call(produced, "panel_M3.png", panel_m3, montage,
+                   tile_row_roc + tile_row_ov + tile_row_pi + tile_row_sc +
+                   ["-tile", "3x4", "-geometry", f"{SQ}x{SQ}+0+0",
+                    "-background", "white", str(panel_m3)])
 
-        published_m3 = {f"S1_tagger_{tag}_panel_M3.png": panel_m3,
-                        f"S1_tagger_{tag}_roc_M3_cb.png": roc_m3_cb,
-                        f"S1_tagger_{tag}_roc_M3_bb.png": roc_m3_bb}
+        published_m3 = {f"{PUBLISH_PREFIX}_panel_M3.png": panel_m3,
+                        f"{PUBLISH_PREFIX}_roc_M3_cb.png": roc_m3_cb,
+                        f"{PUBLISH_PREFIX}_roc_M3_bb.png": roc_m3_bb,
+                        f"{PUBLISH_PREFIX}_roc_M3_bbc.png": roc_m3_bbc}
         for cn in order:
             ov3, pi3, sc3 = m3_singles[cn]
-            published_m3[f"S1_tagger_{tag}_overtrain_M3_{cn}.png"] = ov3
-            published_m3[f"S1_tagger_{tag}_permimp_M3_{cn}.png"] = pi3
-            published_m3[f"S1_tagger_{tag}_score_M3_{cn}.png"] = sc3
+            published_m3[f"{PUBLISH_PREFIX}_overtrain_M3_{cn}.png"] = ov3
+            # 2026-09-16, user: permimp_M3_{cb,bb,bbc} specifically keep the
+            # tag-qualified prefix -- see PERMIMP_PREFIX/_tagged_prefix().
+            published_m3[f"{PERMIMP_PREFIX}_permimp_M3_{cn}.png"] = pi3
+            published_m3[f"{PUBLISH_PREFIX}_score_M3_{cn}.png"] = sc3
         for gname, src in published_m3.items():
             shutil.copyfile(src, GALLERY / gname)
+        all_published.update(published_m3)
 
         print(f"  wrote {panel_m3.name}  ({panel_m3.stat().st_size // 1024} KB)  "
-              f"(3x3: rows=overtrain/ranking/score, cols={order})")
-        print(f"        {roc_m3_cb.name}  ({roc_m3_cb.stat().st_size // 1024} KB)  "
-              f"(kept OUT of the panel, per instruction)")
-        print(f"        {roc_m3_bb.name}  ({roc_m3_bb.stat().st_size // 1024} KB)  "
-              f"(kept OUT of the panel, per instruction)")
-        print(f"  published {len(published_m3)} -> {GALLERY}/S1_tagger_{tag}_*_M3*.png")
+              f"(3x4: rows=roc/overtrain/ranking/score, cols={order})")
+        for r in (roc_m3_cb, roc_m3_bb, roc_m3_bbc):
+            print(f"        {r.name}  ({r.stat().st_size // 1024} KB)  "
+                  f"(also in panel_M3.png's top row, 2026-09-16)")
+        print(f"  published {len(published_m3)} -> {GALLERY}/{{{PUBLISH_PREFIX},{PERMIMP_PREFIX}}}_*_M3*.png")
 
-        stale_roc_m3 = GALLERY / f"S1_tagger_{tag}_roc_M3.png"
-        if stale_roc_m3.exists():
-            stale_roc_m3.unlink()
-            print(f"  removed stale {stale_roc_m3.name} (renamed to roc_M3_cb.png)")
+    # one-time sweep: remove any gallery file matching a naming scheme this
+    # pipeline has EVER used (S1_tagger_<tag>_*, TaggerTrain_M3cl_<tag>_*,
+    # TaggerTrain_PRE_*) that isn't one of THIS run's actually-published
+    # names. Generalised (2026-09-16) rather than hardcoded to one "old
+    # scheme -> new scheme" pair, because permimp_M3_{cb,bb,bbc} now lives
+    # on a DIFFERENT prefix (TaggerTrain_M3cl_<tag>_) than every other
+    # figure (TaggerTrain_PRE_) -- a simple two-way sweep would delete the
+    # permimp files right after publishing them. Self-corrects the next
+    # time any prefix changes again, as long as its glob pattern is listed
+    # below.
+    keep_names = set(all_published)
+    candidates = (list(GALLERY.glob(f"S1_tagger_{tag}_*.png"))
+                 + list(GALLERY.glob("TaggerTrain_M3cl_*.png"))
+                 + list(GALLERY.glob("TaggerTrain_PRE_*.png")))
+    stale = sorted({p for p in candidates if p.name not in keep_names})
+    for p in stale:
+        p.unlink()
+    if stale:
+        print(f"  removed {len(stale)} stale file(s) not in this run's "
+              f"{len(keep_names)}-file publish set (retired/superseded names)")
+
+    _report_produced(produced, all_published, GALLERY)
 
 
 def main():
@@ -1685,8 +2077,8 @@ def main():
     outdir = PKG / cfg["output_dir"] / cfg.get("run_tag", cfg["dataset_tag"])
     build_report(cfg, outdir)
     print()
-    _done_banner(t_wall0, f"{outdir}  (published: {GALLERY}/S1_tagger_"
-                          f"{cfg.get('run_tag', cfg['dataset_tag'])}_*.png)")
+    _done_banner(t_wall0, f"{outdir}  (published: {GALLERY}/"
+                          f"{_publish_prefix(cfg.get('run_tag', cfg['dataset_tag']))}_*.png)")
 
 
 if __name__ == "__main__":

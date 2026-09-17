@@ -257,7 +257,7 @@ class Config:
         #   build_trainset.py) -- for the new REGIONS-mode m(J) plots and
         #   any other MAT plot's background breakdown. New raw branch +
         #   changed mat_cat values -> full re-derive.
-        self.cache_tag = "derived_v28_m3cb_v1"
+        self.cache_tag = "derived_v27_qcdbb_v1_cbproxy_kin_test1"
 
         # ------------------------------------------------------------------
         # Switches
@@ -372,7 +372,6 @@ class Config:
             "score_Dbc3_bc": r"$D_{bc}$ (3cl)",
             "score_Dbc3_bb": r"$D_{bb}$ (3cl)",
             "score_S1": r"$S_{1}(bc)$",
-            "score_M3_cb": r"$D_{cb}$ (M3)",
             "score_S2": r"$S_{2}(bb)$",
             "score_S3": r"$S_{3}(bbc)$",
             "score_SC": r"$S_{\mathrm{EVT}}$",
@@ -3104,6 +3103,78 @@ class DataManager:
         n_b_nearcb_L = np.where(ak8_ok, n_b_nearcb_L, -1).astype(np.int16)
         n_b_nearcb_M = np.where(ak8_ok, n_b_nearcb_M, -1).astype(np.int16)
 
+        # -- in-cone AK4 "subjet" proxy (b_L^in / c_L^in), NEW 2026-09-17 ------
+        # test_kinematics_cb_vs_proxy.py ONLY (not in the real 04_Make_plots.py):
+        # the ntuple has NO subjet-level or gen-quark 4-vectors at all (verified
+        # directly against the ROOT branch list: no SubJet_*, no per-parton
+        # GenPart, not even gen-jet kinematic arrays -- only counts like
+        # n_b_genjets_fromW). So "the 2 subjets of J" is approximated here by
+        # the two AK4 jets INSIDE the AK8 cone (dR<0.8, AK8's own clustering
+        # radius): c_L^in = highest ParticleNetAK4 c-score AK4 in-cone,
+        # b_L^in = highest b-score AK4 in-cone EXCLUDING whichever AK4 was
+        # picked as c_L^in (so the two "subjets" are never the same object).
+        # Feasibility checked beforehand: at score_M3_cb>=0.95 on this sample,
+        # 93.9% of PRESEL jets have >=2 distinct AK4 within dR<0.8. Sentinel
+        # -1 for any quantity when a slot has no in-cone AK4 (no exclusion
+        # partner, or cone empty).
+        _scb_need = {"ak4_pt", "ak4_eta", "ak4_phi", "ak4_mass", "ak4_pn_b", "ak4_pn_c"}
+        if _scb_need <= set(raw.fields):
+            _sc_dphi = np.abs(raw["ak4_phi"] - ak8_phi_0)
+            _sc_dphi = ak.where(_sc_dphi > np.pi, 2.0 * np.pi - _sc_dphi, _sc_dphi)
+            _sc_dR = np.sqrt((raw["ak4_eta"] - ak8_eta_0) ** 2 + _sc_dphi ** 2)
+            _in_ja = _sc_dR < 0.8                        # inside the AK8 cone
+            _NEG = -1.0e9
+            _lidx = ak.local_index(raw["ak4_pt"], axis=1)
+
+            _ic_sub = ak.argmax(ak.where(_in_ja, raw["ak4_pn_c"], _NEG),
+                                axis=1, keepdims=True)
+            _ic_flat = ak.to_numpy(ak.fill_none(ak.firsts(_ic_sub), -1)).astype(np.int64)
+            _has_c_sub = _ic_flat >= 0
+
+            _excl_c = ak.Array(_ic_flat) == _lidx        # mask out the c pick
+            _b_elig = _in_ja & ~_excl_c
+            _ib_sub = ak.argmax(ak.where(_b_elig, raw["ak4_pn_b"], _NEG),
+                                axis=1, keepdims=True)
+            _ib_flat = ak.to_numpy(ak.fill_none(ak.firsts(_ib_sub), -1)).astype(np.int64)
+            _has_b_sub = _ib_flat >= 0
+
+            def _pick_sub(branch, idx_sub, dflt=-999.0):
+                col = ak.firsts(raw[branch][idx_sub], axis=1)
+                return ak.to_numpy(ak.fill_none(col, dflt)).astype(np.float32)
+
+            cL_sub_pt,  bL_sub_pt  = _pick_sub("ak4_pt",  _ic_sub), _pick_sub("ak4_pt",  _ib_sub)
+            cL_sub_eta, bL_sub_eta = _pick_sub("ak4_eta", _ic_sub), _pick_sub("ak4_eta", _ib_sub)
+            cL_sub_phi, bL_sub_phi = _pick_sub("ak4_phi", _ic_sub), _pick_sub("ak4_phi", _ib_sub)
+
+            _has_both_sub = _has_c_sub & _has_b_sub
+            _dphi_sub = np.abs(bL_sub_phi - cL_sub_phi)
+            _dphi_sub = np.where(_dphi_sub > np.pi, 2.0 * np.pi - _dphi_sub, _dphi_sub)
+            dR_subjets = np.where(_has_both_sub,
+                                  np.hypot(bL_sub_eta - cL_sub_eta, _dphi_sub),
+                                  -1.0).astype(np.float32)
+            pt_bL_subjet = np.where(_has_b_sub, bL_sub_pt, -1.0).astype(np.float32)
+            pt_cL_subjet = np.where(_has_c_sub, cL_sub_pt, -1.0).astype(np.float32)
+            _pt_lo = np.minimum(pt_bL_subjet, pt_cL_subjet)
+            _pt_hi = np.maximum(pt_bL_subjet, pt_cL_subjet)
+            pt_ratio_subjets = np.where(
+                _has_both_sub, _pt_lo / np.maximum(_pt_hi, 1e-6), -1.0
+            ).astype(np.float32)
+            pt_asym_subjets = np.where(
+                _has_both_sub,
+                (_pt_hi - _pt_lo) / np.maximum(_pt_hi + _pt_lo, 1e-6), -1.0
+            ).astype(np.float32)
+        else:
+            dR_subjets = np.full(n, -1.0, dtype=np.float32)
+            pt_bL_subjet = np.full(n, -1.0, dtype=np.float32)
+            pt_cL_subjet = np.full(n, -1.0, dtype=np.float32)
+            pt_ratio_subjets = np.full(n, -1.0, dtype=np.float32)
+            pt_asym_subjets = np.full(n, -1.0, dtype=np.float32)
+        dR_subjets = np.where(ak8_ok, dR_subjets, -1.0).astype(np.float32)
+        pt_bL_subjet = np.where(ak8_ok, pt_bL_subjet, -1.0).astype(np.float32)
+        pt_cL_subjet = np.where(ak8_ok, pt_cL_subjet, -1.0).astype(np.float32)
+        pt_ratio_subjets = np.where(ak8_ok, pt_ratio_subjets, -1.0).astype(np.float32)
+        pt_asym_subjets = np.where(ak8_ok, pt_asym_subjets, -1.0).astype(np.float32)
+
         # -- W->cb resolved-decay proxy: m(c-jet + nearest b-jet) --------------
         # Take the loose c-tagged AK4 jet with the highest ParticleNetAK4 c
         # score, then the loose b-tagged AK4 jet closest to it in dR; return
@@ -3908,6 +3979,11 @@ class DataManager:
             "n_c_nearcb_M": n_c_nearcb_M,
             "n_b_nearcb_L": n_b_nearcb_L,
             "n_b_nearcb_M": n_b_nearcb_M,
+            "dR_subjets": dR_subjets,
+            "pt_bL_subjet": pt_bL_subjet,
+            "pt_cL_subjet": pt_cL_subjet,
+            "pt_ratio_subjets": pt_ratio_subjets,
+            "pt_asym_subjets": pt_asym_subjets,
             "mass_cL_nearb": mass_cL_nearb,
             "mass_bc_bestmW": mass_bc_bestmW,
             "mass_bbc_minDR": mass_bbc_minDR,
@@ -5395,8 +5471,7 @@ class Plotter:
         # Filename suffixes: per-selection ("_PRE" preselection / "_SR" signal
         # region) so the two plot sets never clobber each other; "_norm" for
         # NORM-mode so it doesn't clobber the ABS-mode PNG of the same observable.
-        _sel_suffix = {"PRE": "_PRE", "SR": "_SR", "JB": "_JB",
-                       "SR1": "_SR1", "SR2": "_SR2", "SR3": "_SR3"}.get(_sel, "")
+        _sel_suffix = {"PRE": "_PRE", "SR": "_SR", "JB": "_JB"}.get(_sel, "")
         _suffix = (_sel_suffix + ("_sig" if signal_only else "")
                    + ("_bkg" if bkg_only else "")
                    + ("_norm" if normalize else ""))
@@ -6292,14 +6367,6 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
                    + _MJ12 + " and " + _COMMON),
         "JB":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
                    "(score_SC > 0.05) and " + _COMMON),
-        # 2026-09-17, user: 3 M3-based signal regions, one per one-vs-rest
-        # class score, each at a plain >0.5 cut on top of PRESEL.
-        "SR1":    ("(ak8_pt[0] > 200) and (score_M3_cb > 0.5) and "
-                   + _MJ12 + " and " + _COMMON),
-        "SR2":    ("(ak8_pt[0] > 200) and (score_S2 > 0.5) and "
-                   + _MJ12 + " and " + _COMMON),
-        "SR3":    ("(ak8_pt[0] > 200) and (score_S3 > 0.5) and "
-                   + _MJ12 + " and " + _COMMON),
     }
     CUT = _SELECTIONS.get(str(sel).upper(), _SELECTIONS["PRE"])
     PI = float(np.pi)
@@ -6566,15 +6633,8 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # dedicated binary cb tagger; S2(bb)/S3(bbc) = the new M3 multiclass
         # model's P(bb)/P(bbc) one-vs-rest columns (M3Evaluator).
         ("score_S1",               "score_S1",               0.0, 1.0, 50, r"$S_{1}(bc)$ (BDT fine-tuned)", True),
-        # M3 multiclass tagger's own 3 one-vs-rest probabilities (2026-09-17,
-        # user): D_cb = P(cb) (previously computed but discarded -- only
-        # D_bb/D_bbc were kept, under the score_S2/score_S3 names below,
-        # since S1 already covered "cb" via the separate dedicated binary
-        # tagger). Re-added here as its own variable so the M3 model's own
-        # cb probability can be inspected directly, alongside D_bb/D_bbc.
-        ("score_M3_cb",            "score_M3_cb",            0.0, 1.0, 50, r"$D_{cb}$ (M3 multiclass)",  True),
-        ("score_S2",               "score_S2",               0.0, 1.0, 50, r"$D_{bb}$ (M3 multiclass)",  True),
-        ("score_S3",               "score_S3",               0.0, 1.0, 50, r"$D_{bbc}$ (M3 multiclass)", True),
+        ("score_S2",               "score_S2",               0.0, 1.0, 50, r"$S_{2}(bb)$ (M3 multiclass)",  True),
+        ("score_S3",               "score_S3",               0.0, 1.0, 50, r"$S_{3}(bbc)$ (M3 multiclass)", True),
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
@@ -7165,7 +7225,8 @@ def parse_args():
         nargs="?",
         default="ALL",
         type=str.upper,
-        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG", "REGIONS", "REGIONS-SIGNAL"],
+        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG", "REGIONS", "REGIONS-SIGNAL",
+                 "CBPROXY", "CBPROXY-SCORE"],
         help="ALL (default): run the normal Data/MC batch plots. "
              "MAT: matching-truth overlay only (Wcb vs Cat_Top_bc vs Rest, "
              "with a ratio panel).  "
@@ -7191,7 +7252,7 @@ def parse_args():
     args = parser.parse_args()
 
     _NORMS = {"ABS", "NORM"}
-    _SELS = {"PRE", "SR", "JB", "SR1", "SR2", "SR3"}
+    _SELS = {"PRE", "SR", "JB"}
     _toks = [t for t in (args.opt_a, args.opt_b) if t]
     _bad = [t for t in _toks if t not in _NORMS | _SELS]
     if _bad:
@@ -7237,6 +7298,335 @@ def stream_fill_histograms(manager, metas, specs, hist_maker,
     return accs
 
 
+def run_cbproxy_kinematics(cfg, manager, sample_metas):
+    """Private study (2026-09-17, user request): kinematics of D_cb(M3)>0.95
+    jets, Wcb (mat_cat==0) vs t2(b'c) proxy (mat_cat==2) ONLY, at PRESEL.
+    Goal: understand what separates the two in the high-D_cb region, as a
+    step toward a kinematics-based (or small BDT) proxy-jet selection that is
+    a reliable Wcb stand-in for calibration.
+
+    IMPORTANT (corrected 2026-09-17 after a first run found ZERO mat_cat==2
+    jets): the two categories do NOT both live in ttbar-powheg. That file is
+    a DEDICATED, Vcb-decay-forced sample (config.json's own comment: "the
+    proxy is pulled unthinned from the whole 16-sample background pool ...
+    the dedicated Vcb sample" -- i.e. ttbar-powheg IS that dedicated sample,
+    every hadronic top in it decays W->cb, so mat_cat never lands on 2
+    there; confirmed directly -- only codes {0,5,6,20} occur in it). Proxy
+    (mat_cat==2, a hadronic top's natural Cabibbo-favoured W->cs) lives in
+    the OTHER background samples instead. So this loops over EVERY sample
+    (not signal_only), streaming one at a time (same pattern as
+    stream_fill_histograms) and pools whichever rows have mat_cat in {0,2}
+    -- mat_cat==0 will only ever come from the Wcb-grouped sample, mat_cat==2
+    from the rest, by construction.
+
+    Outputs go to ./cbproxy_kinematics_test/ (NOT cfg.figure_path == '.',
+    so nothing here touches the real gallery / _gallery.json).
+    """
+    OUTDIR = "./cbproxy_kinematics_test"
+    ensure_dir(OUTDIR)
+    hep.style.use("CMS")
+
+    PRE_CUT = ("(ak8_pt[0] > 200) and (ak8_sdmass_0 > 40) and "
+               "(ak8_sdmass_sub_mass_0 < 100) and (ak8_tau21_0 > 0) and "
+               "(ak8_tau21_0 < 0.65) and (dR_lep_ak8 > 1.3)")
+    DCB_CUT = 0.95
+    print(f"[CBPROXY] selection: {PRE_CUT} and (score_M3_cb > {DCB_CUT})")
+
+    KEEP_COLS = [
+        "ak8_sdmass_0", "dR_subjets", "ak8_nConst_0", "ak8_tau21_0",
+        "ak8_tau32_0", "ak8_tau31_0", "n_b_nearcb_L", "n_b_nearcb_M",
+        "n_c_nearcb_L", "n_c_nearcb_M", "ak8_pt_0", "pt_bL_subjet",
+        "pt_cL_subjet", "pt_ratio_subjets", "pt_asym_subjets",
+    ]
+
+    pooled = {"is_wcb": [], "weight": []}
+    for k in KEEP_COLS:
+        pooled[k] = []
+
+    metas = [m for m in sample_metas if not m.get("is_data")]
+    for i, meta in enumerate(metas):
+        s = manager.materialize(meta)
+        if s is None or s.get("array") is None:
+            print(f"[CBPROXY] {i + 1}/{len(metas)} {meta['name']}: unreadable, skip.")
+            continue
+        arr = s["array"]
+        needed = {"score_M3_cb", "mat_cat", "weights"} | set(KEEP_COLS)
+        missing = needed - set(arr.fields)
+        if missing:
+            print(f"[CBPROXY] {meta['name']}: missing {missing} in cache "
+                  f"'{cfg.cache_tag}' -- skip (delete stale cache parquets "
+                  f"for this tag and rerun if this persists).")
+            s["array"] = None
+            continue
+
+        pre_mask = eval_cut(PRE_CUT, arr)
+        dcb = ak.to_numpy(arr["score_M3_cb"])
+        mat_cat = ak.to_numpy(arr["mat_cat"])
+        sel_mask = pre_mask & (dcb > DCB_CUT) & np.isin(mat_cat, (0, 2))
+        n_hit = int(sel_mask.sum())
+        print(f"\r[CBPROXY] {i + 1}/{len(metas)} | group={s['group']:<10} "
+              f"| kept {n_hit:6d} | Mem={get_memory_mb():.1f} MB", end="")
+        if n_hit > 0:
+            pooled["is_wcb"].append((mat_cat[sel_mask] == 0))
+            pooled["weight"].append(ak.to_numpy(arr["weights"])[sel_mask].astype(np.float64))
+            for k in KEEP_COLS:
+                pooled[k].append(ak.to_numpy(arr[k])[sel_mask].astype(np.float64))
+
+        s["array"] = None
+        gc.collect()
+    print("")
+
+    is_wcb = np.concatenate(pooled["is_wcb"]) if pooled["is_wcb"] else np.array([], dtype=bool)
+    is_proxy = ~is_wcb
+    w = np.concatenate(pooled["weight"]) if pooled["weight"] else np.array([])
+    cols = {k: (np.concatenate(pooled[k]) if pooled[k] else np.array([]))
+            for k in KEEP_COLS}
+    print(f"[CBPROXY] pooled: Wcb {int(is_wcb.sum())} jets "
+          f"(sumw={w[is_wcb].sum():.3f})  |  "
+          f"t2(b'c) proxy {int(is_proxy.sum())} jets "
+          f"(sumw={w[is_proxy].sum() if is_proxy.any() else 0:.3f})")
+    if is_wcb.sum() == 0 or is_proxy.sum() == 0:
+        print("[CBPROXY] one or both categories empty after the full-sample "
+              "scan -- aborting before plotting (see counts above).")
+        return
+
+    # Persist the pooled per-jet arrays so follow-up analysis (pT-matching,
+    # reweighting, ...) can reuse this WITHOUT re-streaming all 17 samples
+    # (the expensive part -- ~16 min even on a cache hit).
+    np.savez_compressed(os.path.join(OUTDIR, "pooled.npz"),
+                        is_wcb=is_wcb, weight=w, **cols)
+    print(f"[CBPROXY] wrote {OUTDIR}/pooled.npz "
+          f"(reload with np.load for further analysis, no rerun needed)")
+
+    def col(name):
+        return cols[name]
+
+    # (key, label, lo, hi, nbins, logy, sentinel_lo) -- sentinel_lo: values
+    # <= this are "undefined" (-1/-999 in the cache) and get remapped just
+    # below `lo` so they show up as a visible dedicated first bin instead of
+    # silently vanishing or corrupting the real-value binning.
+    SPECS = [
+        ("ak8_sdmass_0",     r"$m_{SD}(J)$ [GeV]",                    40,  250, 30, False, None),
+        ("dR_subjets",       r"$\Delta R(b^{L}_{in}, c^{L}_{in})$",  -0.1, 1.6, 34, False, -0.5),
+        ("ak8_nConst_0",     r"$J$ nConstituents",                      0,  120, 30, False, None),
+        ("ak8_tau21_0",      r"$\tau_{21}(J)$",                        0,  1.0, 25, False, None),
+        ("ak8_tau32_0",      r"$\tau_{32}(J)$",                        0,  1.0, 25, False, None),
+        ("ak8_tau31_0",      r"$\tau_{31}(J)$",                        0,  1.0, 25, False, None),
+        ("n_b_nearcb_L",     r"$N_{b^{L}}$ ($\Delta R\!<\!1$ of $J$)", -0.5, 5.5, 6, False, None),
+        ("n_b_nearcb_M",     r"$N_{b^{M}}$ ($\Delta R\!<\!1$ of $J$)", -0.5, 5.5, 6, False, None),
+        ("n_c_nearcb_L",     r"$N_{c^{L}}$ ($\Delta R\!<\!1$ of $J$)", -0.5, 5.5, 6, False, None),
+        ("n_c_nearcb_M",     r"$N_{c^{M}}$ ($\Delta R\!<\!1$ of $J$)", -0.5, 5.5, 6, False, None),
+        ("ak8_pt_0",         r"$p_T(J)$ [GeV]",                      200, 1000, 32, True,  None),
+        ("pt_bL_subjet",     r"$p_T(b^{L}_{in})$ [GeV]",             -20,  600, 31, False, -10),
+        ("pt_cL_subjet",     r"$p_T(c^{L}_{in})$ [GeV]",             -20,  600, 31, False, -10),
+        ("pt_ratio_subjets", r"$p_T$ ratio (sub/lead subjet)",      -0.05, 1.0, 21, False, -0.5),
+        ("pt_asym_subjets",  r"$p_T$ asymmetry (subjets)",          -0.05, 1.0, 21, False, -0.5),
+    ]
+
+    def get_disp(key, mask, sentinel_lo, lo):
+        """Values for `key` restricted to `mask`; any value <= sentinel_lo
+        (an undefined -1/-999 slot) is remapped just inside `lo` so it shows
+        up as a visible first bin instead of vanishing or corrupting the
+        real-value binning."""
+        v = col(key)[mask]
+        if sentinel_lo is not None:
+            v = np.where(v <= sentinel_lo, lo + 1e-6, v)
+        return v
+
+    n_panels = len(SPECS)
+    ncols = 5
+    nrows = int(np.ceil(n_panels / ncols))
+    fig_m, axes_m = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.2 * nrows))
+    axes_m = np.asarray(axes_m).reshape(-1)
+
+    for i, (key, label, lo, hi, nb, logy, sentinel_lo) in enumerate(SPECS):
+        v_wcb = get_disp(key, is_wcb, sentinel_lo, lo)
+        v_prx = get_disp(key, is_proxy, sentinel_lo, lo)
+        w_wcb = w[is_wcb]
+        w_prx = w[is_proxy]
+        bins = np.linspace(lo, hi, nb + 1)
+        h_w, _ = np.histogram(v_wcb, bins=bins, weights=w_wcb)
+        h_p, _ = np.histogram(v_prx, bins=bins, weights=w_prx)
+        sw, sp = h_w.sum(), h_p.sum()
+        h_w_n = h_w / sw if sw > 0 else h_w
+        h_p_n = h_p / sp if sp > 0 else h_p
+        ctr = 0.5 * (bins[1:] + bins[:-1])
+        und_w = float((col(key)[is_wcb] <= sentinel_lo).mean()) if sentinel_lo is not None else 0.0
+        und_p = float((col(key)[is_proxy] <= sentinel_lo).mean()) if sentinel_lo is not None else 0.0
+
+        def _draw(ax, fontsize_ax=11, fontsize_leg=8, fontsize_txt=7, lw=1.8):
+            ax.step(ctr, h_w_n, where="mid", color="red", lw=lw, label="Wcb")
+            ax.step(ctr, h_p_n, where="mid", color="blue", lw=lw, label="t$^2$(b'c) proxy")
+            ax.set_xlabel(label, fontsize=fontsize_ax)
+            ax.set_ylabel("a.u. (unit area)", fontsize=fontsize_ax)
+            if logy:
+                ax.set_yscale("log")
+            ax.legend(fontsize=fontsize_leg, frameon=False)
+            if sentinel_lo is not None:
+                ax.text(0.03, 0.97, f"undef: Wcb {und_w:.1%} / prx {und_p:.1%}",
+                        transform=ax.transAxes, fontsize=fontsize_txt,
+                        va="top", ha="left")
+
+        _draw(axes_m[i])
+
+        fig, ax = plt.subplots(figsize=(6.5, 5.5))
+        _draw(ax, fontsize_ax=13, fontsize_leg=11, fontsize_txt=9, lw=2.0)
+        hep.cms.label(ax=ax, data=False, label="Simulation",
+                      rlabel=f"PRESEL, $D_{{cb}}$(M3)$>{DCB_CUT}$")
+        fig.tight_layout()
+        fig.savefig(os.path.join(OUTDIR, f"cbproxy_{key}.png"), dpi=150)
+        plt.close(fig)
+        print(f"[CBPROXY] wrote {OUTDIR}/cbproxy_{key}.png")
+
+    for j in range(n_panels, len(axes_m)):
+        axes_m[j].axis("off")
+    fig_m.suptitle(f"D_cb(M3) > {DCB_CUT}, PRESEL: Wcb (red) vs t2(b'c) proxy (blue)",
+                   fontsize=14)
+    fig_m.tight_layout(rect=(0, 0, 1, 0.97))
+    fig_m.savefig(os.path.join(OUTDIR, "cbproxy_montage.png"), dpi=140)
+    plt.close(fig_m)
+    print(f"[CBPROXY] wrote {OUTDIR}/cbproxy_montage.png")
+    print(f"[CBPROXY] done. n(Wcb)={int(is_wcb.sum())}  n(proxy)={int(is_proxy.sum())}")
+
+
+def run_cbproxy_score_reweight(cfg, manager, sample_metas):
+    """Private study (2026-09-17, user request): prototype a DOWNSTREAM
+    kinematic reweighting of t2(b'c) proxy jets (mat_cat==2) to match Wcb
+    (mat_cat==0) in (p_T(J), m_SD(J)) -- the two variables identified as the
+    actual drivers of the target/proxy mismatch (Wcb's m_SD is flat vs p_T;
+    proxy's grows with p_T) -- then check how much of that reweighting
+    closes the gap in the FULL D_cb(M3) score spectrum (not just the >0.95
+    tail; this run applies PRESEL only, no score cut, so the whole [0,1]
+    range is populated for both categories).
+
+    This does NOT touch the trained M3 model at all -- it is the "boring
+    but proven" tag-and-probe-style calibration approach (reweight the
+    control/proxy sample in kinematics, evaluate on the FIXED tagger),
+    proposed as step 1 before considering any training-time redesign
+    (uBoost-style iterative decorrelation) discussed conceptually.
+
+    Outputs go to ./cbproxy_kinematics_test/ (same private dir as the
+    D_cb>0.95 study; NOT cfg.figure_path == '.', so the real gallery is
+    untouched).
+    """
+    OUTDIR = "./cbproxy_kinematics_test"
+    ensure_dir(OUTDIR)
+    hep.style.use("CMS")
+
+    PRE_CUT = ("(ak8_pt[0] > 200) and (ak8_sdmass_0 > 40) and "
+               "(ak8_sdmass_sub_mass_0 < 100) and (ak8_tau21_0 > 0) and "
+               "(ak8_tau21_0 < 0.65) and (dR_lep_ak8 > 1.3)")
+    print(f"[CBSCORE] selection (PRESEL only, no D_cb cut): {PRE_CUT}")
+
+    KEEP_COLS = ["score_M3_cb", "ak8_pt_0", "ak8_sdmass_0"]
+    pooled = {"is_wcb": [], "weight": []}
+    for k in KEEP_COLS:
+        pooled[k] = []
+
+    metas = [m for m in sample_metas if not m.get("is_data")]
+    for i, meta in enumerate(metas):
+        s = manager.materialize(meta)
+        if s is None or s.get("array") is None:
+            print(f"[CBSCORE] {i + 1}/{len(metas)} {meta['name']}: unreadable, skip.")
+            continue
+        arr = s["array"]
+        needed = {"mat_cat", "weights"} | set(KEEP_COLS)
+        missing = needed - set(arr.fields)
+        if missing:
+            print(f"[CBSCORE] {meta['name']}: missing {missing} -- skip.")
+            s["array"] = None
+            continue
+
+        pre_mask = eval_cut(PRE_CUT, arr)
+        mat_cat = ak.to_numpy(arr["mat_cat"])
+        sel_mask = pre_mask & np.isin(mat_cat, (0, 2))
+        n_hit = int(sel_mask.sum())
+        print(f"\r[CBSCORE] {i + 1}/{len(metas)} | group={s['group']:<10} "
+              f"| kept {n_hit:7d} | Mem={get_memory_mb():.1f} MB", end="")
+        if n_hit > 0:
+            pooled["is_wcb"].append((mat_cat[sel_mask] == 0))
+            pooled["weight"].append(ak.to_numpy(arr["weights"])[sel_mask].astype(np.float64))
+            for k in KEEP_COLS:
+                pooled[k].append(ak.to_numpy(arr[k])[sel_mask].astype(np.float64))
+        s["array"] = None
+        gc.collect()
+    print("")
+
+    is_wcb = np.concatenate(pooled["is_wcb"])
+    is_proxy = ~is_wcb
+    w = np.concatenate(pooled["weight"])
+    cols = {k: np.concatenate(pooled[k]) for k in KEEP_COLS}
+    print(f"[CBSCORE] pooled (PRESEL, no D_cb cut): Wcb {int(is_wcb.sum())} jets  |  "
+          f"proxy {int(is_proxy.sum())} jets")
+
+    np.savez_compressed(os.path.join(OUTDIR, "pooled_full.npz"),
+                        is_wcb=is_wcb, weight=w, **cols)
+    print(f"[CBSCORE] wrote {OUTDIR}/pooled_full.npz")
+
+    # ---- 2D (pT, mSD) reweight of proxy -> Wcb -------------------------
+    pt = cols["ak8_pt_0"]; msd = cols["ak8_sdmass_0"]; dcb = cols["score_M3_cb"]
+    pt_bins = np.array([200, 230, 260, 300, 350, 400, 500, 650, 1000])
+    msd_bins = np.linspace(40, 250, 15)
+
+    h_wcb, _, _ = np.histogram2d(pt[is_wcb], msd[is_wcb], bins=[pt_bins, msd_bins],
+                                  weights=w[is_wcb])
+    h_prx, _, _ = np.histogram2d(pt[is_proxy], msd[is_proxy], bins=[pt_bins, msd_bins],
+                                  weights=w[is_proxy])
+    h_wcb_n = h_wcb / h_wcb.sum()
+    h_prx_n = h_prx / h_prx.sum()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(h_prx_n > 0, h_wcb_n / h_prx_n, 0.0)
+    # clip extreme per-bin factors (empty/near-empty bins) so a handful of
+    # jets don't dominate the reweighted sample
+    ratio = np.clip(ratio, 0.0, 20.0)
+
+    ipt = np.clip(np.digitize(pt[is_proxy], pt_bins) - 1, 0, len(pt_bins) - 2)
+    imsd = np.clip(np.digitize(msd[is_proxy], msd_bins) - 1, 0, len(msd_bins) - 2)
+    rw_factor = ratio[ipt, imsd]
+    w_prx_rw = w[is_proxy] * rw_factor
+
+    print(f"[CBSCORE] reweight factor: mean={rw_factor.mean():.2f} "
+          f"median={np.median(rw_factor):.2f} max={rw_factor.max():.2f}")
+
+    # ---- score_M3_cb panel: main (shape-normalized) + ratio-to-Wcb pad ----
+    bins = np.linspace(0.0, 1.0, 41)
+    ctr = 0.5 * (bins[1:] + bins[:-1])
+    hw, _ = np.histogram(dcb[is_wcb], bins=bins, weights=w[is_wcb])
+    hp0, _ = np.histogram(dcb[is_proxy], bins=bins, weights=w[is_proxy])
+    hp1, _ = np.histogram(dcb[is_proxy], bins=bins, weights=w_prx_rw)
+    hw_n = hw / hw.sum(); hp0_n = hp0 / hp0.sum(); hp1_n = hp1 / hp1.sum()
+
+    fig, (ax0, ax1) = plt.subplots(
+        2, 1, figsize=(7.2, 7.4), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.06})
+
+    ax0.step(ctr, hw_n, where="mid", color="red", lw=2.2, label="Wcb (target)")
+    ax0.step(ctr, hp0_n, where="mid", color="blue", lw=2.0, ls="--",
+              label="t$^2$(b'c) proxy (raw)")
+    ax0.step(ctr, hp1_n, where="mid", color="blue", lw=2.2,
+              label="t$^2$(b'c) proxy (p$_T$,m$_{SD}$-reweighted)")
+    ax0.set_ylabel("a.u. (unit area)")
+    ax0.set_yscale("log")
+    ax0.legend(frameon=False, fontsize=10.5, loc="upper center")
+    hep.cms.label(ax=ax0, data=False, label="Simulation",
+                  rlabel="PRESEL, no score cut")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r0 = np.where(hw_n > 0, hp0_n / hw_n, np.nan)
+        r1 = np.where(hw_n > 0, hp1_n / hw_n, np.nan)
+    ax1.axhline(1.0, color="grey", lw=1, ls=":")
+    ax1.step(ctr, r0, where="mid", color="blue", lw=1.8, ls="--", label="raw / Wcb")
+    ax1.step(ctr, r1, where="mid", color="blue", lw=2.0, label="reweighted / Wcb")
+    ax1.set_ylim(0.0, 2.5)
+    ax1.set_xlabel(r"$D_{cb}$ (M3 multiclass)")
+    ax1.set_ylabel("proxy / Wcb")
+    ax1.legend(frameon=False, fontsize=9, loc="upper left")
+
+    fig.savefig(os.path.join(OUTDIR, "cbproxy_score_reweight_PRE.png"), dpi=150)
+    plt.close(fig)
+    print(f"[CBSCORE] wrote {OUTDIR}/cbproxy_score_reweight_PRE.png")
+
+
 def main():
     t_total0 = time.time()
 
@@ -7276,6 +7666,16 @@ def main():
 
     hist_maker = Histogrammer(cfg)
     plotter = Plotter(cfg)
+
+    if args.mode == "CBPROXY":
+        run_cbproxy_kinematics(cfg, manager, sample_metas)
+        print(f"[TIME] Total: {fmt_hms(time.time() - t_total0)}")
+        return
+
+    if args.mode == "CBPROXY-SCORE":
+        run_cbproxy_score_reweight(cfg, manager, sample_metas)
+        print(f"[TIME] Total: {fmt_hms(time.time() - t_total0)}")
+        return
 
     # ------- MAT mode: matching-truth overlay only ----------
     if args.mode in ("MAT", "MAT-SIGNAL", "MAT-BKG"):

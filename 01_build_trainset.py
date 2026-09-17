@@ -47,7 +47,7 @@ Usage:
   ./.venv/bin/python 01_build_trainset.py [--config S1_tagger/config.json] [--overwrite]
 
 Step 1/3 of the S1 tagger pipeline: 01_build_trainset.py -> 02_train_tagger.py
--> 03_render_report.py (or run_s1_tagger.py to drive all three).
+-> 03_Training_report_plots.py (or run_s1_tagger.py to drive all three).
 """
 import argparse
 import hashlib

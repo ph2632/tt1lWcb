@@ -89,13 +89,13 @@ renamed so `ls` shows execution order):
 ./run_s1_tagger.py all             # dataset + train + plots
 ./run_s1_tagger.py dataset         # 01_build_trainset.py only
 ./run_s1_tagger.py train           # 02_train_tagger.py only
-./run_s1_tagger.py plots           # 03_render_report.py only (no retrain)
+./run_s1_tagger.py plots           # 03_Training_report_plots.py only (no retrain)
 
 # or run any step directly:
 ./.venv/bin/python 01_build_trainset.py   # ~10 min (streams 17 ROOT files -> EOS parquet)
 ./.venv/bin/python 02_train_tagger.py     # ~50 min (S1 only; derives class_weight_multiplier
                                            # fresh from config.json's class_weight_share every run)
-./.venv/bin/python 03_render_report.py    # ~15 s (self-bootstraps into an LCG view for PyROOT)
+./.venv/bin/python 03_Training_report_plots.py    # ~15 s (self-bootstraps into an LCG view for PyROOT)
 ```
 
 `config.json` is pure input (preselection fallback, `class_weight_share`,
@@ -124,11 +124,12 @@ scripts themselves now live at the `tt1lWcb/` root).
 | **`panel_{S1,S1p}.png`** | **2×2:  ROC │ overtraining  /  feature-importance+info │ score-by-topology** |
 
 Re-render any run's figures without retraining:
-`./.venv/bin/python 03_render_report.py --config S1_tagger/config.json`
+`./.venv/bin/python 03_Training_report_plots.py --config S1_tagger/config.json`
 
 Published into the gallery root (`:8899`), tagged per run so nothing clobbers:
-`S1_tagger_<tag>_panel_{S1,S1p}.png`, `_results_table.png`, `_roc.png`,
-plus untagged `S1_tagger_panel_latest_{S1,S1p}.png`.
+`TaggerTrain_M3cl_<tag>_*.png` (renamed 2026-09-16 from the old
+`S1_tagger_<tag>_*.png` scheme; the `_zbb` dataset-tag suffix is dropped from
+the published name as redundant).
 
 ## Wiring into Make_plots.py
 

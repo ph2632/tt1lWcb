@@ -32,11 +32,12 @@ ROOT.gErrorIgnoreLevel = ROOT.kWarning
 
 GALLERY = HERE.parent
 
-# 03_render_report.py (moved to tt1lWcb/ root, 2026-09-13; was S1_tagger/
-# XGBoost_training.py) starts with a digit, so it isn't a valid module name
-# for a plain "import" -- load it by path instead.
+# 03_Training_report_plots.py (moved to tt1lWcb/ root, 2026-09-13; was
+# S1_tagger/XGBoost_training.py; renamed from 03_render_report.py 2026-09-16)
+# starts with a digit, so it isn't a valid module name for a plain "import"
+# -- load it by path instead.
 import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location("_render_report", GALLERY / "03_render_report.py")
+_spec = _ilu.spec_from_file_location("_render_report", GALLERY / "03_Training_report_plots.py")
 _render_report = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_render_report)
 cms_style, cms_header, _axes, _legend, SQ, TXT, montage = (

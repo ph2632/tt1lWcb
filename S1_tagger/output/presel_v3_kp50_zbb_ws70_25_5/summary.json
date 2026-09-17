@@ -1,0 +1,1076 @@
+{
+  "run_stamp": "2026-09-16T23:52:33",
+  "config": {
+    "_comment": "S1 / S1' boosted-cb tagger. Inputs = the 30 independent MASS-DECORRELATED ak8_gpt_* scores (Sophon-style: a generic massive resonance X, no parent-flavour assumption, so equally valid for H+->cb). S1' adds tau21, tau32, nConstituents. Binary: signal = the 4 gen-matched W->cb jet topologies W(cb)/t2(b'c)/t2(b'b)/t3(b'bc); background = every AK8 jet from the 16 non-Vcb samples. Inputs are written p(..) in the plots so they are never confused with the truth topologies.",
+    "seed": 42,
+    "dataset_tag": "presel_v3_kp50_zbb",
+    "run_tag": "presel_v3_kp50_zbb_ws70_25_5",
+    "_run_tag_note": "output/<run_tag>/ ; dataset_tag selects the input parquet, run_tag names the training run so re-tunes never clobber.",
+    "lumi_label": "41.5 fb^{-1} (13 TeV)",
+    "cms_label": "Simulation",
+    "data_dir": "/eos/user/a/agapitos/S1_tagger_data",
+    "output_dir": "output",
+    "mc_dir": "/afs/cern.ch/user/y/youpeng/eos/RunTTH/_2017_1L/MC/scored_samples_2final_v20260902_rerun",
+    "tree": "Events",
+    "signal_sample": "ttbar-powheg_merged_Skim.root",
+    "split": {
+      "train": 70,
+      "valid": 15,
+      "test": 15
+    },
+    "weights": [
+      "xsecWeight",
+      "genWeight",
+      "lumiwgt",
+      "puWeight",
+      "trigEffWeight",
+      "l1PreFiringWeight"
+    ],
+    "preselection": {
+      "jet_pt_min": 200.0,
+      "jet_sdmass_min": 40.0,
+      "jet_tau21_max": 0.65,
+      "dr_lep_jet_min": 1.3,
+      "event_subleading_sdmass_max": 100.0
+    },
+    "train_models": [
+      "M3"
+    ],
+    "_train_models_note": "S1' dropped as the carried default (agreed: substructure adds ~0 AUC, tau21/tau32/nConstituents rank low) -- also halves wall time on this dataset size (S1 alone took 3412s in the last full run) and reduces exposure to this shared node's memory-pressure kills. Override with train.py --only S1,S1p to train both. M3 added 2026-09-13: the 4-class multiclass sibling of S1 (see M3_* keys below). 2026-09-15, user: S1 REMOVED from train_models -- 'keep only the M3 for the moment (3 classes, each binary)'; the S1 training call is also commented out in 02_train_tagger.py's main(), not just config-gated. The already-trained S1/model.json is untouched and still used by 04_Make_plots.py. Restore 'S1' here (and uncomment the loop in main()) to train it again. n_jobs is no longer hardcoded per-model (was 12) -- 02_train_tagger.py now detects the actual core count via os.sched_getaffinity(0) at runtime and overrides both xgboost.n_jobs and M3_xgboost.n_jobs, since lxplus9 nodes vary in core count.",
+    "background_keep_prob": 0.15,
+    "_background_keep_prob_note": "base build at the top of the 0.2/0.3/0.4/0.5 scan (scan_keep_prob.py); it sub-thins this dataset in-memory so the expensive ROOT read runs once. Final value picked after the scan. 2026-09-15, user: dropped 0.5->0.15 to cut training wall time (topology-0 'true bkg' is 82.6% of train rows at 0.5, tt-semi alone 68.4% of that -- thinning it is the only lever with real leverage on row count; tau21 tightening/loosening were checked and are NOT good levers, see git history). This ONLY affects the thinnable pool (mat topology 0) -- the rare signal-adjacent topologies (Wcb, t2(b'c), proxy, Zbb, QCD(bb)) are NEVER thinned regardless of this value, so their statistics are unaffected. Known tradeoff (already documented in the xgboost regularisation-scan note below): halving the background roughly doubles the residual overtraining bias -- 0.5->0.15 is more than a halving (~3.3x), so re-check the bias numbers after this rebuild+retrain; if bkg bias regresses meaningfully, consider settling between 0.15 and 0.5 rather than pushing lower.",
+    "class_weight_share": {
+      "1": 0.5,
+      "2": 0.1,
+      "3": 0.1,
+      "4": 0.1,
+      "5": 0.1,
+      "6": 0.1,
+      "7": 0.02
+    },
+    "_class_weight_share_note": "the CHOSEN quantity -- target fraction of train-split positive-class sumw per topology: multiplier_c = share_c * total_raw_sumw / raw_sumw_c. Class 6 (Z(bb)-adj) added 2026-09-12: t2_bb's previous 20% share was split into two equal 10% twins -- true t2(b'b) and its Z->bb counterpart -- since z_contamination_study.py showed the tagger cannot distinguish them (mean S1 0.797 for Z(bb)-adj vs 0.834 for true t2(b'b)); every other share is unchanged. Class 7 (QCD(bb)) added 2026-09-13: when it entered the dataset as a topology>0 signal-class member with NO explicit share, it defaulted to raw-weight multiplier 1.0 (the class_weight_lookup fallback), and its very high raw statistics visibly shifted S1's training mix enough to regress overtraining from OK (bkg 3.8%) to FAIL (bkg 15.1%). Giving it a small explicit 2% share re-tames that -- shares now sum to 1.02, not 1.0, which is harmless (the derivation formula does not require the shares to sum to exactly 1; each class's multiplier only depends on its OWN chosen share and raw sumw). Change a share here and just retrain (02_train_tagger.py) -- the multiplier is derived automatically, see class_weight_multiplier below.",
+    "class_weight_multiplier": {
+      "1": 218.0474,
+      "2": 105.5357,
+      "3": 77.174,
+      "4": 191.8259,
+      "5": 0.167,
+      "6": 9.3442,
+      "7": 0.0519
+    },
+    "_class_weight_multiplier_note": "2026-09-13: this key is now a REFERENCE SNAPSHOT only (last values derived by 02_train_tagger.py's run on presel_v3_kp50_zbb), not a pipeline input -- 02_train_tagger.py derives it fresh every run from class_weight_share + the real train-split per-class sumw (see derive_class_weight_multiplier() there) and never reads or writes this key, so it can't go stale for the main pipeline. Kept here only because scan_keep_prob.py's standalone class_weight_lookup() still reads this key directly; update it by hand (or fix that script to self-derive too) if you change class_weight_share and want the scan to match. Historical context: unweighted, the 5 signal sub-classes' train-split sumw was Wcb 0.38% / t2_bc 0.16% / t2_bb 0.21% / t3_bbc 0.09% / t2_bc_proxy 99.16% (proxy pulled unthinned from the whole 16-sample background pool, Cabibbo-favoured W->cs vastly outnumbers the dedicated Vcb sample) -- the BDT loss was ~99% 'find a proxy-like jet' and Wcb was noise in the gradient. Applied at LOAD time to TRAIN and VALID weight only -- TEST is left at raw physics weight so reported AUC/working-points/per-class efficiency stay physically meaningful.",
+    "M3_class_groups": {
+      "0": 0,
+      "1": 1,
+      "2": 1,
+      "5": 1,
+      "3": 2,
+      "6": 2,
+      "7": 2,
+      "4": 3
+    },
+    "_M3_class_groups_note": "2026-09-13: topology code -> M3 (4-class multiclass: bkg/cb/bb/bbc) class label. cb-like = codes 1,2,5 (Wcb, t2_bc, t2_bc_proxy); bb-like = codes 3,6,7 (t2_bb, Z(bb)-adj, QCD(bb) -- see M3_topo_subshare for the within-class 60/36/4 split; t2_bb/Zbb kept together with QCD(bb) since z_contamination_study.py shows the tagger cannot separate t2_bb/Zbb from the AK8 jet's own inputs alone, and QCD(bb) -- genuine gen-matched QCD-origin bb-bar, see build_trainset.py -- is the same kind of object again; the planned j*-flavour analysis-level cut is a separate follow-on, not part of this model); bbc-like = code 4 (t3_bbc); everything else (code 0) = background.",
+    "M3_class_names": [
+      "bkg",
+      "cb",
+      "bb",
+      "bbc"
+    ],
+    "M3_class_weight_share": {
+      "0": 0.5,
+      "1": 0.35,
+      "2": 0.1,
+      "3": 0.05
+    },
+    "_M3_class_weight_share_note": "2026-09-13: like class_weight_share, but keyed by the M3 class label (0..3, matching M3_class_names) INCLUDING background -- multi:softprob has no scale_pos_weight equivalent, so background/signal balance must be baked into sample_weight here directly (see derive_multiclass_weight_multiplier() in 02_train_tagger.py), unlike the binary path where scale_pos_weight handles it automatically. Default derived from class_weight_share's existing cb:bb:bbc ratio (which summed to 1.0 over signal only: cb pool codes 1+2+5 = 0.5+0.1+0.1 = 0.7, bb pool codes 3+6 = 0.1+0.1 = 0.2, bbc code 4 = 0.1) rescaled into a 50% combined-signal budget (0.7*0.5=0.35, 0.2*0.5=0.10, 0.1*0.5=0.05) plus an explicit 50% background share chosen to roughly match the effective signal:background balance S1's scale_pos_weight already gives it -- a first-pass choice, not yet tuned; revisit once M3's overtraining/AUC numbers exist.",
+    "M3_topo_subshare": {
+      "1": {
+        "1": 0.7,
+        "2": 0.25,
+        "5": 0.05
+      },
+      "2": {
+        "3": 0.6,
+        "6": 0.36,
+        "7": 0.04
+      }
+    },
+    "_M3_topo_subshare_note": "2026-09-13, user: within the 'bb' class (label 2)'s own 10% overall share, split 60% t2(b'b) / 36% Z(bb)-adj / 4% QCD(bb) -- t2(b'b) prioritised as requested, QCD(bb) capped low because its gen-matched population is tiny (2026-09-13 investigation: ~1.5% of QCD-sample AK8 jets have >=2 hadron-flavour-b AK4 jets in-cone) so 'accept all these events' rather than force a larger share onto a handful of jets. Within the 'cb' class (label 1): FIRST attempt (2026-09-13) used the aggressive 2:1 Wcb-vs-whole-t2(b'c)-family split (Wcb=0.6667, t2_bc=0.0009 natural, proxy=0.3324 natural). 2026-09-14 UPDATE (user, after seeing this push M3 into WARN across the board): moved to an explicit 60/20/20 (Wcb/t2_bc/proxy). Investigated first: cb's own WARN was shown to be driven by the bkg(rest) side (5.1-5.6%), NOT the sig side (0.7%, healthy at either split) -- so this subshare change does not target cb's actual overtraining driver, but is kept as the user's explicit physics-priority choice. Side effect to watch: topo2 (true t2_bc, only 18.9k/4.0k raw train/test events) needs its multiplier raised from ~4.3 (at 0.09% target) to ~960 (at 20% target, ~220x) since its raw sumw is tiny (~0.16% of the cb pool) -- this concentrates much more gradient weight onto a small event population, a similar order of magnitude to bbc's already stats-limited topo4 (10.4k/2.1k), so a new topo2-specific overfitting contribution is plausible and expected, not a bug if seen. Classes not listed here (bbc) are unaffected -- they fall back to natural raw-sumw proportions within the class, i.e. today's single-multiplier-per-class behaviour.",
+    "features_S1": [
+      "ak8_gpt_bb",
+      "ak8_gpt_cc",
+      "ak8_gpt_bc",
+      "ak8_gpt_bs",
+      "ak8_gpt_cs",
+      "ak8_gpt_qq",
+      "ak8_gpt_ss",
+      "ak8_gpt_tauhtauh",
+      "ak8_gpt_qcdb",
+      "ak8_gpt_qcdbb",
+      "ak8_gpt_qcdc",
+      "ak8_gpt_qcdcc",
+      "ak8_gpt_qcdothers",
+      "ak8_gpt_topbwc",
+      "ak8_gpt_topbwcs",
+      "ak8_gpt_topbwq",
+      "ak8_gpt_topbwqq",
+      "ak8_gpt_topbws",
+      "ak8_gpt_topwqq",
+      "ak8_gpt_topwcs",
+      "ak8_gpt_lepq",
+      "ak8_gpt_qcd"
+    ],
+    "_features_S1_note": "22 nodes (2026-09-13: +ak8_gpt_qcd, was 21) = the 30-node ak8_gpt_* set (all minus the 2 REMAINING parent sums topbw/topw) with the 10 leptonic top/W-decay categories merged into one ak8_gpt_lepq = their sum, PLUS the QCD parent sum ak8_gpt_qcd re-added on top of its own 5 children (qcdb/qcdbb/qcdc/qcdcc/qcdothers), on the hypothesis (user, 2026-09-13) that the parent softmax output is not a pure arithmetic sum of the 5 children (unlike the verified-lossless lepq merge) and may carry its own separation power from the model's learned QCD-flavour-composition weighting. If it turns out to be an exact linear combination of the 5 children already in the list, a tree model gains nothing from it (permutation importance should then read ~0) -- next training's permutation-importance ranking is the direct test. topbw/topw stay excluded (not requested). The 10 leptonic top/W-decay categories are mutually-exclusive sub-classes of one GloParT parent softmax, so THEIR sum (lepq) is a verified lossless union probability, not a dropped feature -- and all 10 individually contributed <0.0012 permutation AUC (9 of 10 below 0.001; physically expected since our AK8 jet is a hadronic W->cb candidate). cc/qcdbb/qcdcc/topbwcs/qq/ss/tauhtauh were also individually <0.001 but are NOT merged: they are physically distinct categories (not mutually-exclusive sub-classes of one summed parent), so low permutation importance there means 'not needed for this S:B split', not 'redundant' -- kept as-is per instruction.",
+    "derived_features": {
+      "ak8_gpt_lepq": [
+        "ak8_gpt_topbwev",
+        "ak8_gpt_topbwmv",
+        "ak8_gpt_topbwtauev",
+        "ak8_gpt_topbwtauhv",
+        "ak8_gpt_topbwtaumv",
+        "ak8_gpt_topwev",
+        "ak8_gpt_topwmv",
+        "ak8_gpt_topwtauev",
+        "ak8_gpt_topwtauhv",
+        "ak8_gpt_topwtaumv"
+      ]
+    },
+    "_derived_features_note": "computed at LOAD time in train.py/scan_keep_prob.py (df[name] = df[components].sum(axis=1)) -- the raw components stay in the parquet (build_trainset.py always writes them) so this is a train-time-only reduction, reversible with no rebuild. topbwtaumv (auc_drop 0.00113, the highest of the 10) is included for physical consistency of the group; flag if you want it split out separately instead.",
+    "features_S1p_extra": [
+      "ak8_tau21",
+      "ak8_tau32",
+      "ak8_nConstituents"
+    ],
+    "xgboost": {
+      "n_estimators": 4000,
+      "max_depth": 2,
+      "learning_rate": 0.05,
+      "subsample": 0.5,
+      "colsample_bytree": 0.5,
+      "min_child_weight": 300,
+      "reg_lambda": 20.0,
+      "objective": "binary:logistic",
+      "eval_metric": "auc",
+      "tree_method": "hist",
+      "n_jobs": 6,
+      "early_stopping_rounds": 50
+    },
+    "_xgboost_note": "point D3 of the regularisation scans: depth 2, min_child_weight 300, subsample 0.5. Background training bias 6.1% (from 14.2%), converges at ~620 of 4000 trees so early stopping decides, 45 s/model. reg_alpha HURTS (10.6%) and max_delta_step does not help. Regularisation saturates ~6%: the residual bias is statistics-limited (halving the background doubles it), so <5% needs background_keep_prob 0.15 -> ~0.40 and a dataset rebuild.",
+    "M3_xgboost": {
+      "n_estimators": 6000,
+      "max_depth": 2,
+      "learning_rate": 0.05,
+      "subsample": 0.4,
+      "colsample_bytree": 0.4,
+      "min_child_weight": 800,
+      "reg_lambda": 50.0,
+      "objective": "multi:softprob",
+      "eval_metric": "mlogloss",
+      "tree_method": "hist",
+      "n_jobs": 6,
+      "early_stopping_rounds": 25
+    },
+    "_M3_xgboost_note": "2026-09-13: SEPARATE, MORE REGULARISED than S1's xgboost block (reused unchanged for S1) -- first-run M3 (identical params to S1) FAILED overtraining on all 3 classes (bias: cb bkg 21.9%, bb sig 13.6%/bkg 15.4%, bbc bkg 144.4%). bbc's own raw test-split stats are tiny (2132 raw events, sumw 3.98) after a target share (5%) that upweights it heavily -- that number is dominated by statistics, not pure overfitting, and won't fully resolve without more raw bbc events (there aren't any more in this MC). cb's asymmetric bias (sig 0.1% / bkg 21.9%) with bkg's own huge stats (1.03M test) pointed at genuine overfitting coupled THROUGH the shared softmax (bbc's severe overfit perturbs every class's logit, since softmax normalises across all 4 at once) rather than a background-specific stats problem -- hence stronger GLOBAL regularisation (higher min_child_weight/reg_lambda, lower subsample/colsample, earlier stopping) as the lever, not a per-class knob (multiclass has no per-class regularisation). Retune this block if bias is still unacceptable after a run; do not just copy S1's numbers back. 2026-09-14: n_estimators 4000->6000 -- the previous full run's validation mlogloss was STILL (very slightly) improving at the 4000-round cap, i.e. early_stopping_rounds=30 never fired, so training was capped rather than converged; letting it run to a genuine early stop costs little (the tail improvement was tiny, ~1.4e-4 over the last 100 rounds) but removes the artificial cap as a confound when reading the next run's bias numbers. 2026-09-15, user: chose between 25/30/35/40 -- replayed the ACTUAL last run's training_history.json (real M3 fit, not a toy) through each patience value: esr=30 is exactly what happened (stopped at round 4196, best at 4166). esr=25 would have stopped 673 rounds earlier (round 3523, best_i=3498) at val_mlogloss 0.55392 vs the true best 0.55276 -- a 0.21% relative cost for ~1225s (~20 min) saved. esr=35/40 give ZERO extra rounds beyond 30 (the real run's last 10 recorded values are flat within 2e-5, so there's nothing more to find past round ~4170 anyway). 25 is the clear pick: real, measurable time savings for a negligible, explicitly-quantified accuracy cost; 35/40 have no evidence of any benefit at all. n_jobs is no longer read from here at runtime -- 02_train_tagger.py overrides it via os.sched_getaffinity(0) (kept as 12 here only as a fallback default for standalone scripts that read this file directly, e.g. scan_keep_prob.py).",
+    "raw_sum_baseline": [
+      "ak8_gpt_bc",
+      "ak8_gpt_bb",
+      "ak8_gpt_topbwc"
+    ],
+    "permutation_repeats": 3,
+    "overtrain_score_cut": 0.6,
+    "benchmark_bkg_eff": [
+      0.05,
+      0.01,
+      0.001
+    ],
+    "compare_models": {
+      "Dbc_old_8node": "train_bdt/dbc_bdt_output/bdt_dbc_model.pkl",
+      "Dbc_3class_expanded": "/eos/user/y/youpeng/research/wcb/BoostedDbcTrain/dbc_3class_v1/output_inclusive_v1/models/expanded/model.json"
+    },
+    "_features_S1p_note": "S1' = the 30 GloParT nodes + tau21 + tau32 + nConstituents",
+    "_private_scan_note": "PRIVATE subshare scan (2026-09-16, user request) -- cb-class (topology 1) M3_topo_subshare only, testing Wcb/t2bc-true/proxy = {'1': 0.7, '2': 0.25, '5': 0.05} vs the tracked config's 60/20/20. dataset_tag unchanged (reuses the already-built parquet); run_tag changed so output lands in its own S1_tagger/output/<run_tag>/ directory, never touching the main presel_v3_kp50_zbb run. 02_train_tagger.py itself is NOT modified -- this is a config-only variant."
+  },
+  "dataset_dir": "/eos/user/a/agapitos/S1_tagger_data/presel_v3_kp50_zbb",
+  "dataset_counts": {
+    "train": {
+      "1": 45711,
+      "2": 18931,
+      "3": 25860,
+      "4": 10413,
+      "5": 573505,
+      "6": 136000,
+      "7": 179609,
+      "0": 1413215
+    },
+    "valid": {
+      "1": 9934,
+      "2": 4055,
+      "3": 5515,
+      "4": 2282,
+      "5": 123022,
+      "6": 28922,
+      "7": 38392,
+      "0": 303051
+    },
+    "test": {
+      "1": 9585,
+      "2": 4047,
+      "3": 5548,
+      "4": 2132,
+      "5": 122208,
+      "6": 29271,
+      "7": 38307,
+      "0": 303121
+    }
+  },
+  "dataset_sumw": {
+    "train": {
+      "sig": 37409.81843431178,
+      "bkg": 448903.3627234457
+    },
+    "valid": {
+      "sig": 8034.953136240752,
+      "bkg": 99731.31900385636
+    },
+    "test": {
+      "sig": 7997.922610433981,
+      "bkg": 94854.74489517773
+    }
+  },
+  "split_note": "train 70 / valid 15 (early stop) / test 15 (held out)",
+  "models": {
+    "M3": {
+      "features": [
+        "ak8_gpt_bb",
+        "ak8_gpt_cc",
+        "ak8_gpt_bc",
+        "ak8_gpt_bs",
+        "ak8_gpt_cs",
+        "ak8_gpt_qq",
+        "ak8_gpt_ss",
+        "ak8_gpt_tauhtauh",
+        "ak8_gpt_qcdb",
+        "ak8_gpt_qcdbb",
+        "ak8_gpt_qcdc",
+        "ak8_gpt_qcdcc",
+        "ak8_gpt_qcdothers",
+        "ak8_gpt_topbwc",
+        "ak8_gpt_topbwcs",
+        "ak8_gpt_topbwq",
+        "ak8_gpt_topbwqq",
+        "ak8_gpt_topbws",
+        "ak8_gpt_topwqq",
+        "ak8_gpt_topwcs",
+        "ak8_gpt_lepq",
+        "ak8_gpt_qcd"
+      ],
+      "n_features": 22,
+      "class_names": [
+        "bkg",
+        "cb",
+        "bb",
+        "bbc"
+      ],
+      "class_weight_multiplier": {
+        "0": 0.5508,
+        "1": 1158.992,
+        "2": 1001.7077,
+        "5": 0.317,
+        "3": 502.291,
+        "6": 36.4902,
+        "7": 0.1126,
+        "4": 1040.4246
+      },
+      "best_iteration": 5948,
+      "fit_seconds": 4637.3,
+      "params": {
+        "n_estimators": 6000,
+        "max_depth": 2,
+        "learning_rate": 0.05,
+        "subsample": 0.4,
+        "colsample_bytree": 0.4,
+        "min_child_weight": 800,
+        "reg_lambda": 50.0,
+        "objective": "multi:softprob",
+        "eval_metric": "mlogloss",
+        "tree_method": "hist",
+        "n_jobs": 6,
+        "early_stopping_rounds": 25,
+        "random_state": 42,
+        "num_class": 4
+      },
+      "feature_importance": [
+        {
+          "feature": "ak8_gpt_qcdothers",
+          "gain": 88.42932891845703,
+          "weight": 2616.0,
+          "cover": 19834.287109375,
+          "score": 0.8407830993731196
+        },
+        {
+          "feature": "ak8_gpt_bb",
+          "gain": 81.147216796875,
+          "weight": 4051.0,
+          "cover": 18314.25390625,
+          "score": 0.9090183141909031
+        },
+        {
+          "feature": "ak8_gpt_bc",
+          "gain": 72.93083190917969,
+          "weight": 3464.0,
+          "cover": 19064.6015625,
+          "score": 0.8407998687942034
+        },
+        {
+          "feature": "ak8_gpt_topbwc",
+          "gain": 58.391868591308594,
+          "weight": 3099.0,
+          "cover": 18159.599609375,
+          "score": 0.7426293920799223
+        },
+        {
+          "feature": "ak8_gpt_qcdbb",
+          "gain": 56.158294677734375,
+          "weight": 3501.0,
+          "cover": 19951.443359375,
+          "score": 0.7936852539501095
+        },
+        {
+          "feature": "ak8_gpt_qcdc",
+          "gain": 45.75633239746094,
+          "weight": 2648.0,
+          "cover": 18949.669921875,
+          "score": 0.6695288446944504
+        },
+        {
+          "feature": "ak8_gpt_qcdb",
+          "gain": 30.410913467407227,
+          "weight": 2734.0,
+          "cover": 18091.314453125,
+          "score": 0.6061158069834874
+        },
+        {
+          "feature": "ak8_gpt_topbwq",
+          "gain": 28.556869506835938,
+          "weight": 2448.0,
+          "cover": 19668.955078125,
+          "score": 0.5988351739363539
+        },
+        {
+          "feature": "ak8_gpt_topwcs",
+          "gain": 24.84968376159668,
+          "weight": 3357.0,
+          "cover": 19558.1796875,
+          "score": 0.6580254084626432
+        },
+        {
+          "feature": "ak8_gpt_topbwqq",
+          "gain": 21.625642776489258,
+          "weight": 2373.0,
+          "cover": 19705.6171875,
+          "score": 0.5670767771403702
+        },
+        {
+          "feature": "ak8_gpt_topbws",
+          "gain": 19.70610809326172,
+          "weight": 2484.0,
+          "cover": 18683.853515625,
+          "score": 0.5539222671345042
+        },
+        {
+          "feature": "ak8_gpt_cc",
+          "gain": 17.865568161010742,
+          "weight": 3019.0,
+          "cover": 20580.56640625,
+          "score": 0.6189483746219997
+        },
+        {
+          "feature": "ak8_gpt_bs",
+          "gain": 17.2092227935791,
+          "weight": 3158.0,
+          "cover": 17144.416015625,
+          "score": 0.5772911958468586
+        },
+        {
+          "feature": "ak8_gpt_cs",
+          "gain": 16.74701690673828,
+          "weight": 3644.0,
+          "cover": 22626.826171875,
+          "score": 0.6963046800107467
+        },
+        {
+          "feature": "ak8_gpt_ss",
+          "gain": 16.62618064880371,
+          "weight": 2746.0,
+          "cover": 19004.4375,
+          "score": 0.5685937505868003
+        },
+        {
+          "feature": "ak8_gpt_qcdcc",
+          "gain": 13.976285934448242,
+          "weight": 2386.0,
+          "cover": 17660.005859375,
+          "score": 0.5091768219170923
+        },
+        {
+          "feature": "ak8_gpt_topbwcs",
+          "gain": 12.676475524902344,
+          "weight": 3077.0,
+          "cover": 17665.513671875,
+          "score": 0.5612167303357382
+        },
+        {
+          "feature": "ak8_gpt_qq",
+          "gain": 12.639155387878418,
+          "weight": 2138.0,
+          "cover": 19256.265625,
+          "score": 0.5072457809847105
+        },
+        {
+          "feature": "ak8_gpt_qcd",
+          "gain": 11.11485481262207,
+          "weight": 2719.0,
+          "cover": 18159.54296875,
+          "score": 0.533150400958899
+        },
+        {
+          "feature": "ak8_gpt_topwqq",
+          "gain": 9.444010734558105,
+          "weight": 3108.0,
+          "cover": 18073.94921875,
+          "score": 0.5575997831286532
+        },
+        {
+          "feature": "ak8_gpt_lepq",
+          "gain": 8.408269882202148,
+          "weight": 3017.0,
+          "cover": 17632.056640625,
+          "score": 0.5396978444279948
+        },
+        {
+          "feature": "ak8_gpt_tauhtauh",
+          "gain": 6.954051494598389,
+          "weight": 2644.0,
+          "cover": 17982.671875,
+          "score": 0.5086893598928263
+        }
+      ],
+      "permutation_importance": [
+        {
+          "feature": "ak8_gpt_cs",
+          "auc_drop": 0.045658615979119944,
+          "auc_drop_err": 0.0001745564474999606
+        },
+        {
+          "feature": "ak8_gpt_bc",
+          "auc_drop": 0.028154893871400948,
+          "auc_drop_err": 8.813097310629444e-05
+        },
+        {
+          "feature": "ak8_gpt_qcdbb",
+          "auc_drop": 0.02610250186606533,
+          "auc_drop_err": 0.0005556602218797845
+        },
+        {
+          "feature": "ak8_gpt_bb",
+          "auc_drop": 0.025611275724509386,
+          "auc_drop_err": 0.0004406525317237237
+        },
+        {
+          "feature": "ak8_gpt_topbwc",
+          "auc_drop": 0.018616498420115108,
+          "auc_drop_err": 3.99347731283322e-05
+        },
+        {
+          "feature": "ak8_gpt_qcdc",
+          "auc_drop": 0.017185856927692072,
+          "auc_drop_err": 0.0001842501566281314
+        },
+        {
+          "feature": "ak8_gpt_ss",
+          "auc_drop": 0.013062787308586787,
+          "auc_drop_err": 0.00021020660368384944
+        },
+        {
+          "feature": "ak8_gpt_qcdb",
+          "auc_drop": 0.010950682147573517,
+          "auc_drop_err": 7.406282081159657e-05
+        },
+        {
+          "feature": "ak8_gpt_cc",
+          "auc_drop": 0.010723584531584692,
+          "auc_drop_err": 6.531838242850739e-05
+        },
+        {
+          "feature": "ak8_gpt_topwqq",
+          "auc_drop": 0.00811314679251455,
+          "auc_drop_err": 0.00013310246059815035
+        },
+        {
+          "feature": "ak8_gpt_topbwq",
+          "auc_drop": 0.007237964252789404,
+          "auc_drop_err": 7.68099617108091e-05
+        },
+        {
+          "feature": "ak8_gpt_bs",
+          "auc_drop": 0.00629190401934232,
+          "auc_drop_err": 0.00019082771026756345
+        },
+        {
+          "feature": "ak8_gpt_qq",
+          "auc_drop": 0.006256137568157312,
+          "auc_drop_err": 0.00017804372145797207
+        },
+        {
+          "feature": "ak8_gpt_topwcs",
+          "auc_drop": 0.00508223767389715,
+          "auc_drop_err": 9.763061549994468e-05
+        },
+        {
+          "feature": "ak8_gpt_qcd",
+          "auc_drop": 0.004209631897118797,
+          "auc_drop_err": 3.8321539922716096e-05
+        },
+        {
+          "feature": "ak8_gpt_qcdcc",
+          "auc_drop": 0.0034888600925854587,
+          "auc_drop_err": 0.00010906849354783309
+        },
+        {
+          "feature": "ak8_gpt_topbwcs",
+          "auc_drop": 0.002684567869686886,
+          "auc_drop_err": 4.585993083518493e-05
+        },
+        {
+          "feature": "ak8_gpt_topbws",
+          "auc_drop": 0.0025046774169631783,
+          "auc_drop_err": 0.0001825765898644523
+        },
+        {
+          "feature": "ak8_gpt_qcdothers",
+          "auc_drop": 0.0020199315458810188,
+          "auc_drop_err": 5.245111165266444e-05
+        },
+        {
+          "feature": "ak8_gpt_lepq",
+          "auc_drop": 0.0015834478852082186,
+          "auc_drop_err": 2.9052881614929915e-06
+        },
+        {
+          "feature": "ak8_gpt_topbwqq",
+          "auc_drop": 0.0015762662898604802,
+          "auc_drop_err": 5.898917736275118e-05
+        },
+        {
+          "feature": "ak8_gpt_tauhtauh",
+          "auc_drop": 0.0005015435109623212,
+          "auc_drop_err": 1.616338429066946e-05
+        }
+      ],
+      "macro_auc_ovr_test": 0.9273137887987233,
+      "n_train": 2403244,
+      "train": {
+        "log_loss": 0.5341029649932604,
+        "n": 2403244
+      },
+      "valid": {
+        "log_loss": 0.5508240403059395,
+        "n": 515173
+      },
+      "test": {
+        "log_loss": 0.3827834750981249,
+        "n": 514219
+      },
+      "per_class": {
+        "cb": {
+          "auc_ovr": 0.8857838858138183,
+          "working_points": [
+            {
+              "target_bkg_eff": 0.05,
+              "bkg_eff": 0.04999745352964936,
+              "threshold": 0.5913013815879822,
+              "signal_eff": 0.5283712464432482
+            },
+            {
+              "target_bkg_eff": 0.01,
+              "bkg_eff": 0.009984396968299352,
+              "threshold": 0.8225094676017761,
+              "signal_eff": 0.283886455318057
+            },
+            {
+              "target_bkg_eff": 0.001,
+              "bkg_eff": 0.0010011709772121894,
+              "threshold": 0.9470690488815308,
+              "signal_eff": 0.06952925947922507
+            }
+          ],
+          "sig_eff_at_1e-3_bkg": 0.06952925947922163,
+          "overtraining": {
+            "score_cut": 0.6,
+            "frac_train_sig": 0.6039489609376862,
+            "frac_test_sig": 0.5974703800238521,
+            "rel_diff_sig_pct": 1.0843350784310837,
+            "ks_sig_D": 0.0020424395147181224,
+            "ks_sig_p": 0.7376380890035488,
+            "frac_train_bkg": 0.0647599113125407,
+            "frac_test_bkg": 0.06635997608114443,
+            "rel_diff_bkg_pct": 2.411189489651375,
+            "ks_bkg_D": 0.0009798345769758132,
+            "ks_bkg_p": 0.9255617951342665,
+            "worst_rel_diff_pct": 2.411189489651375,
+            "verdict": "OK"
+          },
+          "permutation_importance": [
+            {
+              "feature": "ak8_gpt_cs",
+              "auc_drop": 0.10738390844093419,
+              "auc_drop_err": 4.603519489291179e-05
+            },
+            {
+              "feature": "ak8_gpt_bc",
+              "auc_drop": 0.057191603420733816,
+              "auc_drop_err": 9.601946124023256e-05
+            },
+            {
+              "feature": "ak8_gpt_topbwc",
+              "auc_drop": 0.04877808073761899,
+              "auc_drop_err": 0.00010440600281374234
+            },
+            {
+              "feature": "ak8_gpt_cc",
+              "auc_drop": 0.024390446667443683,
+              "auc_drop_err": 0.00024716894949238226
+            },
+            {
+              "feature": "ak8_gpt_topwqq",
+              "auc_drop": 0.015138782595305026,
+              "auc_drop_err": 3.704168205765838e-05
+            },
+            {
+              "feature": "ak8_gpt_qq",
+              "auc_drop": 0.011875615707469311,
+              "auc_drop_err": 0.000153388240241618
+            },
+            {
+              "feature": "ak8_gpt_bb",
+              "auc_drop": 0.01170187989602097,
+              "auc_drop_err": 0.00021024572264824495
+            },
+            {
+              "feature": "ak8_gpt_topwcs",
+              "auc_drop": 0.009855438238102235,
+              "auc_drop_err": 0.00022735957070174783
+            },
+            {
+              "feature": "ak8_gpt_qcdc",
+              "auc_drop": 0.007281573252623796,
+              "auc_drop_err": 3.830060316600701e-05
+            },
+            {
+              "feature": "ak8_gpt_bs",
+              "auc_drop": 0.00726573324919888,
+              "auc_drop_err": 7.769678601298801e-05
+            },
+            {
+              "feature": "ak8_gpt_topbwq",
+              "auc_drop": 0.005382007888653802,
+              "auc_drop_err": 0.00011515634398860757
+            },
+            {
+              "feature": "ak8_gpt_qcdcc",
+              "auc_drop": 0.0049602949669389496,
+              "auc_drop_err": 0.00010392067533635338
+            },
+            {
+              "feature": "ak8_gpt_qcdothers",
+              "auc_drop": 0.0039471112742212044,
+              "auc_drop_err": 7.05392650667748e-05
+            },
+            {
+              "feature": "ak8_gpt_qcdb",
+              "auc_drop": 0.0036357780499362744,
+              "auc_drop_err": 2.9523363793966538e-05
+            },
+            {
+              "feature": "ak8_gpt_qcd",
+              "auc_drop": 0.003385472413704719,
+              "auc_drop_err": 5.956503329488022e-05
+            },
+            {
+              "feature": "ak8_gpt_topbwcs",
+              "auc_drop": 0.002462539758988025,
+              "auc_drop_err": 7.00815507147854e-05
+            },
+            {
+              "feature": "ak8_gpt_topbwqq",
+              "auc_drop": 0.0021016199910506295,
+              "auc_drop_err": 8.897024771919552e-05
+            },
+            {
+              "feature": "ak8_gpt_topbws",
+              "auc_drop": 0.0012934222577715149,
+              "auc_drop_err": 0.0001561883275506486
+            },
+            {
+              "feature": "ak8_gpt_lepq",
+              "auc_drop": 0.0012124023356861653,
+              "auc_drop_err": 3.9877050920643635e-05
+            },
+            {
+              "feature": "ak8_gpt_ss",
+              "auc_drop": 1.3863019827087264e-05,
+              "auc_drop_err": 0.00019918363855683083
+            },
+            {
+              "feature": "ak8_gpt_tauhtauh",
+              "auc_drop": -0.00013223084098823445,
+              "auc_drop_err": 4.144632150120507e-05
+            },
+            {
+              "feature": "ak8_gpt_qcdbb",
+              "auc_drop": -0.0016977012016062831,
+              "auc_drop_err": 4.9679303590682e-05
+            }
+          ]
+        },
+        "bb": {
+          "auc_ovr": 0.9393498898413166,
+          "working_points": [
+            {
+              "target_bkg_eff": 0.05,
+              "bkg_eff": 0.04999990519960316,
+              "threshold": 0.11403954774141312,
+              "signal_eff": 0.727344905033523
+            },
+            {
+              "target_bkg_eff": 0.01,
+              "bkg_eff": 0.010001587486412522,
+              "threshold": 0.37977349758148193,
+              "signal_eff": 0.4837677180517526
+            },
+            {
+              "target_bkg_eff": 0.001,
+              "bkg_eff": 0.0009989447729485065,
+              "threshold": 0.8557093739509583,
+              "signal_eff": 0.1906950589381837
+            }
+          ],
+          "sig_eff_at_1e-3_bkg": 0.1906950589381847,
+          "overtraining": {
+            "score_cut": 0.6,
+            "frac_train_sig": 0.4846803446498342,
+            "frac_test_sig": 0.4839016218012025,
+            "rel_diff_sig_pct": 0.1609258604534387,
+            "ks_sig_D": 0.00280698707671323,
+            "ks_sig_p": 0.7285516254182403,
+            "frac_train_bkg": 0.00937389932105627,
+            "frac_test_bkg": 0.009779014140913752,
+            "rel_diff_bkg_pct": 4.142695920262041,
+            "ks_bkg_D": 0.001833378101660954,
+            "ks_bkg_p": 0.17352808198934266,
+            "worst_rel_diff_pct": 4.142695920262041,
+            "verdict": "OK"
+          },
+          "permutation_importance": [
+            {
+              "feature": "ak8_gpt_bb",
+              "auc_drop": 0.06638299013210969,
+              "auc_drop_err": 0.0007708335677197196
+            },
+            {
+              "feature": "ak8_gpt_qcdbb",
+              "auc_drop": 0.04927728736820843,
+              "auc_drop_err": 0.0014475681206771406
+            },
+            {
+              "feature": "ak8_gpt_bc",
+              "auc_drop": 0.017874610515022222,
+              "auc_drop_err": 0.00020396663214661718
+            },
+            {
+              "feature": "ak8_gpt_cs",
+              "auc_drop": 0.013726209824666213,
+              "auc_drop_err": 0.0004436460407314438
+            },
+            {
+              "feature": "ak8_gpt_cc",
+              "auc_drop": 0.011826080028325414,
+              "auc_drop_err": 0.0002565063002762908
+            },
+            {
+              "feature": "ak8_gpt_topbwq",
+              "auc_drop": 0.01018567199998103,
+              "auc_drop_err": 0.0002853898425495688
+            },
+            {
+              "feature": "ak8_gpt_qcdb",
+              "auc_drop": 0.009714450037962044,
+              "auc_drop_err": 4.291071067800734e-05
+            },
+            {
+              "feature": "ak8_gpt_ss",
+              "auc_drop": 0.007852401445033705,
+              "auc_drop_err": 0.0003349449034584333
+            },
+            {
+              "feature": "ak8_gpt_bs",
+              "auc_drop": 0.007297688538125846,
+              "auc_drop_err": 0.00024761308789326384
+            },
+            {
+              "feature": "ak8_gpt_qcd",
+              "auc_drop": 0.005210402494203348,
+              "auc_drop_err": 9.612053722724432e-05
+            },
+            {
+              "feature": "ak8_gpt_qcdcc",
+              "auc_drop": 0.00465270517907479,
+              "auc_drop_err": 0.00015282318379383346
+            },
+            {
+              "feature": "ak8_gpt_qcdc",
+              "auc_drop": 0.003925674761906972,
+              "auc_drop_err": 0.0002027266885090403
+            },
+            {
+              "feature": "ak8_gpt_topwqq",
+              "auc_drop": 0.003649062283787733,
+              "auc_drop_err": 0.0002443312655041305
+            },
+            {
+              "feature": "ak8_gpt_lepq",
+              "auc_drop": 0.0033584177639368975,
+              "auc_drop_err": 0.00011411497284875416
+            },
+            {
+              "feature": "ak8_gpt_qq",
+              "auc_drop": 0.003226095979209457,
+              "auc_drop_err": 0.00019262946872427824
+            },
+            {
+              "feature": "ak8_gpt_topbws",
+              "auc_drop": 0.003130571895076706,
+              "auc_drop_err": 5.4781802768194986e-05
+            },
+            {
+              "feature": "ak8_gpt_topbwcs",
+              "auc_drop": 0.0016235196980018591,
+              "auc_drop_err": 0.00011665918505823849
+            },
+            {
+              "feature": "ak8_gpt_topbwc",
+              "auc_drop": 0.0014403307762245188,
+              "auc_drop_err": 0.0001236799321982186
+            },
+            {
+              "feature": "ak8_gpt_topwcs",
+              "auc_drop": 0.001434587817137678,
+              "auc_drop_err": 6.193655933626415e-05
+            },
+            {
+              "feature": "ak8_gpt_qcdothers",
+              "auc_drop": 0.0005220901651269427,
+              "auc_drop_err": 0.00010887762788340133
+            },
+            {
+              "feature": "ak8_gpt_topbwqq",
+              "auc_drop": 0.00028245113428804203,
+              "auc_drop_err": 0.00012951302751766086
+            },
+            {
+              "feature": "ak8_gpt_tauhtauh",
+              "auc_drop": -0.00029558693313765555,
+              "auc_drop_err": 3.594764480308979e-05
+            }
+          ]
+        },
+        "bbc": {
+          "auc_ovr": 0.9741826613237163,
+          "working_points": [
+            {
+              "target_bkg_eff": 0.05,
+              "bkg_eff": 0.04999942304001935,
+              "threshold": 0.06659193336963654,
+              "signal_eff": 0.8711575158179662
+            },
+            {
+              "target_bkg_eff": 0.01,
+              "bkg_eff": 0.010000559254156502,
+              "threshold": 0.2905733585357666,
+              "signal_eff": 0.6338765589715171
+            },
+            {
+              "target_bkg_eff": 0.001,
+              "bkg_eff": 0.0010002988356645963,
+              "threshold": 0.737764835357666,
+              "signal_eff": 0.2692973296787334
+            }
+          ],
+          "sig_eff_at_1e-3_bkg": 0.269297329678733,
+          "overtraining": {
+            "score_cut": 0.6,
+            "frac_train_sig": 0.4107015213570695,
+            "frac_test_sig": 0.40039775093614555,
+            "rel_diff_sig_pct": 2.5733836908007937,
+            "ks_sig_D": 0.030311547713575582,
+            "ks_sig_p": 0.07578224812200629,
+            "frac_train_bkg": 0.004618884228668415,
+            "frac_test_bkg": 0.004853770827761251,
+            "rel_diff_bkg_pct": 4.839260184049008,
+            "ks_bkg_D": 0.0013243457215693644,
+            "ks_bkg_p": 0.4496835081621574,
+            "worst_rel_diff_pct": 4.839260184049008,
+            "verdict": "OK"
+          },
+          "permutation_importance": [
+            {
+              "feature": "ak8_gpt_qcdc",
+              "auc_drop": 0.047064704994603614,
+              "auc_drop_err": 0.0007272089730706921
+            },
+            {
+              "feature": "ak8_gpt_qcdbb",
+              "auc_drop": 0.04553055730050918,
+              "auc_drop_err": 0.000647721991399545
+            },
+            {
+              "feature": "ak8_gpt_ss",
+              "auc_drop": 0.043289949791405026,
+              "auc_drop_err": 0.0006905607388924078
+            },
+            {
+              "feature": "ak8_gpt_qcdb",
+              "auc_drop": 0.027600978807543752,
+              "auc_drop_err": 0.0003820489085849432
+            },
+            {
+              "feature": "ak8_gpt_bc",
+              "auc_drop": 0.01746355618416336,
+              "auc_drop_err": 0.0003572136610976885
+            },
+            {
+              "feature": "ak8_gpt_topwqq",
+              "auc_drop": 0.013199021349882564,
+              "auc_drop_err": 0.0003461736056856371
+            },
+            {
+              "feature": "ak8_gpt_cs",
+              "auc_drop": 0.012810736581803797,
+              "auc_drop_err": 0.00046079613041617425
+            },
+            {
+              "feature": "ak8_gpt_topbwq",
+              "auc_drop": 0.005708700669606492,
+              "auc_drop_err": 0.0005098074696898114
+            },
+            {
+              "feature": "ak8_gpt_bs",
+              "auc_drop": 0.004881116114259713,
+              "auc_drop_err": 0.00035263808745059685
+            },
+            {
+              "feature": "ak8_gpt_bb",
+              "auc_drop": 0.004747373289126777,
+              "auc_drop_err": 0.0009053067115015607
+            },
+            {
+              "feature": "ak8_gpt_topbws",
+              "auc_drop": 0.004353331950368393,
+              "auc_drop_err": 0.0005527218439512051
+            },
+            {
+              "feature": "ak8_gpt_topbwc",
+              "auc_drop": 0.003352656979799251,
+              "auc_drop_err": 0.00023603441891559095
+            },
+            {
+              "feature": "ak8_gpt_topbwqq",
+              "auc_drop": 0.0031434548577640906,
+              "auc_drop_err": 0.00014413422128448837
+            },
+            {
+              "feature": "ak8_gpt_topbwcs",
+              "auc_drop": 0.00294831881166339,
+              "auc_drop_err": 0.00023159000383341443
+            },
+            {
+              "feature": "ak8_gpt_qcd",
+              "auc_drop": 0.002590551070444221,
+              "auc_drop_err": 6.778231888923301e-05
+            },
+            {
+              "feature": "ak8_gpt_qcdcc",
+              "auc_drop": 0.0025469573740165563,
+              "auc_drop_err": 0.00023179572453831617
+            },
+            {
+              "feature": "ak8_gpt_qcdothers",
+              "auc_drop": 0.002328323431889675,
+              "auc_drop_err": 0.00015543726501932349
+            },
+            {
+              "feature": "ak8_gpt_tauhtauh",
+              "auc_drop": 0.0022100826146667085,
+              "auc_drop_err": 4.2924936873195e-05
+            },
+            {
+              "feature": "ak8_gpt_lepq",
+              "auc_drop": 0.0018241749173272999,
+              "auc_drop_err": 5.906890687463056e-05
+            },
+            {
+              "feature": "ak8_gpt_cc",
+              "auc_drop": 0.0016711987005822253,
+              "auc_drop_err": 0.00022491684765976405
+            },
+            {
+              "feature": "ak8_gpt_topwcs",
+              "auc_drop": 0.0011368901297540424,
+              "auc_drop_err": 0.00037545405062891285
+            },
+            {
+              "feature": "ak8_gpt_qq",
+              "auc_drop": -0.00011558675746973594,
+              "auc_drop_err": 0.00016896337799977753
+            }
+          ]
+        }
+      },
+      "confusion_matrix_row_normalised": [
+        [
+          0.8927139702158092,
+          0.09566125904077738,
+          0.007559118147344811,
+          0.004065652596068412
+        ],
+        [
+          0.29139788178009574,
+          0.658729619015982,
+          0.038159054643181256,
+          0.01171344456074106
+        ],
+        [
+          0.23550277988934507,
+          0.224240379783797,
+          0.47229621119169013,
+          0.06796062913516765
+        ],
+        [
+          0.09023757620845838,
+          0.2729435674291157,
+          0.10615701101584128,
+          0.5306618453465846
+        ]
+      ]
+    }
+  },
+  "comparison_test_auc": {
+    "Dbc_old_8node": 0.8532960231242538,
+    "Dbc3_bc": 0.6893826940708292,
+    "Dbc3_bb": 0.8422782534440705,
+    "Dbc3_bc_plus_bb": 0.893620457104989,
+    "raw_cb": 0.6970260505501057,
+    "raw_cb_bb": 0.8367979170598513,
+    "raw_sum_bc_bb_topbwc": 0.8573283736045922
+  }
+}

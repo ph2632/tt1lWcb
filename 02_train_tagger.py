@@ -24,13 +24,13 @@ train split's real per-class sumw (2026-09-13 -- previously a separate shell
 step wrote it into config.json, which could silently go stale if
 class_weight_share was edited without re-running that step). config.json
 therefore only carries class_weight_share now; the derived numbers are
-printed below and baked into summary.json's "config" for 03_render_report.py.
+printed below and baked into summary.json's "config" for 03_Training_report_plots.py.
 
 Usage:
   ./.venv/bin/python 02_train_tagger.py [--config S1_tagger/config.json]
 
 Step 2/3 of the S1 tagger pipeline: 01_build_trainset.py -> 02_train_tagger.py
--> 03_render_report.py (or run_s1_tagger.py to drive all three).
+-> 03_Training_report_plots.py (or run_s1_tagger.py to drive all three).
 """
 import argparse
 import datetime
@@ -752,7 +752,7 @@ def main():
     # 2026-09-15 bugfix: summary.json is written FRESH every run (the dict
     # literal above), so a model skipped THIS run (e.g. S1, parked below)
     # simply has no entry -- even though its model.json/eval.npz are still
-    # sitting on disk untouched. 03_render_report.py hard-requires an "S1"
+    # sitting on disk untouched. 03_Training_report_plots.py hard-requires an "S1"
     # entry and exits immediately without one. Carry forward any PRIOR
     # summary.json's entry for a model not in model_list this run, so the
     # render step keeps working off the still-valid last-trained artifacts
@@ -875,7 +875,7 @@ def main():
     print("  XGBoost: " + ", ".join(f"{k}={v}" for k, v in cfg["xgboost"].items()
                                     if not k.startswith("_")))
     if not args.no_report:
-        print("\n  (render plots with:  ./.venv/bin/python 03_render_report.py)")
+        print("\n  (render plots with:  ./.venv/bin/python 03_Training_report_plots.py)")
     print()
     _done_banner(t_wall0, outdir)
 
