@@ -3,11 +3,13 @@
 import os
 import re
 import gc
+import json
 import time
 import shutil
 import argparse
 import subprocess
 import psutil
+from pathlib import Path
 import numpy as np
 import awkward as ak
 import uproot
@@ -76,7 +78,7 @@ class Config:
 
         self.tree_name = "Events"
 
-        self.figure_path = "."
+        self.figure_path = os.environ.get("WCB_FIGURE_PATH", ".")
         # ./cache_batch_parquet is a symlink onto youpeng's read-only EOS, so a
         # new cache_tag (below) cannot be written there. Point the cache at a
         # writable area; override with $WCB_CACHE_DIR.
@@ -257,7 +259,7 @@ class Config:
         #   build_trainset.py) -- for the new REGIONS-mode m(J) plots and
         #   any other MAT plot's background breakdown. New raw branch +
         #   changed mat_cat values -> full re-derive.
-        self.cache_tag = "derived_v28_m3cb_v1"
+        self.cache_tag = "derived_v30_tridrsum_v1"
 
         # ------------------------------------------------------------------
         # Switches
@@ -373,6 +375,7 @@ class Config:
             "score_Dbc3_bb": r"$D_{bb}$ (3cl)",
             "score_S1": r"$S_{1}(bc)$",
             "score_M3_cb": r"$D_{cb}$ (M3)",
+            "ak8_gpt_Jrank_0": r"$J$-rank (bc+bb+topbwc)",
             "score_S2": r"$S_{2}(bb)$",
             "score_S3": r"$S_{3}(bbc)$",
             "score_SC": r"$S_{\mathrm{EVT}}$",
@@ -1019,7 +1022,7 @@ _CACHE_RUNTIME_INPUT_COLUMNS = frozenset({
     "ak8_sdmass_maxmass_0", "ak8_sdmass_sub_mass_0",
     "score_cata_top_bq_norm", "score_cata_top_bqq_norm",
     "ak8_gpt_bc_0", "ak8_gpt_cc_0", "ak8_gpt_bb_0",
-    "ak8_gpt_bs_0", "ak8_gpt_cs_0", "ak8_gpt_qq_0",
+    "ak8_gpt_bs_0", "ak8_gpt_cs_0", "ak8_gpt_qq_0", "ak8_gpt_topbwc_0",
     # gpt_qcd_sum5 (5 QCD sub-nodes) + gpt_t_btaunu (3 b'Wtaunu sub-nodes)
     # runtime sums (2026-09-07, user) -- tiny float32 scalars.
     "ak8_gpt_qcdbb_0", "ak8_gpt_qcdb_0", "ak8_gpt_qcdcc_0",
@@ -2397,7 +2400,7 @@ class DataManager:
         #                525                            for the residual bin.
         #   SENTINEL only when J itself is missing (mSD(J) <= 0).
         _mjc_in = {"ak8_sdmass_0", "jstar_flav", "jstar_flav_nowin"}
-        _mjc_out = ("mJ_jstar_cat",)
+        _mjc_out = ("mJ_jstar_cat", "mSD_jstar_4block")
         if _want(*_mjc_out) and arr is not None and _mjc_in <= set(arr.fields):
             _mJ = ak.to_numpy(arr["ak8_sdmass_0"]).astype(np.float64)
             _jf = ak.to_numpy(arr["jstar_flav"]).astype(np.float64)
@@ -2418,6 +2421,61 @@ class DataManager:
                          np.where(_mJ_ok, 525.0, SENTINEL)))
             arr = ak.with_field(
                 arr, _composite.astype(np.float32), "mJ_jstar_cat")
+
+            # ---- 4-block mSD(J) composite by j* case, uniform range --------
+            # (2026-09-18, user): simpler sibling of mJ_jstar_cat -- ONE mass
+            # sub-range mSD(J) in [50,200) at 10 GeV/bin (15 regular bins per
+            # block), plus ONE GLOBAL underflow bin (mSD<50) and ONE GLOBAL
+            # overflow bin (mSD>=200) shared across all 4 j*-cases (2026-09-18
+            # follow-up, user: "underflows & overflows will have jets
+            # collectively regardless of the j* case" -- previously each
+            # block had its OWN u/f-o/f edge bin; that duplication is gone).
+            # Layout along the composite x-axis (10 GeV/bin throughout, 64
+            # bins x 10 GeV = 640 total; 2026-09-18, user: "set 64 bins
+            # instead and let empty the 2nd and the one before the last so
+            # the underflow and the overflow will not touch the real
+            # spectra" -- 2 always-empty 1-bin spacers added, right after
+            # the u/f bin and right before the o/f bin):
+            #   [0,10)     global underflow                       (bin 1)
+            #   [10,20)    EMPTY spacer                            (bin 2)
+            #   [20,170)   block 0: j* = b_L   (jstar_flav==2)     (bins 3-17)
+            #   [170,320)  block 1: j* = c_L   (jstar_flav==1)     (bins 18-32)
+            #   [320,470)  block 2: j* = q, not b_L/c_L (==0)      (bins 33-47)
+            #   [470,620)  block 3: j* N/A, no j* found (==-1)     (bins 48-62)
+            #   [620,630)  EMPTY spacer                            (bin 63)
+            #   [630,640)  global overflow                        (bin 64)
+            # SENTINEL only when J itself is missing (mSD(J) <= 0).
+            #
+            # 2026-09-18 BUGFIX (user: "these plots do not present yields all
+            # bins ... likely due to some old cut on mSD(J)~60-130"): jstar_flav
+            # is only computed WITHIN the merge window mSD(J) in [40,130]
+            # (WCB_TTRECO_MRG_MSD_LO/HI) -- outside it, jstar_flav is the raw
+            # SENTINEL (a large negative constant), not -1. The old `default=
+            # -1.0` fallback below meant SENTINEL jets fell through to that
+            # SAME -1.0 value, which then FAILED `_blk4 >= 0.0` (real "N/A" is
+            # coded 3.0, not -1.0) and got silently dropped from ALL 4 blocks
+            # -- every jet with mSD(J) > 130 (or < 40, moot since preselection
+            # already requires mSD(J) > 40) vanished instead of landing in
+            # block 3. This spec has no mass-window restriction of its own,
+            # so out-of-window jets are just as valid a "no j*-case
+            # determined" jet as an in-window jf==-1 one -- default now maps
+            # straight to 3.0 (N/A) instead of -1.0, and every jet with a
+            # valid mSD(J) is guaranteed one of the 4 blocks.
+            _blk4 = np.select(
+                [_jf == 2.0, _jf == 1.0, _jf == 0.0],
+                [0.0, 1.0, 2.0], default=3.0)
+            _has_blk4 = _mJ_ok & (_blk4 >= 0.0)
+            _uf4 = _has_blk4 & (_mJ < 50.0)
+            _of4 = _has_blk4 & (_mJ >= 200.0)
+            _reg4 = _has_blk4 & ~_uf4 & ~_of4
+            _local4 = np.clip(_mJ - 50.0, 0.0, 150.0 - 1e-6)
+            _composite4 = np.select(
+                [_uf4, _of4, _reg4],
+                [5.0, 635.0, 20.0 + 150.0 * _blk4 + _local4],
+                default=SENTINEL)
+            arr = ak.with_field(
+                arr, _composite4.astype(np.float32), "mSD_jstar_4block")
+
             del (_mJ, _jf, _jfnw, _mJ_ok, _in_lo, _blk_lo, _take_lo,
                  _in_hi, _blk_hi, _composite)
         elif _want(*_mjc_out) and arr is not None:
@@ -2425,6 +2483,21 @@ class DataManager:
                 if _nm not in arr.fields:
                     arr = ak.with_field(
                         arr, np.full(_N, SENTINEL, dtype=np.float32), _nm)
+
+        # -- ak8_gpt_Jrank_0: the composite score J itself was CHOSEN BY -------
+        # (2026-09-17, user): same 3-node sum used at candidate-selection time
+        # (ak8_gpt_bc + ak8_gpt_bb + ak8_gpt_topbwc, see the J-rank comment
+        # above _cand_ak8), re-exposed here as J's OWN value of that score so
+        # it can be plotted / cut on directly. Runtime-only (not baked into
+        # the parquet cache) since it's a trivial sum of 3 already-cached
+        # leading-scalar columns -- no cache_tag bump needed.
+        _jr_in = {"ak8_gpt_bc_0", "ak8_gpt_bb_0", "ak8_gpt_topbwc_0"}
+        if _want("ak8_gpt_Jrank_0") and _jr_in <= set(arr.fields):
+            _jr = (ak.to_numpy(arr["ak8_gpt_bc_0"]).astype(np.float32)
+                   + ak.to_numpy(arr["ak8_gpt_bb_0"]).astype(np.float32)
+                   + ak.to_numpy(arr["ak8_gpt_topbwc_0"]).astype(np.float32))
+            arr = ak.with_field(arr, _jr, "ak8_gpt_Jrank_0")
+            del _jr
 
         gc.collect()
         return arr
@@ -3247,6 +3320,19 @@ class DataManager:
                 ak.firsts(_mtri[_idr], axis=1), -1.0))
             mass_bbc_minDR = np.where(_hasT, _mdr, -1.0).astype(np.float32)
 
+            # tri_dRsum_bbc (2026-09-18, user): the summed pairwise dR of that
+            # SAME most-collimated (b^L,b^L,c^L) triplet -- i.e. how tight the
+            # candidate 3-jet system actually is, exposed as its own variable
+            # (previously only used internally to RANK the triplet for
+            # mass_bbc_minDR, never itself saved). A genuine t^3(b'bc) has all
+            # 3 partons merged into ONE AK8 -> its best AK4 triplet should
+            # come out tight; a t^3(b'cq) proxy only has ONE real b (top's
+            # own b'), so any 2nd "b" in the triplet is combinatorial/fake ->
+            # expect a looser (or absent, sentinel -1) triplet.
+            _dRsum_best = ak.to_numpy(ak.fill_none(
+                ak.firsts(_dRsum[_idr], axis=1), -1.0))
+            tri_dRsum_bbc = np.where(_hasT, _dRsum_best, -1.0).astype(np.float32)
+
             _imt = ak.argmin(np.abs(_mtri - 172.5), axis=1, keepdims=True)
             _mmt = ak.to_numpy(ak.fill_none(
                 ak.firsts(_mtri[_imt], axis=1), -1.0))
@@ -3254,6 +3340,7 @@ class DataManager:
         else:
             mass_bbc_minDR = np.full(n, -1.0, dtype=np.float32)
             mass_bbc_bestmt = np.full(n, -1.0, dtype=np.float32)
+            tri_dRsum_bbc = np.full(n, -1.0, dtype=np.float32)
 
         # -- min Delta-phi between a loose b-tag and a loose c-tag AK4 jet ------
         # Same object set as minDR_bc (all b^L x c^L AK4 pairs) but ranked by
@@ -3911,6 +3998,7 @@ class DataManager:
             "mass_cL_nearb": mass_cL_nearb,
             "mass_bc_bestmW": mass_bc_bestmW,
             "mass_bbc_minDR": mass_bbc_minDR,
+            "tri_dRsum_bbc": tri_dRsum_bbc,
             "mass_bbc_bestmt": mass_bbc_bestmt,
             "minDphi_bc": minDphi_bc,
             "mSD_minus_mbc": mSD_minus_mbc,
@@ -5025,6 +5113,36 @@ class Plotter:
             ax_ratio.set_ylabel(
                 r"component / total " + ("signal" if signal_only else "bkg"),
                 fontsize=_lp_fs(10), labelpad=2)
+        elif cfg.get("_topo3_lowerpad") and not normalize:
+            # 2026-09-17, user: for a score that TARGETS one specific signal
+            # topology (e.g. D_bb targets t^2(b'b)), the generic 5-line-S
+            # significance is not the useful number to show -- instead, show
+            # how the (still-shared) total S splits, per bin, into 3 hand-
+            # picked topology groups relevant to which region this score is
+            # selecting: (Wcb + t^2(b'c)), t^2(b'b), t^3(b'bc). Colours reuse
+            # the upper-panel per-topology colours directly (no legend --
+            # the upper-panel legend already keys them).
+            _z = np.zeros(len(bins) - 1)
+            _tot_S = sum((abs_hists[k] for k in SIGNAL_KEYS if k in abs_hists),
+                        start=_z.copy())
+            _groups = [
+                ("cb+b'c", ("Wcb", "Wcb_tmrg_bc"), _c_sig["Wcb"]),
+                ("b'b",    ("Wcb_tmrg_bb",),        _c_sig["Wcb_tmrg_bb"]),
+                ("b'bc",   ("Cat_Top_bbc",),        _c_sig["Cat_Top_bbc"]),
+            ]
+            valid = _tot_S > 0
+            for _glabel, _gkeys, _gcolor in _groups:
+                _gsum = sum((abs_hists[k] for k in _gkeys if k in abs_hists),
+                           start=_z.copy())
+                _frac = np.full(len(_tot_S), np.nan)
+                _frac[valid] = _gsum[valid] / _tot_S[valid]
+                ax_ratio.plot(np.repeat(bins, 2)[1:-1],
+                             _stepify(np.where(valid, _frac, np.nan)),
+                             color=_gcolor, linewidth=1.8, solid_joinstyle="miter")
+            ax_ratio.axhline(1.0, color="0.6", linestyle=":", linewidth=1)
+            ax_ratio.set_ylim(0.0, cfg.get("sigonly_ymax") or 1.05)
+            ax_ratio.set_ylabel(r"topology / total signal $S$",
+                                fontsize=_lp_fs(10), labelpad=2)
         elif normalize:
             # NORM: shape ratio  (W->cb =J) / (t->bc), both unit-area
             wcb, top = shape_hists["Wcb"], shape_hists["Cat_Top_bc"]
@@ -5224,7 +5342,15 @@ class Plotter:
             # extra headroom for the enlarged in-axes legends -- more for the
             # categorical composition plot (ja_truth) whose tallest bin is a
             # narrow spike that would otherwise poke into the 3 legends.
-            _hr = 2.6 if cfg.get("xticklabels") else 1.7
+            # ymax_headroom_abs (2026-09-18, user: "set the y-axis max to 2x
+            # the max bin yield") -- an ABSOLUTE headroom factor that
+            # bypasses the shared 2.6/1.7 base entirely, for specs that want
+            # an exact, predictable multiple instead of "base x extra bonus".
+            _hr_abs = cfg.get("ymax_headroom_abs")
+            if _hr_abs is not None:
+                _hr = float(_hr_abs)
+            else:
+                _hr = (2.6 if cfg.get("xticklabels") else 1.7) * cfg.get("ymax_headroom_mult", 1.0)
             ax.set_ylim(0.0, _ymax * _hr)
             # powers-of-10 tick labels (1e5, ...) rather than "200000"
             ax.ticklabel_format(axis="y", style="sci", scilimits=(-2, 3))
@@ -5239,7 +5365,7 @@ class Plotter:
                      "Wcb_res", "Wcb_total", "Wcb_nomt"]
         _t_keys   = ["Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq"]
-        _v_keys   = ["Wcq", "Wqq_light", "Zbb", "Zcc", "Zlight", "Rest"]
+        _v_keys   = ["Wcq", "Wqq_light", "Zbb", "Zcc", "Zlight", "QCD_bb", "Rest"]
         _hmap = {l: h for h, l in zip(*ax.get_legend_handles_labels())}
 
         # Legend style -- IDENTICAL for MAT and MAT-SIGNAL (2026-09-04, user):
@@ -5291,8 +5417,14 @@ class Plotter:
         # Selection tag: shown after "Simulation" in the CMS label and appended
         # to the PNG filename so PRE / SR plot sets don't clobber each other.
         _sel = str(cfg.get("_sel", "PRE")).upper()
+        # 2026-09-18, user: "the naming convention will be 'SR3b' not
+        # 'SR3B' ... in the plot text" -- display-only (the CLI token,
+        # _SELECTIONS key and filename suffix all stay uppercase "SR3B").
         _sel_label = {"PRE": "Preselection", "SR": "SR",
-                      "JB": "jb-Region"}.get(_sel, _sel)
+                      "JB": "jb-Region",
+                      "SR1A": "SR1a", "SR1B": "SR1b",
+                      "SR2A": "SR2a", "SR2B": "SR2b",
+                      "SR3A": "SR3a", "SR3B": "SR3b"}.get(_sel, _sel)
         if signal_only:
             _sel_label += " (signal only)"
         elif bkg_only:
@@ -5347,11 +5479,12 @@ class Plotter:
         # (2026-09-06, user).
         _vlines = cfg.get("vlines")
         if _vlines:
+            _vlw = 1.1 * cfg.get("vline_width_mult", 1.0)
             for _vx in _vlines:
                 ax.axvline(_vx, ymin=0.0, ymax=0.25, color="0.35",
-                           linestyle=(0, (4, 3)), linewidth=1.1, zorder=1)
+                           linestyle=(0, (4, 3)), linewidth=_vlw, zorder=1)
                 ax_ratio.axvline(_vx, ymin=0.0, ymax=0.25, color="0.35",
-                                 linestyle=(0, (4, 3)), linewidth=1.1, zorder=1)
+                                 linestyle=(0, (4, 3)), linewidth=_vlw, zorder=1)
 
         # Optional per-block condition labels (spec "block_labels" key:
         # [(x_data, text), ...]) -- spells out the j* condition defining
@@ -5364,6 +5497,7 @@ class Plotter:
         # blocks dodge the annotations individually (2026-09-06, user).
         _blabels = cfg.get("block_labels")
         if _blabels:
+            _blfs_mult = cfg.get("block_label_fontsize_mult", 1.0)
             for _i, _bl in enumerate(_blabels):
                 _bx, _btxt = _bl[0], _bl[1]
                 _by = _bl[2] if len(_bl) > 2 else (0.60 if _i % 2 == 0 else 0.82)
@@ -5372,7 +5506,7 @@ class Plotter:
                 ax_ratio.text(_bx, _by, _btxt,
                               transform=ax_ratio.get_xaxis_transform(),
                               ha="center", va="center",
-                              fontsize=(11.0 if _lp2x else 9.0),
+                              fontsize=(11.0 if _lp2x else 9.0) * _blfs_mult,
                               color="0.20", clip_on=False)
 
         # Optional explanatory caption (spec "caption" key): a small grey text
@@ -5396,7 +5530,9 @@ class Plotter:
         # region) so the two plot sets never clobber each other; "_norm" for
         # NORM-mode so it doesn't clobber the ABS-mode PNG of the same observable.
         _sel_suffix = {"PRE": "_PRE", "SR": "_SR", "JB": "_JB",
-                       "SR1": "_SR1", "SR2": "_SR2", "SR3": "_SR3"}.get(_sel, "")
+                       "SR1A": "_SR1A", "SR1B": "_SR1B",
+                       "SR2A": "_SR2A", "SR2B": "_SR2B",
+                       "SR3A": "_SR3A", "SR3B": "_SR3B"}.get(_sel, "")
         _suffix = (_sel_suffix + ("_sig" if signal_only else "")
                    + ("_bkg" if bkg_only else "")
                    + ("_norm" if normalize else ""))
@@ -6281,24 +6417,57 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     # Common preselection applied to ALL three selections.
     # tau21(J) is guarded with > 0 so SENTINEL (-999) jets are not let
     # through by the "< 0.6" test.
+    # 2026-09-17, user: generous background-thinning cut on J-rank (the same
+    # bc+bb+topbwc composite that selects J -- see ak8_gpt_Jrank_0 in
+    # _attach_runtime_fields), applied at PRESELECTION (and therefore in
+    # every derived selection below) and in 01_build_trainset.py's own copy
+    # of this cut (S1_tagger/presel.py's _MAP + config.json's jrank_min
+    # fallback) so it also thins the training set. 0.01 sits well below
+    # where any signal-adjacent category has real density (checked against
+    # MAT_ak8_gpt_Jrank_0_PRE.png) and squarely in the steep low-end falloff
+    # of the dominant junk backgrounds (Rest/W(cq)/W(qq)).
     _COMMON = ("(ak8_tau21_0 > 0) and (ak8_tau21_0 < 0.65) and "
-               "(dR_lep_ak8 > 1.3)")
+               "(dR_lep_ak8 > 1.3) and (ak8_gpt_Jrank_0 > 0.01)")
     # PRE and SR only (2026-09-04, user):
     #   m(J) > 40  (cb-candidate AK8)   AND   m(j^2) < 100  (2nd-heaviest AK8).
     _MJ12 = "(ak8_sdmass_0 > 40) and (ak8_sdmass_sub_mass_0 < 100)"
+    # 2-bin-optimal SR windows (2026-09-18, user: "automate this when we run
+    # 03*.py to propagate changes also at 04*.py") -- 03_Training_report_
+    # plots.py re-derives these every run and writes S1_tagger/sr_cuts.json;
+    # read that here instead of a second, hand-maintained copy of the
+    # numbers. Written as 2 FLAT (unindented) lines, no try/except or helper
+    # call: S1_tagger/presel.py lifts this whole _COMMON..CUT= block out by
+    # text and exec()s it fully DEDENTED in an otherwise-empty namespace, so
+    # anything indented breaks (IndentationError) and anything needing a
+    # name presel.py hasn't injected (a function defined elsewhere, an
+    # import) breaks (NameError) -- presel.py injects json/Path/__file__
+    # for exactly this line to keep working there too.
+    _sr_cuts_path = Path(__file__).resolve().parent / "S1_tagger" / "sr_cuts.json"
+    _sr_cuts = (json.loads(_sr_cuts_path.read_text())["sr_cuts"] if _sr_cuts_path.exists()
+                else {"cb": (0.80, 0.95), "bb": (0.80, 0.95), "bbc": (0.50, 0.80)})
     _SELECTIONS = {
         "PRE": "(ak8_pt[0] > 200) and " + _MJ12 + " and " + _COMMON,
         "SR":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
                    + _MJ12 + " and " + _COMMON),
         "JB":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
                    "(score_SC > 0.05) and " + _COMMON),
-        # 2026-09-17, user: 3 M3-based signal regions, one per one-vs-rest
-        # class score, each at a plain >0.5 cut on top of PRESEL.
-        "SR1":    ("(ak8_pt[0] > 200) and (score_M3_cb > 0.5) and "
+        # 2026-09-18, user: retired the single plain >0.5 SR1/SR2/SR3 bands in
+        # favour of 6 fixed-window sub-regions, "a" (looser) and "b"
+        # (tighter) per class -- these ARE the analysis SRs now, no longer
+        # just m3_overtrain_figure diagnostic annotations, and the windows
+        # themselves now come from _sr_cuts above (2-bin-optimal, re-derived
+        # per training run) rather than being hardcoded here.
+        "SR1A":   (f"(ak8_pt[0] > 200) and (score_M3_cb > {_sr_cuts['cb'][0]}) and "
+                   f"(score_M3_cb <= {_sr_cuts['cb'][1]}) and " + _MJ12 + " and " + _COMMON),
+        "SR1B":   (f"(ak8_pt[0] > 200) and (score_M3_cb > {_sr_cuts['cb'][1]}) and "
                    + _MJ12 + " and " + _COMMON),
-        "SR2":    ("(ak8_pt[0] > 200) and (score_S2 > 0.5) and "
+        "SR2A":   (f"(ak8_pt[0] > 200) and (score_S2 > {_sr_cuts['bb'][0]}) and "
+                   f"(score_S2 <= {_sr_cuts['bb'][1]}) and " + _MJ12 + " and " + _COMMON),
+        "SR2B":   (f"(ak8_pt[0] > 200) and (score_S2 > {_sr_cuts['bb'][1]}) and "
                    + _MJ12 + " and " + _COMMON),
-        "SR3":    ("(ak8_pt[0] > 200) and (score_S3 > 0.5) and "
+        "SR3A":   (f"(ak8_pt[0] > 200) and (score_S3 > {_sr_cuts['bbc'][0]}) and "
+                   f"(score_S3 <= {_sr_cuts['bbc'][1]}) and " + _MJ12 + " and " + _COMMON),
+        "SR3B":   (f"(ak8_pt[0] > 200) and (score_S3 > {_sr_cuts['bbc'][1]}) and "
                    + _MJ12 + " and " + _COMMON),
     }
     CUT = _SELECTIONS.get(str(sel).upper(), _SELECTIONS["PRE"])
@@ -6307,7 +6476,9 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     def m(name, var, lo, hi, nb, xlabel, logy, truth_only=False, logx=False,
           xticklabels=None, caption=None, vlines=None, block_labels=None,
           xticks=None, xtick_rotation=None, hide_total_signal=False,
-          sig_ymax=None, sigonly_ymax=None):
+          sig_ymax=None, sigonly_ymax=None,
+          block_label_fontsize_mult=1.0, vline_width_mult=1.0,
+          ymax_headroom_mult=1.0, ymax_headroom_abs=None):
         # logx: log-spaced bin edges + log x-axis (lo must be > 0).
         # xticklabels: list of strings -> categorical x-axis.  Ticks default
         # to the bin centres (one label per bin); pass `xticks` (data-coord
@@ -6356,6 +6527,22 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
             "hide_total_signal": hide_total_signal,
             "sig_ymax": sig_ymax,
             "sigonly_ymax": sigonly_ymax,
+            # per-spec overrides for the shared block_labels/vlines styling
+            # (2026-09-18, user -- default 1.0 leaves every other composite
+            # spec, e.g. ttreco_mJ_jstar_cat, byte-identical).
+            "block_label_fontsize_mult": block_label_fontsize_mult,
+            "vline_width_mult": vline_width_mult,
+            # upper-pad linear-mode max-yield headroom multiplier (2026-09-18,
+            # user: "set upper pad-yaxis max max-yields x5 to avoid
+            # histo-legend overlaps") -- default 1.0 leaves every other spec
+            # byte-identical; multiplies the existing `_hr` factor at its use
+            # site in draw_matching().
+            "ymax_headroom_mult": ymax_headroom_mult,
+            # ABSOLUTE headroom override (2026-09-18, user: "set the y-axis
+            # max to 2x the max bin yield") -- bypasses the shared 2.6/1.7
+            # base + ymax_headroom_mult entirely when set; None (default)
+            # leaves every other spec byte-identical.
+            "ymax_headroom_abs": ymax_headroom_abs,
         }
 
     # =====================================================================
@@ -6520,6 +6707,71 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
          # sigonly_ymax.  Drop the dotted "Total signal" overlay; lower-pad
          # y-max 0.65 for MAT (signal+bkg), 1.2 for MAT-SIGNAL.
          True, 0.65, 1.2),
+        # 62-bin composite (2026-09-18, user, extended): mSD(J) by j* case,
+        # simpler sibling of ttreco_mJ_jstar_cat -- ONE mass sub-range
+        # [50,200) GeV at 10 GeV/bin (15 regular bins/block now, was 10/block
+        # over [50,150)), split 4 ways by the window-gated jstar_flav:
+        #   block 0: j* = b_L                    (jstar_flav==2)
+        #   block 1: j* = c_L                    (jstar_flav==1)
+        #   block 2: j* = q, not b_L/c_L          (jstar_flav==0)
+        #   block 3: j* N/A, no j* found          (jstar_flav==-1)
+        # Underflow (mSD<50) and overflow (mSD>=200) are now ONE bin EACH,
+        # POOLED across all 4 blocks (2026-09-18 follow-up, user: "u/f & o/f
+        # will have jets collectively regardless of the j* case") -- bin 1 =
+        # global underflow, bins 2-61 = the 4x15 regular blocks, bin 62 =
+        # global overflow (4*15+2 = 62 bins total). "u/f"/"o/f" tick text now
+        # appears once each (was 4x, one per block) per the same instruction.
+        # No low/high split, no window-free variant, no residual bin.
+        # Styling overrides (2026-09-18, user, this spec only): block-label
+        # text +10% size / 3% lower, vline separators +30% linewidth, upper-
+        # pad max-yield headroom x5 (legend was overlapping the histograms).
+        # 64 bins (2026-09-18, user: "set 64 bins instead and let empty the
+        # 2nd and the one before the last so the underflow and the overflow
+        # will not touch the real spectra") -- 2 always-empty spacer bins
+        # added, right after u/f and right before o/f; see the composite's
+        # own layout comment in _attach_runtime_fields for the exact bin map.
+        ("ttreco_mSD_jstar_4block", "mSD_jstar_4block",       0.0, 640.0, 64,
+         r"$m_{SD}(J)$ per $j^{*}$ case [GeV]",
+         False, False, False,
+         # "50"/"200" per-block edge labels dropped (2026-09-18, fix): at only
+         # 5 GeV from the adjacent global u/f or o/f tick (or literally
+         # coincident with the next block's own "50"), they collided/
+         # overlapped into unreadable text -- 100/150 mid-block ticks plus
+         # the vline separators already convey the [50,200) block range.
+         ["u/f",
+          "100", "150",
+          "100", "150",
+          "100", "150",
+          "100", "150",
+          "o/f"],
+         None,
+         [20.0, 170.0, 320.0, 470.0, 620.0],   # dashed separators: block0 | block1 | block2 | block3 edges
+         [(95.0,  r"$j^{*}{=}b_L$",                0.90),
+          (245.0, r"$j^{*}{=}c_L$",                0.90),
+          (395.0, r"$j^{*}{=}q$ (not $b_L/c_L$)",  0.90),
+          (545.0, r"$j^{*}$: N/A",                 0.90)],
+         [5.0,
+          70.0, 120.0,
+          220.0, 270.0,
+          370.0, 420.0,
+          520.0, 570.0,
+          635.0],
+         0,          # xtick_rotation: horizontal
+         True, 0.65, 1.2,
+         1.10,       # block_label_fontsize_mult: +10%
+         1.30,       # vline_width_mult: +30%
+         # ymax_headroom_mult (2026-09-18 fix): was 5.0 (on top of the shared
+         # base 2.6x for any xticklabels composite = 13x total) -- massively
+         # overcorrected an assumed legend-overlap risk that was never
+         # actually confirmed for THIS spec (the "x5" instruction was given
+         # while looking at a DIFFERENT plot, m3_score_figure); user
+         # subsequently reported the y-axis "off by a factor of 10" (peak
+         # bins occupying ~1/13 of the frame) -- back to 1.0 (no-op, since
+         # ymax_headroom_abs below now overrides the whole base+mult chain).
+         1.0,
+         # ymax_headroom_abs (2026-09-18, user: "set the y-axis max to 2x the
+         # max bin yield") -- exact, absolute headroom factor for this spec.
+         2.0),
         # ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"ParticleNetAK4 tag of best-$m$ AK4 (bmk1)", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # commented out on request 2026-09-04
         # ("ttreco_bvuds_near",      "bvuds_near",              0.0, 1.0, 50, r"$b/(b{+}uds)$, nearest AK4", False),  # commented out on request
@@ -6575,6 +6827,14 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         ("score_M3_cb",            "score_M3_cb",            0.0, 1.0, 50, r"$D_{cb}$ (M3 multiclass)",  True),
         ("score_S2",               "score_S2",               0.0, 1.0, 50, r"$D_{bb}$ (M3 multiclass)",  True),
         ("score_S3",               "score_S3",               0.0, 1.0, 50, r"$D_{bbc}$ (M3 multiclass)", True),
+        # J-rank composite (2026-09-17, user): the SAME score used to pick J
+        # itself (ak8_gpt_bc+bb+topbwc, see the J-rank comment in
+        # build_derived_array) -- candidate variable for a generous
+        # background-thinning pre-cut. Plotted here at PRESEL, S+B, so a
+        # threshold (0.05/0.1/0.2 under discussion) can be picked by eye
+        # against every category's own distribution before applying it
+        # anywhere.
+        ("ak8_gpt_Jrank_0",        "ak8_gpt_Jrank_0",     1e-4, 1.2, 60, r"$J$-rank $= bc\!+\!bb\!+\!topbwc$ (score that selected $J$)", True, False, True),
         # Same D_bc BDT re-run on the other ranked AK8 jets (j_b = 2nd-bc-score;
         # j^1 / j^2 = 1st / 2nd highest-mSD).  SENTINEL -> dropped when the jet
         # doesn't exist (n_ak8 < 2 for j_b / j^2).
@@ -6833,7 +7093,14 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # ("lep1_eta",               "lep1_eta",               -2.5, 2.5,   50, r"Lepton $\eta$",             False),
     ]
 
-    return [m(*s) for s in specs]
+    _out = [m(*s) for s in specs]
+    # 2026-09-17, user: D_bb (score_S2) targets one specific signal topology
+    # (t^2(b'b)) -- see the "_topo3_lowerpad" branch in draw_matching for
+    # what this flag replaces the significance panel with.
+    for _p in _out:
+        if _p.get("var") == "score_S2":
+            _p["_topo3_lowerpad"] = True
+    return _out
 
 
 # --------------------------------------------------------------------------- #
@@ -6874,7 +7141,7 @@ def build_region_mass_settings(signal_only=False):
     # Mirrors build_mat_plot_settings's _SELECTIONS exactly -- that dict is
     # local to that function, not importable, so reconstructed here.
     _COMMON = ("(ak8_tau21_0 > 0) and (ak8_tau21_0 < 0.65) and "
-               "(dR_lep_ak8 > 1.3)")
+               "(dR_lep_ak8 > 1.3) and (ak8_gpt_Jrank_0 > 0.01)")
     _MJ12 = "(ak8_sdmass_0 > 40) and (ak8_sdmass_sub_mass_0 < 100)"
     PRE = "(ak8_pt[0] > 200) and " + _MJ12 + " and " + _COMMON
     SR = "(ak8_pt[0] > 200) and (score_Dbc > 0.9) and " + _MJ12 + " and " + _COMMON
@@ -7185,13 +7452,18 @@ def parse_args():
     #   04_Make_plots.py MAT SR NORM     04_Make_plots.py MAT ABS
     parser.add_argument("opt_a", nargs="?", default=None, type=str.upper,
                         help="MAT: y-axis ABS (default) | NORM, and/or "
-                             "selection PRE (default) | SR | JB (jb-Region).")
+                             "selection PRE (default) | SR | JB (jb-Region) | "
+                             "SR1A/SR1B/SR2A/SR2B/SR3A/SR3B (2026-09-18: the "
+                             "6 fixed-window D_cb/D_bb/D_bbc sub-regions, "
+                             "a=[0.8,0.95)/[0.8,0.95)/[0.5,0.8) b=>0.95/"
+                             ">0.95/>0.8, replacing the old plain-cut "
+                             "SR1/SR2/SR3).")
     parser.add_argument("opt_b", nargs="?", default=None, type=str.upper,
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     _NORMS = {"ABS", "NORM"}
-    _SELS = {"PRE", "SR", "JB", "SR1", "SR2", "SR3"}
+    _SELS = {"PRE", "SR", "JB", "SR1A", "SR1B", "SR2A", "SR2B", "SR3A", "SR3B"}
     _toks = [t for t in (args.opt_a, args.opt_b) if t]
     _bad = [t for t in _toks if t not in _NORMS | _SELS]
     if _bad:

@@ -8,6 +8,7 @@ lift the `_COMMON / _MJ12 / _SELECTIONS` block out of the source and exec it
 in an empty namespace -- no import of 04_Make_plots (which is heavy and would
 pull in ROOT files) and no duplicated numbers.
 """
+import json
 import re
 from pathlib import Path
 
@@ -20,6 +21,7 @@ _MAP = {
     "ak8_sdmass_sub_mass_0": ("event_subleading_sdmass_max", "<"),
     "ak8_tau21_0": ("jet_tau21_max", "<"),
     "dR_lep_ak8": ("dr_lep_jet_min", ">"),
+    "ak8_gpt_Jrank_0": ("jrank_min", ">"),
 }
 
 
@@ -31,7 +33,11 @@ def read_pre_cut(path=MAKE_PLOTS):
         raise RuntimeError(f"could not locate the _SELECTIONS block in {path}")
     block = "\n".join(ln.strip() for ln in m.group(0).splitlines()[:-1])
     ns = {}
-    exec(block, {}, ns)                                   # noqa: S102 - our own source
+    # 2026-09-18: the block now reads S1_tagger/sr_cuts.json via a couple of
+    # flat (unindented) lines using json/Path/__file__ -- inject those into
+    # the exec globals (still no import of 04_Make_plots itself, which stays
+    # heavy/ROOT-pulling; json+Path are just stdlib) so this keeps working.
+    exec(block, {"json": json, "Path": Path, "__file__": str(MAKE_PLOTS)}, ns)  # noqa: S102 - our own source
     return ns["_SELECTIONS"]["PRE"]
 
 

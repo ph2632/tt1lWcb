@@ -7226,7 +7226,7 @@ def parse_args():
         default="ALL",
         type=str.upper,
         choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG", "REGIONS", "REGIONS-SIGNAL",
-                 "CBPROXY", "CBPROXY-SCORE"],
+                 "CBPROXY", "CBPROXY-SCORE", "CBPROXY-FEATURES"],
         help="ALL (default): run the normal Data/MC batch plots. "
              "MAT: matching-truth overlay only (Wcb vs Cat_Top_bc vs Rest, "
              "with a ratio panel).  "
@@ -7489,6 +7489,78 @@ def run_cbproxy_kinematics(cfg, manager, sample_metas):
     print(f"[CBPROXY] done. n(Wcb)={int(is_wcb.sum())}  n(proxy)={int(is_proxy.sum())}")
 
 
+def run_cbproxy_feature_pool(cfg, manager, sample_metas):
+    """Private study (2026-09-17, user request): pool the 22-GloParT-node
+    RAW INPUT features (S1Evaluator.RAW_INPUTS, cached as "<name>_0" leading
+    scalars) for Wcb (mat_cat==0) and t2(b'c) proxy (mat_cat==2) jets at
+    PRESEL (no score cut), so that ANY future M3 model variant (different
+    M3_topo_subshare, e.g. a proxy-dominant 15/15/70 retrain) can be
+    re-scored and compared WITHOUT re-streaming all 17 ROOT/cache samples
+    again (that step -- the slow part, ~20-30 min -- only has to happen
+    once; re-scoring a new model.json against this pooled feature matrix is
+    a few seconds of XGBoost inference).
+
+    Outputs go to ./cbproxy_kinematics_test/pooled_features.npz (private
+    dir, not the real gallery).
+    """
+    from train_bdt.dbc_tools import S1Evaluator
+    OUTDIR = "./cbproxy_kinematics_test"
+    ensure_dir(OUTDIR)
+
+    PRE_CUT = ("(ak8_pt[0] > 200) and (ak8_sdmass_0 > 40) and "
+               "(ak8_sdmass_sub_mass_0 < 100) and (ak8_tau21_0 > 0) and "
+               "(ak8_tau21_0 < 0.65) and (dR_lep_ak8 > 1.3)")
+    print(f"[CBFEAT] selection (PRESEL only, no D_cb cut): {PRE_CUT}")
+
+    FEAT_COLS = [f"{n}_0" for n in S1Evaluator.RAW_INPUTS]
+    EXTRA_COLS = ["ak8_pt_0", "ak8_sdmass_0", "pt_bL_subjet", "score_M3_cb"]
+    KEEP_COLS = FEAT_COLS + EXTRA_COLS
+
+    pooled = {"is_wcb": [], "weight": []}
+    for k in KEEP_COLS:
+        pooled[k] = []
+
+    metas = [m for m in sample_metas if not m.get("is_data")]
+    for i, meta in enumerate(metas):
+        s = manager.materialize(meta)
+        if s is None or s.get("array") is None:
+            print(f"[CBFEAT] {i + 1}/{len(metas)} {meta['name']}: unreadable, skip.")
+            continue
+        arr = s["array"]
+        needed = {"mat_cat", "weights"} | set(KEEP_COLS)
+        missing = needed - set(arr.fields)
+        if missing:
+            print(f"[CBFEAT] {meta['name']}: missing {missing} -- skip.")
+            s["array"] = None
+            continue
+
+        pre_mask = eval_cut(PRE_CUT, arr)
+        mat_cat = ak.to_numpy(arr["mat_cat"])
+        sel_mask = pre_mask & np.isin(mat_cat, (0, 2))
+        n_hit = int(sel_mask.sum())
+        print(f"\r[CBFEAT] {i + 1}/{len(metas)} | group={s['group']:<10} "
+              f"| kept {n_hit:7d} | Mem={get_memory_mb():.1f} MB", end="")
+        if n_hit > 0:
+            pooled["is_wcb"].append((mat_cat[sel_mask] == 0))
+            pooled["weight"].append(ak.to_numpy(arr["weights"])[sel_mask].astype(np.float64))
+            for k in KEEP_COLS:
+                pooled[k].append(ak.to_numpy(arr[k])[sel_mask].astype(np.float32))
+        s["array"] = None
+        gc.collect()
+    print("")
+
+    is_wcb = np.concatenate(pooled["is_wcb"])
+    w = np.concatenate(pooled["weight"])
+    cols = {k: np.concatenate(pooled[k]) for k in KEEP_COLS}
+    print(f"[CBFEAT] pooled: Wcb {int(is_wcb.sum())} jets  |  "
+          f"proxy {int((~is_wcb).sum())} jets")
+
+    np.savez_compressed(os.path.join(OUTDIR, "pooled_features.npz"),
+                        is_wcb=is_wcb, weight=w, feat_cols=np.array(FEAT_COLS), **cols)
+    print(f"[CBFEAT] wrote {OUTDIR}/pooled_features.npz "
+          f"({len(FEAT_COLS)} raw GloParT features + {len(EXTRA_COLS)} extras)")
+
+
 def run_cbproxy_score_reweight(cfg, manager, sample_metas):
     """Private study (2026-09-17, user request): prototype a DOWNSTREAM
     kinematic reweighting of t2(b'c) proxy jets (mat_cat==2) to match Wcb
@@ -7518,7 +7590,7 @@ def run_cbproxy_score_reweight(cfg, manager, sample_metas):
                "(ak8_tau21_0 < 0.65) and (dR_lep_ak8 > 1.3)")
     print(f"[CBSCORE] selection (PRESEL only, no D_cb cut): {PRE_CUT}")
 
-    KEEP_COLS = ["score_M3_cb", "ak8_pt_0", "ak8_sdmass_0"]
+    KEEP_COLS = ["score_M3_cb", "ak8_pt_0", "ak8_sdmass_0", "pt_bL_subjet"]
     pooled = {"is_wcb": [], "weight": []}
     for k in KEEP_COLS:
         pooled[k] = []
@@ -7565,6 +7637,7 @@ def run_cbproxy_score_reweight(cfg, manager, sample_metas):
 
     # ---- 2D (pT, mSD) reweight of proxy -> Wcb -------------------------
     pt = cols["ak8_pt_0"]; msd = cols["ak8_sdmass_0"]; dcb = cols["score_M3_cb"]
+    ptbl = cols["pt_bL_subjet"]
     pt_bins = np.array([200, 230, 260, 300, 350, 400, 500, 650, 1000])
     msd_bins = np.linspace(40, 250, 15)
 
@@ -7585,8 +7658,30 @@ def run_cbproxy_score_reweight(cfg, manager, sample_metas):
     rw_factor = ratio[ipt, imsd]
     w_prx_rw = w[is_proxy] * rw_factor
 
-    print(f"[CBSCORE] reweight factor: mean={rw_factor.mean():.2f} "
+    print(f"[CBSCORE] (pT,mSD) reweight factor: mean={rw_factor.mean():.2f} "
           f"median={np.median(rw_factor):.2f} max={rw_factor.max():.2f}")
+
+    # ---- 1D p_T(b_L^in) reweight of proxy -> Wcb (user's new hypothesis) ---
+    # Only defined where the in-cone b_L pick exists (sentinel -1 otherwise,
+    # rare per the earlier feasibility check); undefined slots get rw=1
+    # (no correction) rather than being dropped, so they still contribute
+    # at their original weight.
+    ptbl_bins = np.array([0, 40, 60, 80, 100, 125, 150, 175, 200, 250, 300, 400, 600])
+    ok_w = ptbl[is_wcb] > 0
+    ok_p = ptbl[is_proxy] > 0
+    hbl_wcb, _ = np.histogram(ptbl[is_wcb][ok_w], bins=ptbl_bins, weights=w[is_wcb][ok_w])
+    hbl_prx, _ = np.histogram(ptbl[is_proxy][ok_p], bins=ptbl_bins, weights=w[is_proxy][ok_p])
+    hbl_wcb_n = hbl_wcb / hbl_wcb.sum()
+    hbl_prx_n = hbl_prx / hbl_prx.sum()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rbl = np.clip(np.where(hbl_prx_n > 0, hbl_wcb_n / hbl_prx_n, 0.0), 0.0, 20.0)
+    ibl = np.clip(np.digitize(ptbl[is_proxy], ptbl_bins) - 1, 0, len(ptbl_bins) - 2)
+    rw_factor_bl = np.where(ok_p, rbl[ibl], 1.0)
+    w_prx_rw_bl = w[is_proxy] * rw_factor_bl
+
+    print(f"[CBSCORE] pT(b_L) reweight factor: mean={rw_factor_bl.mean():.2f} "
+          f"median={np.median(rw_factor_bl):.2f} max={rw_factor_bl.max():.2f}  "
+          f"(undefined slot frac: Wcb {1 - ok_w.mean():.3f} / proxy {1 - ok_p.mean():.3f})")
 
     # ---- score_M3_cb panel: main (shape-normalized) + ratio-to-Wcb pad ----
     bins = np.linspace(0.0, 1.0, 41)
@@ -7594,37 +7689,54 @@ def run_cbproxy_score_reweight(cfg, manager, sample_metas):
     hw, _ = np.histogram(dcb[is_wcb], bins=bins, weights=w[is_wcb])
     hp0, _ = np.histogram(dcb[is_proxy], bins=bins, weights=w[is_proxy])
     hp1, _ = np.histogram(dcb[is_proxy], bins=bins, weights=w_prx_rw)
-    hw_n = hw / hw.sum(); hp0_n = hp0 / hp0.sum(); hp1_n = hp1 / hp1.sum()
+    hp2, _ = np.histogram(dcb[is_proxy], bins=bins, weights=w_prx_rw_bl)
+    hw_n = hw / hw.sum(); hp0_n = hp0 / hp0.sum()
+    hp1_n = hp1 / hp1.sum(); hp2_n = hp2 / hp2.sum()
 
     fig, (ax0, ax1) = plt.subplots(
-        2, 1, figsize=(7.2, 7.4), sharex=True,
+        2, 1, figsize=(7.8, 7.8), sharex=True,
         gridspec_kw={"height_ratios": [3, 1], "hspace": 0.06})
 
     ax0.step(ctr, hw_n, where="mid", color="red", lw=2.2, label="Wcb (target)")
-    ax0.step(ctr, hp0_n, where="mid", color="blue", lw=2.0, ls="--",
+    ax0.step(ctr, hp0_n, where="mid", color="blue", lw=1.6, ls="--",
               label="t$^2$(b'c) proxy (raw)")
     ax0.step(ctr, hp1_n, where="mid", color="blue", lw=2.2,
-              label="t$^2$(b'c) proxy (p$_T$,m$_{SD}$-reweighted)")
+              label="proxy (p$_T(J)$,m$_{SD}(J)$-reweighted)")
+    ax0.step(ctr, hp2_n, where="mid", color="darkorange", lw=2.2,
+              label="proxy (p$_T(b^L_{in})$-reweighted)")
     ax0.set_ylabel("a.u. (unit area)")
     ax0.set_yscale("log")
-    ax0.legend(frameon=False, fontsize=10.5, loc="upper center")
-    hep.cms.label(ax=ax0, data=False, label="Simulation",
-                  rlabel="PRESEL, no score cut")
+    ax0.legend(frameon=False, fontsize=10, loc="lower center")
+    ax0.text(0.02, 0.96, "PRESEL, no score cut", transform=ax0.transAxes,
+             fontsize=11, va="top", ha="left")
+    hep.cms.label(ax=ax0, data=False, label="Simulation")
 
     with np.errstate(divide="ignore", invalid="ignore"):
         r0 = np.where(hw_n > 0, hp0_n / hw_n, np.nan)
         r1 = np.where(hw_n > 0, hp1_n / hw_n, np.nan)
+        r2 = np.where(hw_n > 0, hp2_n / hw_n, np.nan)
     ax1.axhline(1.0, color="grey", lw=1, ls=":")
-    ax1.step(ctr, r0, where="mid", color="blue", lw=1.8, ls="--", label="raw / Wcb")
-    ax1.step(ctr, r1, where="mid", color="blue", lw=2.0, label="reweighted / Wcb")
+    ax1.step(ctr, r0, where="mid", color="blue", lw=1.4, ls="--", label="raw / Wcb")
+    ax1.step(ctr, r1, where="mid", color="blue", lw=1.8, label="(J) reweighted / Wcb")
+    ax1.step(ctr, r2, where="mid", color="darkorange", lw=1.8, label="p$_T(b^L)$ reweighted / Wcb")
     ax1.set_ylim(0.0, 2.5)
     ax1.set_xlabel(r"$D_{cb}$ (M3 multiclass)")
     ax1.set_ylabel("proxy / Wcb")
-    ax1.legend(frameon=False, fontsize=9, loc="upper left")
+    ax1.legend(frameon=False, fontsize=8.5, loc="upper left")
 
     fig.savefig(os.path.join(OUTDIR, "cbproxy_score_reweight_PRE.png"), dpi=150)
     plt.close(fig)
     print(f"[CBSCORE] wrote {OUTDIR}/cbproxy_score_reweight_PRE.png")
+
+    # frac(D_cb>0.95) for all three -- the operational number
+    for lbl, ww in (("raw", w[is_proxy]), ("(J) reweighted", w_prx_rw),
+                    ("pT(b_L) reweighted", w_prx_rw_bl)):
+        m95 = dcb[is_proxy] > 0.95
+        print(f"[CBSCORE] frac(D_cb>0.95) proxy {lbl:22s}: "
+              f"{ww[m95].sum() / ww.sum():.4f}")
+    m95w = dcb[is_wcb] > 0.95
+    print(f"[CBSCORE] frac(D_cb>0.95) Wcb (target)       : "
+          f"{w[is_wcb][m95w].sum() / w[is_wcb].sum():.4f}")
 
 
 def main():
@@ -7674,6 +7786,11 @@ def main():
 
     if args.mode == "CBPROXY-SCORE":
         run_cbproxy_score_reweight(cfg, manager, sample_metas)
+        print(f"[TIME] Total: {fmt_hms(time.time() - t_total0)}")
+        return
+
+    if args.mode == "CBPROXY-FEATURES":
+        run_cbproxy_feature_pool(cfg, manager, sample_metas)
         print(f"[TIME] Total: {fmt_hms(time.time() - t_total0)}")
         return
 

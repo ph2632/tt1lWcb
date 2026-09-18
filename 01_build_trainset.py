@@ -68,11 +68,12 @@ PI = float(np.pi)
 
 # jet topology codes
 SIG_CODES = {1: "Wcb", 2: "t2_bc", 3: "t2_bb", 4: "t3_bbc", 5: "t2_bc_proxy",
-             6: "z_bb", 7: "qcd_bb"}
+             6: "z_bb", 7: "qcd_bb", 8: "t3_bcq_proxy_windowed"}
 BKG_CODE = 0
 PROXY_CODE = 5
 ZBB_CODE = 6
 QCDBB_CODE = 7
+BCQ_PROXY_CODE = 8
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +238,13 @@ def main():
              # every non-top sample (2026-09-13).
              "ak4_pt", "ak4_eta", "ak4_phi", "ak4_hflav"]
     ev_scalar = ["run", "luminosityBlock", "event", "n_ak8",
+                 # windowed t3(b'cq) proxy promotion (2026-09-18, user): same
+                 # event-level min-dR AK4-pair branches 04_Make_plots.py's
+                 # minDR_b/minDR_bc read directly (ev(...) -- not per-jet),
+                 # needed to restrict the proxy to the kinematically-
+                 # consistent [0.6,1.2] window on
+                 # sqrt(minDR_b^2+minDR_bc^2) (see BCQ_PROXY_CODE below).
+                 "minDR_b", "minDR_bc",
                  "lep1_pt", "lep1_eta", "lep1_phi"] + cfg["weights"]
     read_cols = sorted(set(kin + truth + ev_scalar + feats_all))
 
@@ -277,6 +285,16 @@ def main():
             jphi = flatten(events["ak8_phi"], 0.0)
             jmsd = flatten(events["ak8_sdmass"], -1.0)
             jt21 = flatten(events["ak8_tau21"], -1.0)
+            # J-rank (2026-09-17, user): same bc+bb+topbwc composite that
+            # selects the candidate J in 04_Make_plots.py, applied per-jet
+            # here as a generous background-thinning preselection cut
+            # (see S1_tagger/presel.py's jrank_min / config.json fallback).
+            # 2026-09-18: a 4th-node extension ("4SS", adding topbwcs for
+            # bbc) was proposed and then put on hold pending a design
+            # question -- see chat -- reverted here, unchanged from before.
+            jrank = (flatten(events["ak8_gpt_bc"], -1.0)
+                     + flatten(events["ak8_gpt_bb"], -1.0)
+                     + flatten(events["ak8_gpt_topbwc"], -1.0))
 
             lep_pt = broadcast(events, "lep1_pt", template, -1.0)
             lep_eta = broadcast(events, "lep1_eta", template, 0.0)
@@ -295,6 +313,7 @@ def main():
                 & (jt21 > 0.0) & (jt21 < presel["jet_tau21_max"])
                 & (lep_pt > 0.0) & (dr_lep > presel["dr_lep_jet_min"])
                 & (sub_msd < presel["event_subleading_sdmass_max"])
+                & (jrank > presel["jrank_min"])
             )
 
             topo = topology_codes(events, template)
@@ -351,9 +370,39 @@ def main():
                 special_zp = proxy | z_bb
                 qcd_bb = (n_bflav_in_cone >= 2) & ~special_zp
 
-                special = special_zp | qcd_bb
-                topo = np.select([z_bb, proxy, qcd_bb],
-                                [ZBB_CODE, PROXY_CODE, QCDBB_CODE],
+                # t3(b'cq) proxy flag (2026-09-13, user; moved up 2026-09-18
+                # to feed the windowed promotion right below): same idea as
+                # the t2(b'c) proxy, but for the fully-merged t3(b'bc)
+                # signal -- a Cabibbo-favoured W->cs event with the SAME
+                # 3-prong top-decay match pattern (w_decay==4 & ak8_match_
+                # top_bcq), exactly as studied standalone in
+                # t3_proxy_study.py.
+                m_top_bcq = flatten(events["ak8_match_top_bcq"], 0).astype(bool)
+                t3bcq_proxy_flag = (w_decay_bg == 4) & m_top_bcq
+
+                # windowed t3(b'cq) proxy for bbc (2026-09-18, user): the
+                # existing t3bcq_proxy_flag match (w_decay==4 & ak8_match_
+                # top_bcq -- Cabibbo-favoured full 3-prong merge, same
+                # topology as true t3(b'bc) with the b<->light-q swap)
+                # was previously a plain annotation, never promoted to a
+                # training signal (no adequate real proxy existed).
+                # Restricting it to sqrt(minDR_b^2+minDR_bc^2) in [0.6,1.2]
+                # (per bbc_bcq_minDRcomposite_SR3.png: the region where both
+                # populations peak, signal more concentrated) forces
+                # kinematic consistency with genuine bbc jets before
+                # promoting it -- same idea as the t2(b'c) proxy, applied
+                # here for the first time.
+                minb_bg = broadcast(events, "minDR_b", template, -1.0)
+                minbc_bg = broadcast(events, "minDR_bc", template, -1.0)
+                has_pair = (minb_bg >= 0) & (minbc_bg >= 0)
+                bbc_composite = np.where(
+                    has_pair, np.hypot(minb_bg, minbc_bg), -1.0)
+                in_window = (bbc_composite >= 0.6) & (bbc_composite <= 1.2)
+                bcq_proxy_windowed = t3bcq_proxy_flag & in_window & ~special_zp & ~qcd_bb
+
+                special = special_zp | qcd_bb | bcq_proxy_windowed
+                topo = np.select([z_bb, proxy, qcd_bb, bcq_proxy_windowed],
+                                [ZBB_CODE, PROXY_CODE, QCDBB_CODE, BCQ_PROXY_CODE],
                                 default=BKG_CODE).astype(np.int8)
                 thin = rng.random(len(keep)) < keep_p   # thin true background only
                 keep &= (special | thin)
@@ -388,19 +437,6 @@ def main():
                     m = topo == code
                     capped = np.minimum(np.abs(weight), cap) * rescale
                     weight = np.where(m, np.sign(weight) * capped, weight)
-
-                # t3(b'cq) proxy flag (2026-09-13, user): same idea as the
-                # t2(b'c) proxy, but for the fully-merged t3(b'bc) signal --
-                # a Cabibbo-favoured W->cs event with the SAME 3-prong
-                # top-decay match pattern (w_decay==4 & ak8_match_top_bcq),
-                # exactly as studied standalone in t3_proxy_study.py. This is
-                # a PLAIN ANNOTATION column, not a topology/signal promotion:
-                # it does not touch topo/special/keep/weight above, so it
-                # cannot change S1 or M3 training at all -- purely for a
-                # reference curve on the bbc score plot (no adequate real
-                # proxy exists there, unlike cb's t2(b'c) proxy).
-                m_top_bcq = flatten(events["ak8_match_top_bcq"], 0).astype(bool)
-                t3bcq_proxy_flag = (w_decay_bg == 4) & m_top_bcq
 
             if not keep.any():
                 continue

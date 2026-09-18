@@ -140,11 +140,12 @@ def class_weight_lookup(cfg):
     cwm = cfg.get("class_weight_multiplier")
     if not cwm:
         return None
-    # floor 8 (2026-09-13): topology 7 (QCD(bb)) now exists in the dataset
-    # but isn't in class_weight_share (S1 doesn't split it out specially) --
-    # sizing only from cwm's OWN keys would make lut[topo] IndexError on any
-    # jet with topology>=len(lut); un-listed topologies default to 1.0.
-    lut = np.ones(max(8, max(int(k) for k in cwm) + 1), dtype=np.float64)
+    # floor 9 (2026-09-13, bumped 2026-09-18): topology 7 (QCD(bb)), then 8
+    # (t3_bcq_proxy_windowed) now exist in the dataset but aren't in
+    # class_weight_share (S1 doesn't split either out specially) -- sizing
+    # only from cwm's OWN keys would make lut[topo] IndexError on any jet
+    # with topology>=len(lut); un-listed topologies default to 1.0.
+    lut = np.ones(max(9, max(int(k) for k in cwm) + 1), dtype=np.float64)
     for k, v in cwm.items():
         lut[int(k)] = float(v)
     return lut

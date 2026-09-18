@@ -54,6 +54,7 @@ PyROOT is not already importable; override the view with $S1_LCG_VIEW):
   python3 03_Training_report_plots.py [--config S1_tagger/config.json]
 """
 import argparse
+import datetime
 import json
 import os
 import shlex
@@ -241,20 +242,32 @@ def node_label(feat):
 
 TOPO_COL = {1: ROOT.kAzure + 2, 2: ROOT.kOrange + 7,
             3: ROOT.kGreen + 2, 4: ROOT.kMagenta + 1, 5: ROOT.kCyan + 2,
-            6: ROOT.kBlue + 2, 7: ROOT.kRed + 1}
+            6: ROOT.kBlue + 2, 7: ROOT.kRed + 1, 8: ROOT.kViolet + 1}
 # short forms (no parens) for Wcb/t2b'b/Zbb, 2026-09-13 -- saves legend width
 # 2026-09-16, user: "Zbb adj" -> "Zbb" -- no other "Zbb" label anywhere in
 # these plots, so the "adj" (adjacent/geometric-match) qualifier is dropped
 # as unnecessary disambiguation.
 TOPO_LAB = {1: "Wcb", 2: "t^{2}(b'c)", 3: "t^{2}b'b", 4: "t^{3}(b'bc)",
-            5: "t^{2}(b'c) proxy", 6: "Zbb", 7: "QCD(bb)"}
-# M3 (multiclass) per-class colour = the colour of that group's eponymous
-# topology above (cb -> Wcb's azure, bb -> t2(b'b)'s green, bbc -> t3(b'bc)'s
-# magenta), so M3 plots read consistently with every other plot in this file.
+            5: "t^{2}(b'c) proxy", 6: "Zbb", 7: "QCD(bb)",
+            8: "t^{3}(b'cq) proxy"}
+# short forms used only to spell out what an M3 class's "total" signal curve
+# actually sums over, in m3_score_figure's legend (2026-09-18, user: "the
+# Dcb total in the legend is unclear -- if this is the total signal, say
+# 'cb+b'c'"). Built generically from my_codes minus exclude_codes so it also
+# covers bb (b'b+Zbb+QCDbb) and bbc (b'bc+b'cq-prx), not just cb.
+TOPO_SHORT = {1: "cb", 2: "b'c", 3: "b'b", 4: "b'bc", 5: "b'c-prx",
+              6: "Zbb", 7: "QCDbb", 8: "b'cq-prx"}
+# M3 (multiclass) per-class colour -- MUST match that class's own PURE-
+# SIGNAL ("curve1"/"entry 2", proxy excluded) m3_roc_figure curve colour,
+# since m3_overtrain_figure's h_str/h_ste histogram IS (as of the 2026-09-18
+# restructure below) that exact pure-signal population, not the full class.
 # 2026-09-16, user: "align the color [of overtrain_M3_cb] to be as [roc_M3's
-# D_cb curve] color(4)" -- cb overridden to plain ROOT colour 4, matching
-# m3_roc_figure's _DARK curve.
-M3_COL = {"cb": 4, "bb": TOPO_COL[3], "bbc": TOPO_COL[4]}
+# D_cb curve] color(4)" -- cb's curve1 happens to already be 62 in one
+# earlier pass and cb itself was pinned to plain colour 4 at the time; kept
+# at 62 now to genuinely match curve1. 2026-09-18 RESTRUCTURE (user: "I tend
+# to believe it should correspond to the 2nd entry of the [ROC] legends"):
+# bb/bbc updated to their curve1 colours (kGreen+2, kMagenta+0).
+M3_COL = {"cb": 62, "bb": ROOT.kGreen + 2, "bbc": ROOT.kMagenta + 0}
 # 2026-09-14, user: "S1, Dbc, Dbc(J), Dbb are unclear -- there should be 3
 # taggers only: S1(bc), S2(bb), S3(bbc)". Internal keys (cname: cb/bb/bbc,
 # used for dict lookups and file names) are UNCHANGED; only the human-
@@ -266,13 +279,21 @@ M3_DISP = {"cb": "D_{cb}", "bb": "D_{bb}", "bbc": "D_{bbc}"}
 # 2026-09-16, user: the physics components each M3 class actually targets --
 # used to spell out "rest" as the OTHER 2 classes + non-targeted jets, not a
 # vague "bkg", on the per-class overtraining plots.
-M3_COMPONENTS = {"cb": "cb, b'c, b'c-prx", "bb": "b'b, Zbb, QCDbb", "bbc": "b'bc"}
+# bbc's own entry corrected 2026-09-18 (user: "the plots should consider as
+# targeted jets all those used as such in the training -- in the last
+# training, we only considered the b'cq-prx as a proxy") -- was just "b'bc",
+# missing topology 8 (the b'cq-prx-windowed code), which IS one of bbc's own
+# M3_class_groups/M3_topo_subshare components (80/20 split), same as cb's
+# and bb's own proxy topologies are already listed for them.
+M3_COMPONENTS = {"cb": "cb, b'c, b'c-prx", "bb": "b'b, Zbb, QCDbb", "bbc": "b'bc, b'cq-prx"}
 def _m3_rest_components(cname):
-    # 2026-09-16, user: "there is no true-BKG, better to say non-targeted
-    # jets" -- topology 0 is just jets that match none of the 3 targeted
-    # classes, not a separate "background" sample.
-    others = ", ".join(M3_COMPONENTS[c] for c in ("cb", "bb", "bbc") if c != cname)
-    return "non-targeted jets, " + others
+    # 2026-09-18, user (after finding the itemized other-2-classes listing
+    # "very incomplete"-looking): short "non <this class's own components>"
+    # form instead -- exactly equivalent set-theoretically (Rest = NOT this
+    # class), and unambiguous rather than an itemized list that invites
+    # wondering what else might be missing from it. E.g. bbc -> "Rest (non
+    # b'bc, b'cq-prx)".
+    return "non " + M3_COMPONENTS[cname]
 
 TOP_MARGIN = 0.065     # all four figures (was 0.085)
 RIGHT_MARGIN = 0.025   # all four figures (was 0.035)
@@ -447,6 +468,49 @@ def best_1bin_cut(score, w, sig_mask, bkg_mask, nbins=100):
     return best_thr, float(eff_s), float(eff_b)
 
 
+def best_2bin_cut(score, w, sig_mask, bkg_mask, nbins=100):
+    """2-category optimum at the high-score end (2026-09-18, user, for
+    m3_overtrain_figure: "evaluate the optimal cut not based on 1-bin
+    optimization but on 2-bin optimization ... see ../Hgg/Root_plots.py
+    2bin_optimization ... S = all targeted jets, B = rest jets"). Same
+    construction as sig_2bin() above (both outer edges free, quadrature sum
+    of S/sqrt(S+B) over the 2 disjoint bins [lo,hi) and [hi,1]), but takes
+    boolean sig_mask/bkg_mask like best_1bin_cut() instead of raw topology
+    codes, so it can drop straight into that call site.
+
+    "Keep the eff. numerics to correspond to the 2nd looser cut bin" -- the
+    returned eff_s/eff_b are the score>=lo_thr efficiencies (the union of
+    both bins, i.e. the looser/2nd cut), not the tighter hi_thr ones.
+
+    Returns (lo_thr, hi_thr, eff_s, eff_b, best_z).
+    """
+    edges = np.linspace(0.0, 1.0, nbins + 1)
+    hs, _ = np.histogram(score[sig_mask], bins=edges, weights=w[sig_mask])
+    hb, _ = np.histogram(score[bkg_mask], bins=edges, weights=w[bkg_mask])
+    cs = np.concatenate([np.cumsum(hs[::-1])[::-1], [0.0]])   # yield >= edges[j]
+    cb = np.concatenate([np.cumsum(hb[::-1])[::-1], [0.0]])
+    s_tot, b_tot = cs[0], cb[0]
+    best_z, best_i, best_j = -1.0, None, None
+    for j in range(1, nbins + 1):                     # upper (tighter) cat = bins j..end
+        s_hi, b_hi = cs[j], cb[j]
+        if b_hi < 1.0 or s_hi <= 0:
+            continue
+        z_hi = s_hi / np.sqrt(s_hi + b_hi)
+        for i in range(j):                            # lower (looser) cat = bins i..j-1
+            s_lo, b_lo = cs[i] - s_hi, cb[i] - b_hi
+            if b_lo < 1.0 or s_lo <= 0:
+                continue
+            z = float(np.hypot(z_hi, s_lo / np.sqrt(s_lo + b_lo)))
+            if z > best_z:
+                best_z, best_i, best_j = z, i, j
+    if best_i is None:
+        return 0.5, 0.5, 0.0, 0.0, 0.0
+    lo_thr, hi_thr = float(edges[best_i]), float(edges[best_j])
+    eff_s = cs[best_i] / s_tot if s_tot > 0 else 0.0
+    eff_b = cb[best_i] / b_tot if b_tot > 0 else 0.0
+    return lo_thr, hi_thr, float(eff_s), float(eff_b), best_z
+
+
 def _roc_points(y, s, w, npts=400):
     """Weighted ROC: signal efficiency vs background efficiency, plus AUC."""
     o = np.argsort(-s)
@@ -471,7 +535,7 @@ def roc_figure(outdir, summary, cfg, out_png, presel=None):
     # PROXY/Zbb/QCDbb), so "cb-jets" would be actively wrong here (that
     # narrower definition is what M3's S1(bc) class means, a different
     # model). Background is topology==0, any non-signal-matched jet.
-    frame = _axes(c.DrawFrame(0.0, 1e-3, 1.0, 0.3),
+    frame = _axes(c.DrawFrame(0.0, 1e-3, 1.0, 0.5),
                   "targeted jets eff.", "Other than targeted jets eff.",
                   xoff=0.96, yoff=1.06)
     frame.GetYaxis().SetLabelOffset(0.005)   # tick numbers 1% closer
@@ -593,6 +657,9 @@ def roc_figure(outdir, summary, cfg, out_png, presel=None):
                  "m_{SD} > %.0f GeV" % presel["jet_sdmass_min"],
                  "#tau_{21} < %.2f" % presel["jet_tau21_max"],
                  "#DeltaR(l, J) > %.1f" % presel["dr_lep_jet_min"]]
+        # "3SS" = 3-Score-Sum (ak8_gpt_bc+bb+topbwc), same as m3_roc_figure.
+        if "jrank_min" in presel:
+            lines.append("3SS > %.2f" % presel["jrank_min"])
         for i, ln in enumerate(lines):
             t.DrawLatex(0.165, 0.880 - 0.044 * i, ln)
         t.SetTextColor(ROOT.kBlack)
@@ -1098,12 +1165,28 @@ def score_figure(outdir, name, summary, cfg, sig_codes, out_png,
 #   D_bb curves:  (b'b,Zbb,QCDbb/rest), (b'b/rest), (cb,b'c,b'b,b'bc/rest)
 # --------------------------------------------------------------------------- #
 def m3_roc_figure(outdir, cfg, out_png, sig_classes, cname, curves, colors,
-                  presel=None):
+                  presel=None, match_signal_codes=None, match_sr_cuts=None):
     """N ROC curves of ONE class's REAL M3 score (its own softmax
     probability), one per nested topology-inclusion definition of "signal"
     for that class -- see module comment above. `curves` = list of
     (label, topology codes); `colors` = list of ROOT colour indices, same
-    length, dark-to-light order."""
+    length, dark-to-light order.
+
+    match_signal_codes/match_sr_cuts (2026-09-18, user: "TaggerTrain_PRE_
+    overtrain_M3_cb and TaggerTrain_PRE_roc_M3_cb are a bit inconsistent --
+    use the same 2-bin-optimization algorithm to mark 2 WPs ... eff should
+    match the values identified in the former"): identifies which of the N
+    `curves` is the SAME pure-signal-vs-Rest definition m3_overtrain_figure
+    uses (cb: (1,2), bb: (3,), bbc: (4,)). For THAT curve only, the 2
+    markers use the SAME fixed thresholds (match_sr_cuts) AND that curve's
+    OWN background (y==0, i.e. NOT in signal_codes -- correctly counts this
+    class's own proxy topology as background, matching m3_overtrain_figure
+    after its 2026-09-18 bugfix) so the drawn eff numbers are bit-for-bit
+    identical to the overtrain figure's AND the marker lands back on its own
+    curve. Every OTHER curve still gets 2 markers (best_2bin_cut instead of
+    the old single best_1bin_cut), self-consistent on its own background,
+    unchanged in definition.
+    """
     c_idx = next(i for i, cn in sig_classes if cn == cname)
     e = np.load(outdir / "M3" / "eval.npz")
     w, topo = e["test_w"], e["test_topo"]
@@ -1113,11 +1196,11 @@ def m3_roc_figure(outdir, cfg, out_png, sig_classes, cname, curves, colors,
     c.SetTopMargin(TOP_MARGIN - 0.010); c.SetLeftMargin(0.105)
     c.SetRightMargin(0.018); c.SetBottomMargin(0.085)
     c.SetLogy(); c.SetGridx(); c.SetGridy()
-    frame = _axes(c.DrawFrame(0.0, 1e-3, 1.0, 0.3),
+    frame = _axes(c.DrawFrame(0.0, 1e-3, 1.0, 0.5),
                   f"{M3_DISP[cname]} score", "Other than targeted jets eff.", xoff=0.96, yoff=1.06)
     frame.GetYaxis().SetLabelOffset(0.005)
 
-    entries = [(lab, col, 1, np.isin(topo, codes).astype(np.int8))
+    entries = [(lab, col, 1, np.isin(topo, codes).astype(np.int8), codes)
                for (lab, codes), col in zip(curves, colors)]
 
     n = len(entries)
@@ -1130,23 +1213,68 @@ def m3_roc_figure(outdir, cfg, out_png, sig_classes, cname, curves, colors,
     def sig3(x):
         return f"{x:.3g}"
 
+    _match_set = set(match_signal_codes) if match_signal_codes is not None else None
     keep, rows = [pvw], []
-    for lab, col, ls, y in entries:
+    for lab, col, ls, y, codes in entries:
         tpr, fpr, auc = _roc_points(y, score, w)
         g = ROOT.TGraph(len(tpr), tpr, fpr)
         g.SetLineColor(col); g.SetLineWidth(3); g.SetLineStyle(ls)
         g.Draw("L SAME"); keep.append(g)
         lg.AddEntry(g, lab, "l")
-        # marker + significance both from the same best_1bin_cut optimum
-        # (same method as overtrain_M3_cb.png's WP line).
-        cut_thr, eff_s, eff_b = best_1bin_cut(score, w, y == 1, y == 0)
-        s_tot, b_tot = w[y == 1].sum(), w[y == 0].sum()
-        S, B = eff_s * s_tot, eff_b * b_tot
-        z = S / np.sqrt(S + B) if (S + B) > 0 else 0.0
+        # 2 markers (best_2bin_cut, was 1 via best_1bin_cut) -- same
+        # 2-bin-optimization algorithm as m3_overtrain_figure's SR{n}a/b
+        # lines. For the ONE curve matching that figure's own signal_codes
+        # (cb (1,2), bb (3,), bbc (4,)), use the SAME fixed cuts.
+        # 2026-09-18 BUGFIX (user: "the marker ... is on the air ...
+        # something wrong in the way we group topologies into targeted/
+        # rest"): background was `y_te != c_idx` ("not this class"), which
+        # ALSO excludes this class's own proxy topology from background
+        # (since the proxy IS class==c_idx) -- silently dropping a huge,
+        # genuinely-background population instead of counting it, and
+        # disagreeing with this very curve's OWN line (drawn with
+        # background = NOT in signal_codes, i.e. y==0, which DOES count the
+        # proxy as background). Now uses that same y==0 -- the fix makes the
+        # marker land back on its own curve, and matches m3_overtrain_figure
+        # (also fixed the same way, see its _bkg_mask_sig comment).
+        if _match_set is not None and set(codes) == _match_set and match_sr_cuts is not None:
+            _bkg_mask = (y == 0)
+            _sig_mask = (y == 1)
+            lo_c, hi_c = float(match_sr_cuts[0]), float(match_sr_cuts[1])
+            _s_tot = float(w[_sig_mask].sum()); _b_tot = float(w[_bkg_mask].sum())
+            eff_s_lo = float(w[_sig_mask & (score >= lo_c)].sum()) / _s_tot if _s_tot > 0 else 0.0
+            eff_b_lo = float(w[_bkg_mask & (score >= lo_c)].sum()) / _b_tot if _b_tot > 0 else 0.0
+            eff_s_hi = float(w[_sig_mask & (score >= hi_c)].sum()) / _s_tot if _s_tot > 0 else 0.0
+            eff_b_hi = float(w[_bkg_mask & (score >= hi_c)].sum()) / _b_tot if _b_tot > 0 else 0.0
+            # 2026-09-18, user: "significance not based on 1-bin optimization
+            # but on 2-bin optimization corresponding to the 2 WPs ...
+            # quadratic combination of the 2 optimal bins as buckets (not
+            # further individual binning)" -- z = hypot(z_hi, z_lo), each
+            # from its own EXCLUSIVE bucket ([hi,1] and [lo,hi) respectively,
+            # not a cumulative score>=lo single bin as before.
+            S_hi = float(w[_sig_mask & (score >= hi_c)].sum())
+            B_hi = float(w[_bkg_mask & (score >= hi_c)].sum())
+            S_lo = float(w[_sig_mask & (score >= lo_c) & (score < hi_c)].sum())
+            B_lo = float(w[_bkg_mask & (score >= lo_c) & (score < hi_c)].sum())
+            z_hi = S_hi / np.sqrt(S_hi + B_hi) if (S_hi + B_hi) > 0 else 0.0
+            z_lo = S_lo / np.sqrt(S_lo + B_lo) if (S_lo + B_lo) > 0 else 0.0
+            z = float(np.hypot(z_hi, z_lo))
+            eff_pairs = [(eff_s_lo, eff_b_lo), (eff_s_hi, eff_b_hi)]
+        else:
+            # best_2bin_cut's own returned z IS already this exact quadrature
+            # combination over the 2 exclusive optimal buckets (see its
+            # docstring) -- was discarded before, recomputed less correctly.
+            lo_c, hi_c, eff_s_lo, eff_b_lo, z = best_2bin_cut(score, w, y == 1, y == 0)
+            s_tot, b_tot = w[y == 1].sum(), w[y == 0].sum()
+            # 2nd (tighter) marker's own eff, evaluated at hi_c same way
+            # best_1bin_cut/best_2bin_cut compute eff (cumulative >= thr).
+            eff_s_hi = float(w[(y == 1) & (score >= hi_c)].sum()) / s_tot if s_tot > 0 else 0.0
+            eff_b_hi = float(w[(y == 0) & (score >= hi_c)].sum()) / b_tot if b_tot > 0 else 0.0
+            eff_pairs = [(eff_s_lo, eff_b_lo), (eff_s_hi, eff_b_hi)]
         rows.append([f"{auc:.3f}", "#color[%d]{%s}" % (col, sig3(z))])
-        mk = ROOT.TMarker(eff_s, eff_b, 20)
-        mk.SetMarkerColor(col); mk.SetMarkerSize(1.7)
-        mk.Draw(); keep.append(mk)
+        for _es, _eb in eff_pairs:
+            mk = ROOT.TMarker(_es, _eb, 20)
+            mk.SetMarkerColor(col); mk.SetMarkerSize(1.7)
+            mk.Draw(); keep.append(mk)
     lg.Draw()
 
     t = ROOT.TLatex(); t.SetNDC(); t.SetTextFont(42); t.SetTextSize(0.0303)
@@ -1176,6 +1304,13 @@ def m3_roc_figure(outdir, cfg, out_png, sig_classes, cname, curves, colors,
                  "m_{SD} > %.0f GeV" % presel["jet_sdmass_min"],
                  "#tau_{21} < %.2f" % presel["jet_tau21_max"],
                  "#DeltaR(l, J) > %.1f" % presel["dr_lep_jet_min"]]
+        # "3SS" = 3-Score-Sum, ak8_gpt_bc+ak8_gpt_bb+ak8_gpt_topbwc (the same
+        # composite used to pick J itself, see ak8_gpt_Jrank_0 in
+        # 04_Make_plots.py) -- this cut was already applied everywhere
+        # (preselection string AND 01_build_trainset.py via jrank_min) but
+        # was missing from this displayed list (2026-09-18, user).
+        if "jrank_min" in presel:
+            lines.append("3SS > %.2f" % presel["jrank_min"])
         for i, ln in enumerate(lines):
             t2.DrawLatex(0.165, 0.880 - 0.044 * i, ln)
         ROOT.SetOwnership(t2, False)
@@ -1184,14 +1319,36 @@ def m3_roc_figure(outdir, cfg, out_png, sig_classes, cname, curves, colors,
     return keep
 
 
-def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
+def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png,
+                        signal_codes=None, sr_cuts=None,
+                        proxy_codes=None, proxy_label=None):
     """One-vs-rest overtraining check for ONE M3 class -- simpler than the
     binary overtrain_figure since there is only ONE tagger per class here
     (no S1/S2/S3-style multi-definition overlay). The overtraining numbers
     themselves are read from summary.json (already computed by
     train_one_multiclass in 02_train_tagger.py, same pattern the binary
     overtrain_figure uses) -- NOT recomputed here, since overtrain_metrics()
-    lives only in 02_train_tagger.py's venv-side code, not this PyROOT side."""
+    lives only in 02_train_tagger.py's venv-side code, not this PyROOT side.
+
+    signal_codes (2026-09-18, user, for the 2-bin cut/eff numbers only --
+    same meaning as m3_score_figure's identically-named arg): "S" in the
+    2-bin S/sqrt(S+B) optimization is the PURE signal topologies, proxy
+    excluded (cb: {1,2}, bb: {3}, bbc: {4}) -- not the full M3 training-class
+    label (which folds the class's proxy topology/topologies into "signal"
+    for loss-shaping purposes). Defaults to the full class (old behaviour,
+    yb_te==class_idx) if not passed. Drawn histograms/bias-KS ("ot") below
+    are UNCHANGED -- those track the actual trained class definition, a
+    different, still-valid question from "how pure is the real signal cut".
+
+    sr_cuts (2026-09-18, user: the 2-bin cuts are no longer auto-optimised --
+    "we will define SR1a, SR1b" etc as FIXED score windows that are now the
+    actual analysis SRs in 04_Make_plots.py's _SELECTIONS, not just this
+    diagnostic's own figure of merit): (lo, hi) pair, e.g. cb/bb (0.80,0.95),
+    bbc (0.50,0.80). The vertical lines / SR{n}a,b labels are drawn at these
+    fixed values, and eff_s/eff_rest are evaluated (not searched for) at the
+    looser cut `lo`, same convention as before. Falls back to the old
+    best_2bin_cut() auto-search if not passed.
+    """
     e = np.load(outdir / name / "eval.npz")
     nb, lo, hi = 30, 0.0, 1.0
     y_tr, y_te = e["train_y"], e["test_y"]
@@ -1218,6 +1375,29 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     s_tr, s_te = e["train_proba"][:, class_idx], e["test_proba"][:, class_idx]
     yb_tr = (y_tr == class_idx).astype(np.int8)
     yb_te = (y_te == class_idx).astype(np.int8)
+    # 2026-09-18 RESTRUCTURE (user: "the plots of 2nd row ... have signal
+    # colors from D(signal+proxy/rest) but eff from D(signal/rest) ... I
+    # tend to believe it should correspond to the 2nd entry of the ROC
+    # legends" -- i.e. the PURE-signal curve, entry 2, not entry 1/full
+    # class): h_str/h_ste (the drawn curve), h_btr/h_bte (Rest), and the
+    # bias/KS check ALL now use signal_codes (pure signal, proxy excluded)
+    # instead of the class-label yb_tr/yb_te -- the WHOLE plot is now one
+    # single, self-consistent population, matching the cut/eff numbers
+    # (which were already pure-signal) and the ROC's own "match" curve.
+    # Falls back to the old class-label behaviour if signal_codes isn't
+    # passed. Background is "NOT pure signal" (so the proxy correctly
+    # counts as background, not omitted -- same fix as the SR-cut/eff
+    # background a few turns ago).
+    topo_tr, topo_te = e["train_topo"], e["test_topo"]
+    if signal_codes is not None:
+        yb_tr_sig = np.isin(topo_tr, list(signal_codes))
+        yb_te_sig = np.isin(topo_te, list(signal_codes))
+        bkg_tr_sig = ~yb_tr_sig
+        bkg_te_sig = ~yb_te_sig
+    else:
+        yb_tr_sig, yb_te_sig = (yb_tr == 1), (yb_te == 1)
+        bkg_tr_sig, bkg_te_sig = (yb_tr == 0), (yb_te == 0)
+    yb_te_puresig = yb_te_sig
 
     def mk(tg, score, w, m):
         h = ROOT.TH1F(f"h_m3_{cname}_{tg}", "", nb, lo, hi)
@@ -1228,8 +1408,8 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
             h.Scale(1.0 / h.Integral())
         return h
 
-    h_str = mk("str", s_tr, w_tr, yb_tr == 1); h_ste = mk("ste", s_te, w_te_ot, yb_te == 1)
-    h_btr = mk("btr", s_tr, w_tr, yb_tr == 0); h_bte = mk("bte", s_te, w_te_ot, yb_te == 0)
+    h_str = mk("str", s_tr, w_tr, yb_tr_sig); h_ste = mk("ste", s_te, w_te_ot, yb_te_sig)
+    h_btr = mk("btr", s_tr, w_tr, bkg_tr_sig); h_bte = mk("bte", s_te, w_te_ot, bkg_te_sig)
     col = M3_COL[cname]
     h_str.SetLineColor(col); h_str.SetLineWidth(3); h_str.SetMarkerColor(col)
     h_str.SetMarkerSize(0)   # error bars only (2026-09-13, user) -- no marker dot
@@ -1241,9 +1421,43 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     h_btr.SetMarkerSize(0)   # error bars only (2026-09-13, user) -- no marker dot
     h_bte.SetMarkerColor(ROOT.kGray + 1); h_bte.SetMarkerStyle(21); h_bte.SetMarkerSize(1.0)
 
+    # 2026-09-18, user: "to make it clearer that the 'rest' contains the
+    # proxy, superimpose the proxy component ... dashed grey line" -- single
+    # line, dashed so it reads distinctly from Rest's own solid grey
+    # fill/outline despite the shared grey family.
+    # 2026-09-18 follow-up, user: (a) "match the training samples to have
+    # better statistics" -- built from (s_tr, w_tr) like h_btr/h_str, not
+    # the smaller test split; (b) "normalization ... corresponds to the
+    # correct fraction of the Rest training histogram" -- h_btr/h_str/etc
+    # are each independently rescaled to their OWN unit area (mk()'s
+    # Scale(1/Integral())), which would make the proxy's curve look like it
+    # carries the SAME total weight as the whole of Rest, hiding that it is
+    # actually a (typically dominant) SUBSET of it. Instead of an
+    # independent unit-area normalization, h_prx is scaled so its integral
+    # equals its true fractional share of Rest's train sum(w).
+    if proxy_codes is not None:
+        # proxy_codes (topology codes), not a precomputed mask -- the masks
+        # passed around elsewhere (m3_proxy dict) are aligned to test_topo,
+        # which is a DIFFERENT length/order than train_topo; rebuilding from
+        # codes against topo_tr directly sidesteps that mismatch entirely.
+        _proxy_mask_tr = np.isin(topo_tr, list(proxy_codes))
+        h_prx = ROOT.TH1F(f"h_m3_{cname}_prx", "", nb, lo, hi)
+        h_prx.Sumw2()
+        for v, ww in zip(s_tr[_proxy_mask_tr], w_tr[_proxy_mask_tr]):
+            h_prx.Fill(float(v), float(ww))
+        _rest_tot_w = float(w_tr[bkg_tr_sig].sum())
+        _prx_tot_w = float(w_tr[_proxy_mask_tr].sum())
+        _prx_frac = _prx_tot_w / _rest_tot_w if _rest_tot_w > 0 else 0.0
+        if h_prx.Integral() > 0:
+            h_prx.Scale(_prx_frac / h_prx.Integral())
+        h_prx.SetLineColor(ROOT.kGray + 3); h_prx.SetLineStyle(2); h_prx.SetLineWidth(2)
+        h_prx.SetMarkerSize(0)
+    else:
+        h_prx = None
+
     # 2026-09-16, user: y-range from the actual drawn content (lowest nonzero
     # bin x0.5 to highest x2), same fix as the binary overtrain_figure.
-    all_hists = [h_btr, h_bte, h_str, h_ste]
+    all_hists = [h_btr, h_bte, h_str, h_ste] + ([h_prx] if h_prx is not None else [])
     lo_y_vals, hi_y_vals = [], []
     for h in all_hists:
         for ib in range(1, h.GetNbinsX() + 1):
@@ -1257,7 +1471,12 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     c.SetTopMargin(TOP_MARGIN); c.SetRightMargin(0.025)
     c.SetLeftMargin(0.095); c.SetBottomMargin(0.075)
     c.SetTicks(1, 1); c.SetLogy()
-    comp = M3_COMPONENTS[cname]
+    # pure-signal short names (2026-09-18 restructure above), not the full
+    # class's M3_COMPONENTS (which included the proxy) -- x-axis title and
+    # "D_cb, train (...)" legend text now describe the SAME population the
+    # curve/bias-KS/cut-eff numbers all use.
+    comp = (", ".join(TOPO_SHORT[c] for c in signal_codes) if signal_codes is not None
+            else M3_COMPONENTS[cname])
     # 2026-09-16, user: "x-axis title 0.5% higher" / "y-axis title 0.5%
     # lower", THEN (same day, presumably the first nudge read as too
     # subtle) "x-axis title 1% higher" / "y-axis title 1% lower" again --
@@ -1269,12 +1488,21 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # further from the frame (offset multiplies the horizontal gap for a
     # rotated Y title -- this is the only continuous knob SetTitleOffset
     # gives on that axis).
+    # 2026-09-18, user (this figure only): x-axis title 1% higher (additional
+    # xoff *0.99, same convention as above), x-axis tick numbers ("legends")
+    # 1% lower (LabelOffset +0.005, undoing the earlier -0.005 "1% closer"
+    # nudge), y-axis title ("legend") 1% closer to the axis (additional
+    # yoff *0.99).
     frame = _axes(c.DrawFrame(lo, y_lo, hi, y_hi),
                   f"{M3_DISP[cname]}( {comp} / rest )",
                   "N_{jets} norm. to 1", tsize=0.036,
-                  xoff=1.05 * 0.995 * 0.99, yoff=1.315 * 1.005 * 1.01)
+                  # 2026-09-18, further nudges: x-axis title 1% higher
+                  # (additional xoff *0.99), y-axis title 1% closer to the
+                  # axis (additional yoff *0.99).
+                  xoff=1.05 * 0.995 * 0.99 * 0.99 * 0.99,
+                  yoff=1.315 * 1.005 * 1.01 * 0.99 * 0.99)
     frame.GetYaxis().SetLabelOffset(0.005)   # tick numbers 1% closer
-    frame.GetXaxis().SetLabelOffset(-0.005)  # x-axis tick numbers 1% closer
+    frame.GetXaxis().SetLabelOffset(-0.005 + 0.005)  # x-axis tick numbers 1% lower (net back to 0)
     # 2026-09-16, user: "no horizontal lines, only vertical errorbars" --
     # "E1" adds small perpendicular end-cap ticks to every error bar; plain
     # "E" draws the vertical error bar alone. Train histograms now ALSO
@@ -1282,21 +1510,68 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # "HIST E" draws both together.
     h_btr.Draw("HIST E SAME"); h_bte.Draw("E SAME")
     h_str.Draw("HIST E SAME"); h_ste.Draw("E SAME")
+    if h_prx is not None:
+        h_prx.Draw("HIST SAME")
 
-    # 2026-09-16, user: "evaluate the 1-bin optimal cut of this variable" --
-    # single score>=thr working point maximising S/sqrt(S+B) on the TEST
-    # sample, marked with a dashed grey vertical line + efficiencies quoted
-    # next to it. Stays on the RAW physics w_te (not w_te_ot) -- this is a
-    # physical per-jet efficiency, not the loss-shaping mixture check below.
-    cut_thr, cut_eff_s, cut_eff_b = best_1bin_cut(s_te, w_te, yb_te == 1, yb_te == 0)
+    # 2026-09-18, user: "evaluate the optimal cut not based on 1-bin
+    # optimization but on 2-bin optimization" -- 2 dashed grey vertical
+    # lines, S = pure signal (yb_te_puresig), B = rest jets. Efficiencies
+    # quoted at the LOOSER (lower) threshold ("keep the eff numerics to
+    # correspond to the 2nd looser cut bin"). Stays on RAW physics w_te (not
+    # w_te_ot) -- physical per-jet efficiency, not the loss-shaping mixture
+    # check below.
+    # 2026-09-18 FOLLOW-UP, user: "we will define SR1a, SR1b..." as FIXED
+    # score windows (now the real analysis SRs, see 04_Make_plots.py's
+    # _SELECTIONS) rather than an auto-optimised working point -- sr_cuts
+    # overrides the search when given; only falls back to best_2bin_cut()
+    # when sr_cuts isn't passed (kept for standalone/exploratory use).
+    # 2026-09-18 BUGFIX (user: "the marker for 2nd curve is on the air ...
+    # something wrong in the way we group topologies into targeted/rest"):
+    # background here MUST be "not pure signal" (topology-based,
+    # ~isin(topo,signal_codes)), matching the ROC curve's own native
+    # definition -- NOT "not this class" (yb_te==0), which ALSO excludes
+    # this class's own proxy topology from background (since the proxy IS
+    # part of y_te==class_idx), silently dropping it from the eff_rest
+    # calculation entirely instead of counting it as the real background it
+    # physically is (verified: cb's eff_rest at the 0.80 cut was 1.3% under
+    # the old bug, 3.7% -- correct, and matching the ROC curve -- once the
+    # proxy is properly counted).
+    _bkg_mask_sig = bkg_te_sig
+    if sr_cuts is not None:
+        cut_lo, cut_hi = float(sr_cuts[0]), float(sr_cuts[1])
+        _sig_tot_w = float(w_te[yb_te_puresig].sum())
+        _bkg_tot_w = float(w_te[_bkg_mask_sig].sum())
+        cut_eff_s = (float(w_te[yb_te_puresig & (s_te >= cut_lo)].sum()) / _sig_tot_w
+                     if _sig_tot_w > 0 else 0.0)
+        cut_eff_b = (float(w_te[_bkg_mask_sig & (s_te >= cut_lo)].sum()) / _bkg_tot_w
+                     if _bkg_tot_w > 0 else 0.0)
+    else:
+        cut_lo, cut_hi, cut_eff_s, cut_eff_b, _ = best_2bin_cut(s_te, w_te, yb_te_puresig, _bkg_mask_sig)
+        _sig_tot_w = float(w_te[yb_te_puresig].sum())
+        _bkg_tot_w = float(w_te[_bkg_mask_sig].sum())
+    # 2026-09-18, user: "at the eff text we can add extra values
+    # corresponding to both WPs indicated" -- eff at the tighter (SRnb) cut
+    # too, same cumulative (score>=thr) convention as the looser one above.
+    cut_eff_s_hi = (float(w_te[yb_te_puresig & (s_te >= cut_hi)].sum()) / _sig_tot_w
+                    if _sig_tot_w > 0 else 0.0)
+    cut_eff_b_hi = (float(w_te[_bkg_mask_sig & (s_te >= cut_hi)].sum()) / _bkg_tot_w
+                    if _bkg_tot_w > 0 else 0.0)
     # 2026-09-16, user: "extend at 2/3 of the y-axis length" -- was the full
     # frame height; on this log-y axis, "2/3 of the length" means 2/3 of the
     # log10(y_hi/y_lo) span from the bottom, so it now stops just below the
     # legend box instead of running all the way to the top.
     y_line_top = y_lo * (y_hi / y_lo) ** (2.0 / 3.0)
-    ln = ROOT.TLine(cut_thr, y_lo, cut_thr, y_line_top)
-    ln.SetLineColor(ROOT.kGray + 2); ln.SetLineStyle(2); ln.SetLineWidth(2)
-    ln.Draw(); ROOT.SetOwnership(ln, False)
+    # 2026-09-18, user: colour these to match the PURE-signal m3_roc_figure
+    # curve (not plain grey) -- these numbers are computed on that same
+    # population, a different one from the drawn D_cb/D_bb/D_bbc line above.
+    # 2026-09-18 RESTRUCTURE: h_str/h_ste are now this SAME pure-signal
+    # population (see above), so the cut-lines/SR-labels/eff-text just use
+    # the same `col` as the main curve -- no more two-colour split.
+    _mc = col
+    for _ct in (cut_lo, cut_hi):
+        ln = ROOT.TLine(_ct, y_lo, _ct, y_line_top)
+        ln.SetLineColor(_mc); ln.SetLineStyle(2); ln.SetLineWidth(2)
+        ln.Draw(); ROOT.SetOwnership(ln, False)
     # 2026-09-16 bugfix, user: the annotation used to sit in DATA coordinates
     # near the top of the (now much taller, x5/x10 headroom) frame, which
     # collided with the "70% train / 15% test" header -- switched to NDC
@@ -1304,17 +1579,25 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # c.SetLeftMargin/SetRightMargin).
     # 2026-09-16, user: "the line at lower 1/3 of y-axis range, eff values on
     # its right" -- text placed at the NDC height corresponding to 1/3 up the
-    # log-scale y-axis (bottom margin 0.075, top margin TOP_MARGIN=0.065), to
-    # the right of the line; the line itself now spans 2/3 of the frame (see
-    # y_line_top above), not the full height.
-    x_ndc = min(0.095 + cut_thr * (1.0 - 0.095 - 0.025) + 0.015, 0.860)
+    # log-scale y-axis (bottom margin 0.075, top margin TOP_MARGIN=0.065).
+    # 2026-09-18, user: moved from the RIGHT of the looser/lower line to its
+    # LEFT -- anchor is now the line's own NDC x minus a small gap, with the
+    # text right-aligned (TextAlign 31, was 11) so it grows leftward from
+    # that gap instead of rightward from it. Line itself spans 2/3 of the
+    # frame (see y_line_top above), not the full height.
+    _line_x_ndc = 0.095 + cut_lo * (1.0 - 0.095 - 0.025)
+    x_ndc = max(_line_x_ndc - 0.015, 0.100)
     y_ndc = 0.075 + (1.0 / 3.0) * (1.0 - TOP_MARGIN - 0.075) - 0.10
     t_cut = ROOT.TLatex(); t_cut.SetNDC(True); t_cut.SetTextFont(42)
-    t_cut.SetTextSize(0.024); t_cut.SetTextColor(ROOT.kGray + 3)
-    t_cut.SetTextAlign(11)
+    t_cut.SetTextSize(0.024); t_cut.SetTextColor(_mc)
+    t_cut.SetTextAlign(31)
     t_cut.DrawLatex(x_ndc, y_ndc,
-                    "#splitline{cut = %.2f}{#splitline{eff_{%s} = %.1f%%}{eff_{rest} = %.1f%%}}"
-                    % (cut_thr, cname, 100 * cut_eff_s, 100 * cut_eff_b))
+                    "#splitline{cuts = %.2f / %.2f}"
+                    "{#splitline{eff_{%s}(a,b) = %.1f%% / %.1f%%}"
+                    "{eff_{rest}(a,b) = %.1f%% / %.1f%%}}"
+                    % (cut_lo, cut_hi, cname,
+                       100 * cut_eff_s, 100 * cut_eff_s_hi,
+                       100 * cut_eff_b, 100 * cut_eff_b_hi))
     ROOT.SetOwnership(t_cut, False)
 
     # 2026-09-16, user: bias re-evaluated at score>0.5 (was cfg's 0.6),
@@ -1322,8 +1605,8 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # summary.json number, same bugfix as the binary overtrain_figure (that
     # value would otherwise stay silently frozen at the old cut).
     OT_SCORE_CUT = 0.5
-    ot = subset_overtrain(s_tr, w_tr, yb_tr == 1, yb_tr == 0,
-                          s_te, w_te_ot, yb_te == 1, yb_te == 0, OT_SCORE_CUT)
+    ot = subset_overtrain(s_tr, w_tr, yb_tr_sig, bkg_tr_sig,
+                          s_te, w_te_ot, yb_te_sig, bkg_te_sig, OT_SCORE_CUT)
 
     def row_verdict(bias):
         return "OK" if bias < 5.0 else ("WARN" if bias < 15.0 else "FAIL")
@@ -1347,17 +1630,29 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     # 2026-09-16, user: "legend (numbers) 0.5% lower", then again "1%
     # lower" the same day -- additive, whole box (and its white backing
     # pave) shifted down by 0.005 + 0.010 = 0.015 NDC total.
-    _LG_DY = 0.005 + 0.010
-    pvw = ROOT.TPave(0.245, 0.690 - _LG_DY, 0.730, 0.860 - _LG_DY, 0, "NDC")
+    # 2026-09-18, user: "shift the legend 2% higher and 2% to the right" --
+    # additional compounding offsets on top of the existing _LG_DY (higher =
+    # SUBTRACT less, since _LG_DY is subtracted from the y-coords) and a new
+    # _LG_DX (added to the x-coords).
+    _LG_DY = 0.005 + 0.010 - 0.02
+    _LG_DX = 0.02
+    pvw = ROOT.TPave(0.245 + _LG_DX, 0.690 - _LG_DY, 0.730 + _LG_DX, 0.860 - _LG_DY, 0, "NDC")
     pvw.SetFillColor(ROOT.kWhite); pvw.SetFillStyle(1001); pvw.SetBorderSize(0)
     pvw.Draw(); ROOT.SetOwnership(pvw, False)
-    lg = _legend(0.250, 0.695 - _LG_DY, 0.725, 0.855 - _LG_DY, TXT * 0.85)
+    # 2026-09-18, user: "make the legend text 5% larger".
+    lg = _legend(0.250 + _LG_DX, 0.695 - _LG_DY, 0.725 + _LG_DX, 0.855 - _LG_DY, TXT * 0.85 * 1.05)
     lg.SetMargin(0.16)
     # 2026-09-16, user: "at the train entries note the components" -- Test
     # rows stay compact (bias/KS/verdict); Train rows spell out their own
     # topology composition instead, since that info isn't duplicated there.
     # 2026-09-16, user: "place first the train and then the test".
-    lg.AddEntry(h_btr, "Rest, train ( %s )" % _m3_rest_components(cname), "f")
+    # 2026-09-18: "Rest" is now "NOT pure signal" (includes the proxy), not
+    # "NOT full class" -- _m3_rest_components(cname) described the OLD,
+    # full-class definition and would wrongly still exclude the proxy from
+    # this text; built directly from signal_codes instead.
+    _rest_txt = ("non " + ", ".join(TOPO_SHORT[c] for c in signal_codes)
+                 if signal_codes is not None else _m3_rest_components(cname))
+    lg.AddEntry(h_btr, "Rest, train ( %s )" % _rest_txt, "f")
     lg.AddEntry(h_bte, "Rest, test (bias %.1f%%, KS %.2f, %s)"
                 % (ot["rel_diff_bkg_pct"], ot["ks_bkg_p"],
                    row_verdict_colored(ot["rel_diff_bkg_pct"])), "p")
@@ -1365,7 +1660,27 @@ def m3_overtrain_figure(outdir, name, cname, class_idx, summary, cfg, out_png):
     lg.AddEntry(h_ste, "%s, test (bias %.1f%%, KS %.2f, %s)"
                 % (M3_DISP[cname], ot["rel_diff_sig_pct"], ot["ks_sig_p"],
                    row_verdict_colored(ot["rel_diff_sig_pct"])), "p")
+    if h_prx is not None:
+        lg.AddEntry(h_prx, "proxy ( %s )" % proxy_label, "l")
     lg.Draw()
+
+    # 2026-09-18, user: name the 2 categories the 2-bin optimization forms --
+    # SR{n}a = the looser/lower bin [cut_lo,cut_hi), SR{n}b = the tighter/
+    # upper bin [cut_hi,1] (reading left-to-right in score, "a" first); n =
+    # 1/2/3 for cb/bb/bbc. Drawn AFTER the legend's opaque white backing pave
+    # (bugfix: drawing it earlier let the pave paint over the label whenever
+    # a bin centre fell under the legend's NDC footprint, e.g. bbc's SR3a).
+    _sr_n = {"cb": 1, "bb": 2, "bbc": 3}[cname]
+    # 2026-09-18, user: "the location of SRxy text ... should be identical
+    # in all 3 such plots" -- unified onto the SAME formula/exponent for
+    # cb/bb/bbc (was bbc-only at 0.5, cb/bb still at the old 0.85 default;
+    # now all 3 share the lower (0.5-exponent) position).
+    _sr_y = y_lo * (y_hi / y_lo) ** 0.5
+    t_sr = ROOT.TLatex(); t_sr.SetTextFont(42); t_sr.SetTextColor(_mc)
+    t_sr.SetTextSize(0.028 * 1.10); t_sr.SetTextAlign(22)  # +10% (2026-09-18, user)
+    t_sr.DrawLatex(0.5 * (cut_lo + cut_hi), _sr_y, f"#it{{SR{_sr_n}a}}")
+    t_sr.DrawLatex(0.5 * (cut_hi + 1.0), _sr_y, f"#it{{SR{_sr_n}b}}")
+    ROOT.SetOwnership(t_sr, False)
 
     cms_header(cfg, c, dx=0.095 - CMS_X, lumi_dx=-0.01)
     c.RedrawAxis(); c.SaveAs(str(out_png))
@@ -1468,8 +1783,10 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
     # frame's own right edge at 1-0.025=0.975 -- 0.965 left only a 1%
     # gap, easy to touch at some font/DPI combinations).
     # 2026-09-16, user: "shift the legend 2% to the left" -- both x-edges.
+    # 2026-09-18, user: additional 3% to the left (compounding, not
+    # replacing) -- total -0.05.
     Y0 = 0.860
-    LG_DX = -0.02
+    LG_DX = -0.02 - 0.03
     lg = _legend(0.600 + LG_DX, Y0 - 0.350, 0.950 + LG_DX, Y0 - 0.235, TXT)
     # 2026-09-17, user: "(this class)" redundant (the header line already
     # names the class); "%Imp gain (global)" unclear -- renamed to state
@@ -1627,7 +1944,8 @@ def m3_permimp_figure(outdir, name, cname, class_idx, class_groups, summary, cfg
 
 def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
                     proxy_mask, proxy_label, show_own_components=True,
-                    exclude_codes=()):
+                    exclude_codes=(), signal_codes=None,
+                    proxy2_mask=None, proxy2_label=None, hide_bkg=False):
     """One-vs-rest score composition for ONE M3 class, ratio-to-proxy pad
     style like the binary score_figure ("S/proxy-inspection", user's name
     for this plot type).
@@ -1660,11 +1978,32 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     ratio == 1 by construction) and AGAIN as its own coloured component line
     with a near-identical but not-identical label ("prx" vs "proxy"). Now
     passed as (5,) for cb so it appears only once (the black reference).
+
+    proxy2_mask/proxy2_label (2026-09-18, user, bbc only): bbc actually has
+    TWO distinct proxy populations -- the UNCONDITIONAL t3(b'cq) proxy flag
+    (no cut on the bbc-composite dR; this is proxy_mask/h_prx, black) and a
+    dR-WINDOWED subset of it (topology 8, dR-composite in [0.6,1.2] -- see
+    01_build_trainset.py's BCQ_PROXY_CODE). When passed, h_prx2 is drawn as
+    a second, distinctly-coloured dashed reference line, and the ratio pad
+    is computed against h_prx2 instead of h_prx (2026-09-18 follow-up, user:
+    "the ratio should be evaluated wrt the dR-conditional proxy").
+
+    signal_codes (2026-09-18, user: "the total should be the signal only,
+    without the proxy -- we want to test whether the pure signal components
+    are consistent with the proxy shapes"): the topology codes h_tot sums,
+    in place of ALL of my_codes. Previously h_tot summed every my_codes
+    topology INCLUDING the class's own proxy-analog code (5 for cb, 6+7 for
+    bb, 8 for bbc) -- since that proxy-analog is >99% of the raw physical
+    weight in that union (see chat, 2026-09-18), "total" was landing almost
+    exactly on top of the proxy line by construction, which defeats the
+    plot's actual purpose (comparing PURE signal shape against the proxy).
+    Defaults to my_codes (old behaviour) if not passed.
     """
     e = np.load(outdir / name / "eval.npz")
     s, w, topo = e["test_proba"][:, class_idx], e["test_w"], e["test_topo"]
     nb = 30
     my_codes = sorted(int(k) for k, v in class_groups.items() if int(v) == class_idx)
+    _sig_codes = list(signal_codes) if signal_codes is not None else my_codes
 
     def mk(tg, mask, col, width, style=1):
         h = ROOT.TH1F(f"s_m3_{cname}_{tg}", "", nb, 0.0, 1.0)
@@ -1677,13 +2016,32 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
         h.SetMarkerColor(col)
         return h
 
-    h_bkg = mk("bkg", topo == 0, ROOT.kGray + 1, 4)
-    h_tot = mk("tot", np.isin(topo, my_codes), M3_COL[cname], 4)
+    # hide_bkg (2026-09-18, user, bbc family only): drop the grey total-BKG
+    # (topology 0) histogram from the plot entirely -- not built at all, so
+    # it's absent from the drawn curves, the legend, AND the y-axis auto-
+    # range that fits to what's actually drawn.
+    h_bkg = None if hide_bkg else mk("bkg", topo == 0, ROOT.kGray + 1, 4)
+    h_tot = mk("tot", np.isin(topo, _sig_codes), M3_COL[cname], 4)
     show_codes = my_codes if show_own_components else [c for c in my_codes if c == 3]
     show_codes = [c for c in show_codes if c not in exclude_codes]
+    # drop a component that IS the entire signal total, code-for-code (2026-
+    # 09-18, user: "why are there 2 identical entries for t3(b'bc)? ... drop
+    # one" -- bb/bbc each have only ONE pure-signal topology in _sig_codes,
+    # so their sole h_cls entry is bit-for-bit the same population as h_tot;
+    # cb is unaffected (_sig_codes has 2 codes, no single component matches).
+    if len(_sig_codes) == 1:
+        show_codes = [c for c in show_codes if c != _sig_codes[0]]
     h_cls = {c: mk(f"c{c}", topo == c, TOPO_COL[c], 3, 2) for c in show_codes
              if (topo == c).sum() > 20}
-    h_prx = mk("prx", proxy_mask, ROOT.kBlack, 4, 1)
+    # style=2 (dashed): a SOLID black h_prx (the old bug -- this was meant to
+    # be dashed per this function's own docstring but the style arg was left
+    # at 1) drawn last fully occludes the same-shape solid h_tot underneath
+    # it almost everywhere, which is exactly the "upper pad has only black"
+    # complaint (2026-09-18, user) -- dashing it lets h_tot's colour show
+    # through in the gaps instead of hiding it.
+    h_prx = mk("prx", proxy_mask, ROOT.kBlack, 4, 2)
+    h_prx2 = (mk("prx2", proxy2_mask, ROOT.kViolet + 1, 4, 2)
+              if proxy2_mask is not None else None)
     n_bkg = int((topo == 0).sum())
 
     c = ROOT.TCanvas(f"sc_m3_{cname}", "", SQ, SQ)
@@ -1692,18 +2050,23 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     p2 = ROOT.TPad(f"p2_m3_{cname}", "", 0, 0.0, 1, P2_H)
     p2.SetTopMargin(0.03); p2.SetBottomMargin(0.25)
     for pp in (p1, p2):
-        pp.SetTicks(1, 1); pp.SetLeftMargin(0.145); pp.SetRightMargin(RIGHT_MARGIN)
+        # left margin 1% smaller (2026-09-18, user): 0.145 -> 0.135.
+        pp.SetTicks(1, 1); pp.SetLeftMargin(0.135); pp.SetRightMargin(RIGHT_MARGIN)
     p1.Draw(); p2.Draw()
 
     p1.cd(); p1.SetLogy()
-    all_h = [h_bkg, h_tot, h_prx] + list(h_cls.values())
+    all_h = ([h_bkg] if h_bkg is not None else []) + [h_tot, h_prx] + ([h_prx2] if h_prx2 is not None else []) + list(h_cls.values())
     # y-axis span fit to what's ACTUALLY drawn (2026-09-13, user: cb/bbc
     # panels were clipping real yield at both the top and bottom of the old
     # fixed 3e-3..0.5 window) instead of a one-size-fits-all fixed range.
     peak = max((h.GetMaximum() for h in all_h), default=0.5)
     floor = min((h.GetBinContent(b) for h in all_h for b in range(1, nb + 1)
                 if h.GetBinContent(b) > 0), default=3e-3)
-    f1 = p1.DrawFrame(0.0, floor * 0.5, 1.0, peak * 1.8)
+    # headroom above the tallest curve, x5 (2026-09-18, user: "set upper
+    # pad-yaxis max ... x5 to avoid histo-legend overlaps") -- the legend box
+    # is transparent/borderless (_legend()'s shared style) and was landing
+    # right on top of the curves in the 0.61-0.84 log-y band; was 1.8.
+    f1 = p1.DrawFrame(0.0, floor * 0.5, 1.0, peak * 1.8 * 5)
     f1.GetYaxis().SetTitle("N_{jets} norm. to 1")
     f1.GetYaxis().SetTitleSize(0.0385 / P1_H); f1.GetYaxis().SetTitleOffset(0.72)
     f1.GetYaxis().SetLabelSize(LSIZE / P1_H); f1.GetXaxis().SetLabelSize(0)
@@ -1715,14 +2078,34 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     # column separation was -0.27 (compressed, 2026-09-15 user: "give more
     # space between the 2 columns") -- now a small POSITIVE gap instead.
     lg.SetNColumns(2); lg.SetMargin(0.16); lg.SetColumnSeparation(0.06)
-    left = [(h_bkg, "BKG %.2fM jets" % (n_bkg / 1e6)), (h_tot, f"{M3_DISP[cname]} (total)"),
-            (h_prx, proxy_label)]
+    # Spelled out as the literal sum of its components (2026-09-18, user:
+    # "write the Total as a sum of components to be clear, and remove Dcb").
+    # h_tot now sums only _sig_codes -- the PURE signal topologies, proxy
+    # excluded (2026-09-18 follow-up, user: "the total should be the signal
+    # only, without the proxy") -- weighted by real physical test_w (the
+    # "natural relative fractions", per that same message; no artificial
+    # training-subshare reweighting).
+    _tot_label = " + ".join(TOPO_LAB[c] for c in _sig_codes)
+    left = ([(h_bkg, "BKG %.2fM jets" % (n_bkg / 1e6))] if h_bkg is not None else [])
+    left += [(h_tot, _tot_label), (h_prx, proxy_label)]
+    if h_prx2 is not None:
+        left.append((h_prx2, proxy2_label))
     right = [(h, TOPO_LAB[c]) for c, h in h_cls.items()]
+    # blank filler when a row's right-column partner doesn't exist (2026-09-18
+    # fix): ROOT's TLegend fills row-major over the FLAT AddEntry order, not
+    # over these logical (left[i], right[i]) pairs -- with fewer right
+    # entries than left (e.g. bb, show_own_components=False -> only 1 right
+    # entry), the *next* left entry (h_tot, whose label can be long: "spelled
+    # out as sum of components") ends up sharing a row with an unrelated
+    # later left entry instead of empty space, and the two collide/overlap.
+    # An explicit blank entry keeps each row's right cell empty on purpose.
     for i in range(max(len(left), len(right))):
         if i < len(left):
             lg.AddEntry(left[i][0], left[i][1], "l")
         if i < len(right):
             lg.AddEntry(right[i][0], right[i][1], "l")
+        elif i < len(left):
+            lg.AddEntry(h_tot, "", "")
     lg.Draw()
     p1.RedrawAxis()
     cms_header(cfg, c)
@@ -1735,25 +2118,29 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     f2.GetXaxis().SetTitleSize(TSIZE_X_RATIO / P2_H); f2.GetXaxis().SetLabelSize(LSIZE / P2_H)
     f2.GetXaxis().SetTitleOffset(1.12)
     f2.GetYaxis().SetTitleSize(TSIZE_Y_RATIO / P2_H); f2.GetYaxis().SetLabelSize(LSIZE / P2_H)
-    f2.GetYaxis().SetTitleOffset(0.97); f2.GetYaxis().SetNdivisions(505)
+    # y-axis title 2% closer to the axis (2026-09-18, user): 0.97 -> 0.9506.
+    f2.GetYaxis().SetTitleOffset(0.97 * 0.98); f2.GetYaxis().SetNdivisions(505)
     f2.GetYaxis().SetLabelOffset(0.005)
-    # 2026-09-15, user: "unclear what the lower ratio pads are, what is the
-    # numerator and denominator" -- spell it out. Denominator is ALWAYS the
-    # black dashed proxy_label curve (h_prx); numerator is whichever
-    # same-coloured curve from the top pad the ratio line matches.
-    _rcap = ROOT.TLatex(); _rcap.SetNDC(); _rcap.SetTextFont(42)
-    _rcap.SetTextSize(TXT * 0.80); _rcap.SetTextColor(ROOT.kGray + 2)
-    _rcap.SetTextAlign(13)
-    _rcap.DrawLatex(0.150, 0.965,
-                    "#it{curve = (top-pad line of the same colour) / (black "
-                    + proxy_label + " line)}")
-    ROOT.SetOwnership(_rcap, False)
+    # grey "curve = .../..." caption REMOVED (2026-09-18, user: "remove the
+    # grey text at lower pad from all these plots"). Denominator is always
+    # the black-dashed unconditional proxy (h_prx) UNLESS a second, more
+    # specific proxy was supplied (h_prx2, bbc's dR-windowed one) -- 2026-09-18
+    # follow-up, user: "the ratio should be evaluated wrt the dR-conditional
+    # proxy" -- then that's used instead, for every ratio line including tot.
+    # Numerator is whichever same-coloured top-pad line the ratio matches --
+    # conveyed by colour alone now.
+    #
+    # "tot" ratio line RESTORED (2026-09-18, user, after the total/proxy
+    # near-degeneracy was explained in chat: it's an expected consequence of
+    # raw-weight composition, not a bug -- the line is kept since it now has
+    # a clear, understood meaning: total-signal / proxy).
+    _denom = h_prx2 if h_prx2 is not None else h_prx
     ratios = []
     for cc, h in [("tot", h_tot)] + list(h_cls.items()):
         r = h.Clone(f"r_m3_{cname}_{cc}")
         for b in range(1, nb + 1):
             x, sx = h.GetBinContent(b), h.GetBinError(b)
-            pp, sp = h_prx.GetBinContent(b), h_prx.GetBinError(b)
+            pp, sp = _denom.GetBinContent(b), _denom.GetBinError(b)
             if pp <= 0 or x <= 0:
                 r.SetBinContent(b, 0.0); r.SetBinError(b, 0.0); continue
             v = x / pp
@@ -1768,7 +2155,8 @@ def m3_score_figure(outdir, name, cname, class_idx, class_groups, cfg, out_png,
     ROOT.SetOwnership(one, False)
     p2.RedrawAxis()
     c.SaveAs(str(out_png))
-    return [h_bkg, h_tot, h_prx] + list(h_cls.values()) + ratios
+    return (([h_bkg] if h_bkg is not None else []) + [h_tot, h_prx]
+            + ([h_prx2] if h_prx2 is not None else []) + list(h_cls.values()) + ratios)
 
 
 # --------------------------------------------------------------------------- #
@@ -1921,6 +2309,37 @@ def build_report(cfg, outdir):
         # named as such), and a genuinely parallel roc_M3_bb.png added,
         # using D_bb's OWN score (not D_cb's) throughout.
         _presel = ds_meta.get('preselection_used')
+
+        # 2026-09-18, user: "update to the new optimal values ... for all 3
+        # D_xx scores ... propagated to the SR definition, so that every
+        # SRij is updated based on these results ... automate this when we
+        # run 03*.py to propagate changes also at 04*.py" -- 2-bin-optimal
+        # (lo, hi) recomputed HERE ONCE per class (pure signal vs "not pure
+        # signal", matching the m3_overtrain_figure restructure above), fed
+        # into both this figure's WP markers and m3_overtrain_figure's
+        # vertical lines below, AND written to S1_tagger/sr_cuts.json so
+        # 04_Make_plots.py's _SELECTIONS (SR1A/B..SR3A/B) can read the SAME
+        # numbers at import time instead of carrying its own hardcoded copy.
+        _e_sr = np.load(outdir / "M3" / "eval.npz")
+        _w_sr, _topo_sr = _e_sr["test_w"], _e_sr["test_topo"]
+        _sr_signal_codes = {"cb": (1, 2), "bb": (3,), "bbc": (4,)}
+        _sr_cuts_auto = {}
+        for _cn, _codes in _sr_signal_codes.items():
+            _ci = next(i for i, cn in sig_classes if cn == _cn)
+            _sc = _e_sr["test_proba"][:, _ci]
+            _sig_m = np.isin(_topo_sr, _codes)
+            _lo, _hi, _es, _eb, _z = best_2bin_cut(_sc, _w_sr, _sig_m, ~_sig_m)
+            # rounded to the nearest 0.05 (2026-09-18, user) for clean,
+            # readable SR-window numbers.
+            _sr_cuts_auto[_cn] = (round(round(_lo / 0.05) * 0.05, 2),
+                                  round(round(_hi / 0.05) * 0.05, 2))
+        _sr_cuts_path = PKG / "sr_cuts.json"
+        _sr_cuts_path.write_text(json.dumps(
+            {"generated": datetime.datetime.now().isoformat(),
+             "dataset_tag": cfg.get("dataset_tag"),
+             "sr_cuts": _sr_cuts_auto}, indent=2))
+        print(f"  wrote {_sr_cuts_path}  (2-bin-optimal SR cuts: {_sr_cuts_auto})")
+
         roc_m3_cb = outdir / "roc_M3_cb.png"
         keep += _timed_call(
             produced, "roc_M3_cb.png", roc_m3_cb, m3_roc_figure,
@@ -1928,7 +2347,8 @@ def build_report(cfg, outdir):
             curves=[("D_{cb}( cb, b'c, b'c-prx / rest )", (1, 2, 5)),
                     ("D_{cb}( cb, b'c / rest )", (1, 2)),
                     ("D_{cb}( cb, b'c, b'b, b'bc / rest )", (1, 2, 3, 4))],
-            colors=[4, 62, 65], presel=_presel)
+            colors=[4, 62, 65], presel=_presel,
+            match_signal_codes=(1, 2), match_sr_cuts=_sr_cuts_auto["cb"])
         # 2026-09-16, user's own 3 curves for D_bb (typed explicitly, not
         # guessed -- bb's components are physically distinct processes with
         # no natural cb-style narrowing order).
@@ -1940,20 +2360,28 @@ def build_report(cfg, outdir):
                     ("D_{bb}( b'b / rest )", (3,)),
                     ("D_{bb}( cb, b'c, b'b, b'bc / rest )", (1, 2, 3, 4))],
             colors=[ROOT.kGreen + 4, ROOT.kGreen + 2, ROOT.kGreen + 0],
-            presel=_presel)
+            presel=_presel,
+            match_signal_codes=(3,), match_sr_cuts=_sr_cuts_auto["bb"])
         # 2026-09-16, user: "the ROC curve for D_bbc is missing; add it
-        # alongside the rest" -- 2 curves (bbc's own class vs the same wide
-        # cb/b'c/b'b/b'bc comparison the cb/bb panels already carry; bbc has
-        # only ONE constituent topology (4), unlike cb/bb's multi-topology
-        # narrowing, so there is no natural 3rd intermediate definition).
+        # alongside the rest".
+        # 2026-09-18, user: "for the Dbbc, ROCs should also have 3 curves,
+        # the one for bbc+bcq-prx / rest is missing" -- the FULL bbc class
+        # (topology 4+8, same population m3_overtrain_figure's h_str/h_ste
+        # actually draw) was missing entirely; cb/bb both have this as their
+        # curve0. Added as curve0 here too, now symmetric with cb/bb's
+        # (full, pure, wide) ordering. New darkest shade (kMagenta+4) for it;
+        # the former curve0 ("b'bc/rest", pure signal, still the match_*
+        # curve) and curve1 (wide cross-class) colors are unchanged.
         roc_m3_bbc = outdir / "roc_M3_bbc.png"
         keep += _timed_call(
             produced, "roc_M3_bbc.png", roc_m3_bbc, m3_roc_figure,
             outdir, cfg, roc_m3_bbc, sig_classes, "bbc",
-            curves=[("D_{bbc}( b'bc / rest )", (4,)),
+            curves=[("D_{bbc}( b'bc, b'cq-prx / rest )", (4, 8)),
+                    ("D_{bbc}( b'bc / rest )", (4,)),
                     ("D_{bbc}( cb, b'c, b'b, b'bc / rest )", (1, 2, 3, 4))],
-            colors=[ROOT.kMagenta + 3, ROOT.kMagenta + 1],
-            presel=_presel)
+            colors=[ROOT.kMagenta + 2, ROOT.kMagenta + 0, ROOT.kMagenta - 9],
+            presel=_presel,
+            match_signal_codes=(4,), match_sr_cuts=_sr_cuts_auto["bbc"])
 
         # per-class proxy reference for the score/S-proxy-inspection plot
         # (2026-09-13, user) -- see m3_score_figure's docstring for why each
@@ -1967,10 +2395,31 @@ def build_report(cfg, outdir):
         # "proxy" now used consistently everywhere (not abbreviated "prx"),
         # and cb's own topology-5 component is excluded from h_cls (4th
         # tuple element) so it only appears once, as this reference line.
+        # 5th tuple element (2026-09-18, user: "the total should be the
+        # signal only, without the proxy -- we want to test whether the pure
+        # signal components are consistent with the proxy shapes") -- the
+        # PURE-signal topology codes that h_tot sums (natural physical-weight
+        # mix, no artificial reweighting), excluding this class's own
+        # proxy-analog topology from that union:
+        #   cb:  {1,2}  (Wcb, t^2(b'c))       -- excludes 5  (its own proxy)
+        #   bb:  {3}    (t^2(b'b))            -- excludes 6,7 (Zbb, QCDbb --
+        #        these ARE the bb proxy reference, not bb signal)
+        #   bbc: {4}    (t^3(b'bc))           -- excludes 8  (its proxy-analog)
+        #
+        # bbc has TWO proxy populations (2026-09-18, user), passed as extra
+        # (proxy2_mask, proxy2_label) tuple elements 6/7: the UNCONDITIONAL
+        # t3bcq_proxy_flag (no cut on the bbc dR-composite -- h_prx, black)
+        # and topology 8 itself, the dR-WINDOWED subset of it (dR-composite
+        # in [0.6,1.2], see BCQ_PROXY_CODE in 01_build_trainset.py -- h_prx2,
+        # violet). Topology 8 is dropped from exclude_codes's complement (now
+        # (4, 8) instead of (4,)) since it's promoted to this proxy2 role
+        # instead of being drawn as a signal "component".
         m3_proxy = {
-            "cb":  (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,)),
-            "bb":  (np.isin(_topo_m3, (6, 7)), "Zbb+QCD(bb)", False, ()),
-            "bbc": (e_m3["test_t3bcq_proxy"], "t^{3}(b'cq) proxy", True, ()),
+            "cb":  (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,), (1, 2)),
+            "bb":  (np.isin(_topo_m3, (6, 7)), "Zbb+QCD(bb)", False, (), (3,)),
+            "bbc": (e_m3["test_t3bcq_proxy"], "t^{3}(b'cq) proxy (no #DeltaR cut)",
+                    True, (8,), (4,),
+                    _topo_m3 == 8, "t^{3}(b'cq) proxy (#DeltaR#in[0.6,1.2])"),
         }
 
         # 2026-09-17, user: "the orange bars are the same across all 3
@@ -1991,16 +2440,44 @@ def build_report(cfg, outdir):
             ov3 = outdir / f"overtrain_M3_{cname}.png"
             pi3 = outdir / f"permimp_M3_{cname}.png"
             sc3 = outdir / f"score_M3_{cname}.png"
+            _pt = m3_proxy.get(cname, (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,), (1, 2)))
+            pmask, plabel, pshow, pexcl, psig = _pt[:5]
+            pmask2, plabel2 = (_pt[5], _pt[6]) if len(_pt) > 5 else (None, None)
+            # 2-bin-optimal SR-window cuts, re-derived above and shared with
+            # the ROC WP markers and 04_Make_plots.py's SR1A/B..SR3A/B (see
+            # sr_cuts.json write-out, 2026-09-18, user).
+            _sr_cuts = _sr_cuts_auto.get(cname)
+            # 2026-09-18 RESTRUCTURE (user: "I tend to believe it should
+            # correspond to the 2nd entry of the [ROC] legends" -- see
+            # m3_overtrain_figure's own comment): h_str/h_ste/bias-KS now use
+            # signal_codes (pure signal) throughout, matching the cut/eff
+            # numbers and M3_COL[cname] (which now equals the ROC's own
+            # pure-signal curve colour) -- no separate match_color needed
+            # any more, the whole plot is one consistent population/colour.
+            # 2026-09-18, user: "superimpose the proxy component ... dashed
+            # grey line. For Dbbc, the proxy is b'cq + dR" -- bbc uses the
+            # dR-WINDOWED proxy (pmask2/plabel2, topology 8) here, not the
+            # unconditional one (pmask); cb/bb have no proxy2, use pmask.
+            # topology codes (not masks -- see m3_overtrain_figure's own
+            # comment on why): cb's proxy is (5,), bb's is (6,7), bbc's is
+            # (8,) (the dR-windowed one, per "For Dbbc, the proxy is b'cq +
+            # dR").
+            _ot_pcodes, _ot_plabel = {
+                "cb": ((5,), plabel), "bb": ((6, 7), plabel),
+                "bbc": ((8,), plabel2 if pmask2 is not None else plabel),
+            }[cname]
             keep += _timed_call(produced, f"overtrain_M3_{cname}.png", ov3,
-                                m3_overtrain_figure, outdir, "M3", cname, c_idx, summary, cfg, ov3)
+                                m3_overtrain_figure, outdir, "M3", cname, c_idx, summary, cfg, ov3,
+                                signal_codes=psig, sr_cuts=_sr_cuts,
+                                proxy_codes=_ot_pcodes, proxy_label=_ot_plabel)
             keep += _timed_call(produced, f"permimp_M3_{cname}.png", pi3,
                                 m3_permimp_figure, outdir, "M3", cname, c_idx, class_groups, summary, cfg, pi3,
                                 shared_max=permimp_shared_max)
-            pmask, plabel, pshow, pexcl = m3_proxy.get(
-                cname, (_topo_m3 == 5, "t^{2}(b'c) proxy", True, (5,)))
             keep += _timed_call(produced, f"score_M3_{cname}.png", sc3,
                                 m3_score_figure, outdir, "M3", cname, c_idx, class_groups, cfg, sc3,
-                                pmask, plabel, pshow, exclude_codes=pexcl)
+                                pmask, plabel, pshow, exclude_codes=pexcl, signal_codes=psig,
+                                proxy2_mask=pmask2, proxy2_label=plabel2,
+                                hide_bkg=True)
             m3_singles[cname] = (ov3, pi3, sc3)
 
         panel_m3 = outdir / "panel_M3.png"

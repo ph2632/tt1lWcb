@@ -29,7 +29,8 @@
     "jet_sdmass_min": 40.0,
     "jet_tau21_max": 0.65,
     "dr_lep_jet_min": 1.3,
-    "event_subleading_sdmass_max": 100.0
+    "event_subleading_sdmass_max": 100.0,
+    "jrank_min": 0.01
   },
   "train_models": [
     "M3"
@@ -64,9 +65,10 @@
     "3": 2,
     "6": 2,
     "7": 2,
-    "4": 3
+    "4": 3,
+    "8": 3
   },
-  "_M3_class_groups_note": "2026-09-13: topology code -> M3 (4-class multiclass: bkg/cb/bb/bbc) class label. cb-like = codes 1,2,5 (Wcb, t2_bc, t2_bc_proxy); bb-like = codes 3,6,7 (t2_bb, Z(bb)-adj, QCD(bb) -- see M3_topo_subshare for the within-class 60/36/4 split; t2_bb/Zbb kept together with QCD(bb) since z_contamination_study.py shows the tagger cannot separate t2_bb/Zbb from the AK8 jet's own inputs alone, and QCD(bb) -- genuine gen-matched QCD-origin bb-bar, see build_trainset.py -- is the same kind of object again; the planned j*-flavour analysis-level cut is a separate follow-on, not part of this model); bbc-like = code 4 (t3_bbc); everything else (code 0) = background.",
+  "_M3_class_groups_note": "2026-09-13: topology code -> M3 (4-class multiclass: bkg/cb/bb/bbc) class label. cb-like = codes 1,2,5 (Wcb, t2_bc, t2_bc_proxy); bb-like = codes 3,6,7 (t2_bb, Z(bb)-adj, QCD(bb) -- see M3_topo_subshare for the within-class 60/36/4 split; t2_bb/Zbb kept together with QCD(bb) since z_contamination_study.py shows the tagger cannot separate t2_bb/Zbb from the AK8 jet's own inputs alone, and QCD(bb) -- genuine gen-matched QCD-origin bb-bar, see build_trainset.py -- is the same kind of object again; the planned j*-flavour analysis-level cut is a separate follow-on, not part of this model); bbc-like = codes 4,8 (t3_bbc true signal + t3_bcq_proxy_windowed -- 2026-09-18, user: the pre-existing t3bcq_proxy_flag annotation (w_decay==4 & ak8_match_top_bcq, the Cabibbo-favoured b<->light-q swap of t3_bbc) restricted to sqrt(minDR_b^2+minDR_bc^2) in [0.6,1.2] -- see build_trainset.py's BCQ_PROXY_CODE -- and promoted to a real training topology for the first time, same idea as the cb class's t2_bc_proxy); everything else (code 0) = background.",
   "M3_class_names": ["bkg", "cb", "bb", "bbc"],
   "M3_class_weight_share": {
     "0": 0.50,
@@ -77,17 +79,21 @@
   "_M3_class_weight_share_note": "2026-09-13: like class_weight_share, but keyed by the M3 class label (0..3, matching M3_class_names) INCLUDING background -- multi:softprob has no scale_pos_weight equivalent, so background/signal balance must be baked into sample_weight here directly (see derive_multiclass_weight_multiplier() in 02_train_tagger.py), unlike the binary path where scale_pos_weight handles it automatically. Default derived from class_weight_share's existing cb:bb:bbc ratio (which summed to 1.0 over signal only: cb pool codes 1+2+5 = 0.5+0.1+0.1 = 0.7, bb pool codes 3+6 = 0.1+0.1 = 0.2, bbc code 4 = 0.1) rescaled into a 50% combined-signal budget (0.7*0.5=0.35, 0.2*0.5=0.10, 0.1*0.5=0.05) plus an explicit 50% background share chosen to roughly match the effective signal:background balance S1's scale_pos_weight already gives it -- a first-pass choice, not yet tuned; revisit once M3's overtraining/AUC numbers exist.",
   "M3_topo_subshare": {
     "1": {
-      "1": 0.60,
-      "2": 0.20,
-      "5": 0.20
+      "1": 0.70,
+      "2": 0.15,
+      "5": 0.15
     },
     "2": {
-      "3": 0.60,
-      "6": 0.36,
-      "7": 0.04
+      "3": 0.80,
+      "6": 0.10,
+      "7": 0.10
+    },
+    "3": {
+      "4": 0.80,
+      "8": 0.20
     }
   },
-  "_M3_topo_subshare_note": "2026-09-13, user: within the 'bb' class (label 2)'s own 10% overall share, split 60% t2(b'b) / 36% Z(bb)-adj / 4% QCD(bb) -- t2(b'b) prioritised as requested, QCD(bb) capped low because its gen-matched population is tiny (2026-09-13 investigation: ~1.5% of QCD-sample AK8 jets have >=2 hadron-flavour-b AK4 jets in-cone) so 'accept all these events' rather than force a larger share onto a handful of jets. Within the 'cb' class (label 1): FIRST attempt (2026-09-13) used the aggressive 2:1 Wcb-vs-whole-t2(b'c)-family split (Wcb=0.6667, t2_bc=0.0009 natural, proxy=0.3324 natural). 2026-09-14 UPDATE (user, after seeing this push M3 into WARN across the board): moved to an explicit 60/20/20 (Wcb/t2_bc/proxy). Investigated first: cb's own WARN was shown to be driven by the bkg(rest) side (5.1-5.6%), NOT the sig side (0.7%, healthy at either split) -- so this subshare change does not target cb's actual overtraining driver, but is kept as the user's explicit physics-priority choice. Side effect to watch: topo2 (true t2_bc, only 18.9k/4.0k raw train/test events) needs its multiplier raised from ~4.3 (at 0.09% target) to ~960 (at 20% target, ~220x) since its raw sumw is tiny (~0.16% of the cb pool) -- this concentrates much more gradient weight onto a small event population, a similar order of magnitude to bbc's already stats-limited topo4 (10.4k/2.1k), so a new topo2-specific overfitting contribution is plausible and expected, not a bug if seen. Classes not listed here (bbc) are unaffected -- they fall back to natural raw-sumw proportions within the class, i.e. today's single-multiplier-per-class behaviour.",
+  "_M3_topo_subshare_note": "2026-09-13, user: within the 'bb' class (label 2)'s own 10% overall share, split 60% t2(b'b) / 36% Z(bb)-adj / 4% QCD(bb) -- t2(b'b) prioritised as requested, QCD(bb) capped low because its gen-matched population is tiny (2026-09-13 investigation: ~1.5% of QCD-sample AK8 jets have >=2 hadron-flavour-b AK4 jets in-cone) so 'accept all these events' rather than force a larger share onto a handful of jets. Within the 'cb' class (label 1): FIRST attempt (2026-09-13) used the aggressive 2:1 Wcb-vs-whole-t2(b'c)-family split (Wcb=0.6667, t2_bc=0.0009 natural, proxy=0.3324 natural). 2026-09-14 UPDATE (user, after seeing this push M3 into WARN across the board): moved to an explicit 60/20/20 (Wcb/t2_bc/proxy). Investigated first: cb's own WARN was shown to be driven by the bkg(rest) side (5.1-5.6%), NOT the sig side (0.7%, healthy at either split) -- so this subshare change does not target cb's actual overtraining driver, but is kept as the user's explicit physics-priority choice. Side effect to watch: topo2 (true t2_bc, only 18.9k/4.0k raw train/test events) needs its multiplier raised from ~4.3 (at 0.09% target) to ~960 (at 20% target, ~220x) since its raw sumw is tiny (~0.16% of the cb pool) -- this concentrates much more gradient weight onto a small event population, a similar order of magnitude to bbc's already stats-limited topo4 (10.4k/2.1k), so a new topo2-specific overfitting contribution is plausible and expected, not a bug if seen. Classes not listed here (bbc) are unaffected -- they fall back to natural raw-sumw proportions within the class, i.e. today's single-multiplier-per-class behaviour. 2026-09-17 UPDATE (user): after an 8-point cb-subshare scan (60/20/20, 70/25/5, 80/15/5, 65/18/17, 70/15/15, 75/13/12, 80/10/10, 85/8/7 -- Wcb AUC/Z improves monotonically with Wcb-share, at a monotonic cost to AUC(cb,full) and, past ~80%, to overtraining bias too: 85/8/7 was worst on both cb,full AUC (0.876) and bias despite topping Wcb AUC/Z), moved to 66/17/17 (Wcb/t2_bc/proxy) -- close to the scan's 65/18/17 point (AUC(Wcb) 0.893, Z 0.147, bias 0.6%/0.6%; AUC(cb,full) 0.889, bias 0.6%/2.2%, OK), chosen over the scan's best-AUC/Z point (85/8/7) specifically to avoid that bias/cb-full-AUC degradation. 2026-09-17 UPDATE (user), bb-subshare: moved from 60/36/4 (t2_bb/Zbb/QCDbb) to 66/17/17, ahead of an in-progress 5-point scan (66/17/17, 66/34/0, 66/0/34, 80/10/10, 80/15/5). Partial results at decision time: 60/36/4 AUC(bb,full) 0.940 bias 0.3%/0.7%; 66/17/17 AUC(bb,full) 0.943 bias 1.0%/1.4%; 66/34/0 AUC(bb,full) 0.937 bias 0.3%/0.0%; 66/0/34 AUC(bb,full) 0.945 bias 1.0%/1.1% -- unlike cb, this axis is NOT monotonic (QCD(bb) share trades AUC against bias non-monotonically); 66/17/17 chosen as a balanced point ahead of the scan finishing, not necessarily the AUC-optimal one (66/0/34 was marginally higher on AUC(bb,full) among points completed so far; 80/10/10 and 80/15/5 were still pending at decision time). 2026-09-18 FINAL UPDATE (user, scan complete): cb-subshare set to 80/15/5 (Wcb/t2_bc/proxy; scan: AUC(Wcb) 0.898, Z 0.157, bias 1.1%/1.4%; AUC(cb,full) 0.880, bias 1.0%/2.7%, OK). bb-subshare set to 90/5/5 (t2_bb/Zbb/QCDbb) -- more aggressive than any scanned point (60/36/4 through 80/15/5), not itself scanned; a step further along the same direction the 5-point scan explored. bbc-subshare (NEW, class label 3 previously unlisted/natural-proportion): 95/5 (t3_bbc/t3_bcq_proxy_windowed) -- see M3_class_groups note for what the new code 8 is. 2026-09-18 LATER SAME DAY UPDATE (user, after the 80/15/5-90/5/5-95/5 training's score_M3_* diagnostics -- see chat: h_tot/proxy near-degeneracy investigation): moved AWAY from the more extreme splits toward more balanced ones: cb-subshare 70/15/15 (Wcb/t2_bc/proxy, was 80/15/5 -- less Wcb-dominant, more proxy weight). bb-subshare 80/10/10 (t2_bb/Zbb/QCDbb, was 90/5/5). bbc-subshare 80/20 (t3_bbc/t3_bcq_proxy_windowed, was 95/5, biggest relative jump given it's only 2 components). Prior published diagnostics (score_M3_*.png, panel_M3.png etc, all from the 80/15/5-90/5/5-95/5 run) preserved under the '_prev1' suffix for before/after comparison -- see the gallery/publish-prefix code for the naming.",
   "features_S1": [
     "ak8_gpt_bb",
     "ak8_gpt_cc",
@@ -151,7 +157,7 @@
   "M3_xgboost": {
     "n_estimators": 6000,
     "max_depth": 2,
-    "learning_rate": 0.05,
+    "learning_rate": 0.07,
     "subsample": 0.4,
     "colsample_bytree": 0.4,
     "min_child_weight": 800,
