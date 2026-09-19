@@ -259,7 +259,13 @@ class Config:
         #   build_trainset.py) -- for the new REGIONS-mode m(J) plots and
         #   any other MAT plot's background breakdown. New raw branch +
         #   changed mat_cat values -> full re-derive.
-        self.cache_tag = "derived_v30_tridrsum_v1"
+        # v31 (2026-09-19): the M3 model (S1_tagger/.../M3/model.json) was
+        # RETRAINED on 09-18 18:57, after the v30 parquet was baked (09-18
+        # 01:12), so v30's baked score_M3_cb/score_S2/score_S3 belong to the
+        # OLD model (e.g. mean D_cb 0.180 vs 0.134) and no longer match
+        # sr_cuts.json.  Full re-derive -> scores from the current model.
+        # (The jstar_flav*/bdr1_flav columns are identical in v30 and v31.)
+        self.cache_tag = "derived_v31_jstarfix_v1"
 
         # ------------------------------------------------------------------
         # Switches
@@ -1080,8 +1086,11 @@ def columns_for_cache(cfg):
     try:
         mode = getattr(cfg, "plot_mode", "MAT")
         if mode.startswith("MAT"):
-            specs = build_mat_plot_settings(getattr(cfg, "mat_sel", "PRE"),
-                                            getattr(cfg, "signal_only", False))
+            specs = []
+            for _s in (getattr(cfg, "mat_sels", None)
+                       or [getattr(cfg, "mat_sel", "PRE")]):
+                specs += build_mat_plot_settings(
+                    _s, getattr(cfg, "signal_only", False))
         elif mode.startswith("REGIONS"):
             # 2026-09-14: 6-region composite m(J) plot -- its cut strings
             # (score_S1/S2/S3 among them) and var (ak8_sdmass_0) are NOT
@@ -1129,6 +1138,12 @@ def columns_for_cache(cfg):
             "toplep_phi":     ("pt_jstar",),
             "toplep_pt":      ("pt_jstar",),
             "mJ_jstar_cat":   ("jstar_flav", "jstar_flav_nowin"),
+            # 2026-09-19 ROOT CAUSE of the "empty b_L/c_L/q blocks" saga: the
+            # newer sibling composite was never listed here, so a cached run
+            # (pruned read) did not load jstar_flav*/, they were then created
+            # as SENTINEL placeholders and every jet fell into the N/A block.
+            "mSD_jstar_4block": ("jstar_flav", "jstar_flav_nowin",
+                                 "ak8_sdmass_0"),
         }
         for _k in list(keep):
             keep |= set(_RUNTIME_PREREQS.get(_k, ()))
@@ -2436,14 +2451,15 @@ class DataManager:
             # the underflow and the overflow will not touch the real
             # spectra" -- 2 always-empty 1-bin spacers added, right after
             # the u/f bin and right before the o/f bin):
-            #   [0,10)     global underflow                       (bin 1)
+            #   [0,10)     global underflow (mSD<40)              (bin 1)
             #   [10,20)    EMPTY spacer                            (bin 2)
-            #   [20,170)   block 0: j* = b_L   (jstar_flav==2)     (bins 3-17)
-            #   [170,320)  block 1: j* = c_L   (jstar_flav==1)     (bins 18-32)
-            #   [320,470)  block 2: j* = q, not b_L/c_L (==0)      (bins 33-47)
-            #   [470,620)  block 3: j* N/A, no j* found (==-1)     (bins 48-62)
-            #   [620,630)  EMPTY spacer                            (bin 63)
-            #   [630,640)  global overflow                        (bin 64)
+            #   [20,180)   block 0: j* = b_L   (jstar_flav_nowin==2) (bins 3-18)
+            #   [180,340)  block 1: j* = c_L   (jstar_flav_nowin==1) (bins 19-34)
+            #   [340,500)  block 2: j* = light/untag. (==0)          (bins 35-50)
+            #   [500,660)  block 3: N/A, no j* candidate (==-1)      (bins 51-66)
+            #   [660,670)  EMPTY spacer                            (bin 67)
+            #   [670,680)  global overflow (mSD>=200)             (bin 68)
+            #   each block = mSD(J) 40-200 GeV at 10 GeV/bin = 16 bins.
             # SENTINEL only when J itself is missing (mSD(J) <= 0).
             #
             # 2026-09-18 BUGFIX (user: "these plots do not present yields all
@@ -2461,17 +2477,39 @@ class DataManager:
             # determined" jet as an in-window jf==-1 one -- default now maps
             # straight to 3.0 (N/A) instead of -1.0, and every jet with a
             # valid mSD(J) is guaranteed one of the 4 blocks.
+            #
+            # 2026-09-19 (user): blocks 0-2 (b_L/c_L/q) were empty / truncated
+            # at mSD(J)~130.  Two separate things:
+            #  (1) the windowed `jstar_flav` is SENTINEL for mSD(J) outside
+            #      [40,130] BY DESIGN (fully-merged-top exception: m_t=mSD(J),
+            #      no j* searched) -> switched this diagnostic split to the
+            #      window-FREE `jstar_flav_nowin` (still "was a top-mass-
+            #      hypothesis j* found", so N/A keeps its meaning).  Real reco
+            #      (mt/mt_xself/mt_nojs) is untouched.
+            #  (2) the reason it kept coming out EMPTY even so was NOT a stale
+            #      cache (v30 and v31 hold identical jstar_flav* columns) but
+            #      columns_for_cache: this spec was missing from
+            #      _RUNTIME_PREREQS, so a pruned cached read never loaded
+            #      jstar_flav*, they were re-created as SENTINEL placeholders
+            #      and every jet fell to the default (N/A) block.  WCB_RECOMPUTE_
+            #      RUNTIME=1 "fixed" it only because it widens the read.
             _blk4 = np.select(
-                [_jf == 2.0, _jf == 1.0, _jf == 0.0],
+                [_jfnw == 2.0, _jfnw == 1.0, _jfnw == 0.0],
                 [0.0, 1.0, 2.0], default=3.0)
             _has_blk4 = _mJ_ok & (_blk4 >= 0.0)
-            _uf4 = _has_blk4 & (_mJ < 50.0)
+            # 2026-09-19 (user): 2 + 16x4 + 2 bins -- each block spans the
+            # full 40-200 GeV preselection range at 10 GeV/bin (16 bins),
+            # composite layout (68 bins x 10 = 680): u/f [0,10) | spacer
+            # [10,20) | 4 blocks of 160 starting at 20 | spacer [660,670) |
+            # o/f [670,680).  First/last bin remain under/overflow
+            # (mSD<40 / mSD>=200).
+            _uf4 = _has_blk4 & (_mJ < 40.0)
             _of4 = _has_blk4 & (_mJ >= 200.0)
             _reg4 = _has_blk4 & ~_uf4 & ~_of4
-            _local4 = np.clip(_mJ - 50.0, 0.0, 150.0 - 1e-6)
+            _local4 = np.clip(_mJ - 40.0, 0.0, 160.0 - 1e-6)
             _composite4 = np.select(
                 [_uf4, _of4, _reg4],
-                [5.0, 635.0, 20.0 + 150.0 * _blk4 + _local4],
+                [5.0, 675.0, 20.0 + 160.0 * _blk4 + _local4],
                 default=SENTINEL)
             arr = ak.with_field(
                 arr, _composite4.astype(np.float32), "mSD_jstar_4block")
@@ -2561,7 +2599,13 @@ class DataManager:
         _JRANK_KEY = "ak8_gpt_Jrank"
         _JRANK_NODES = ("ak8_gpt_bc", "ak8_gpt_bb", "ak8_gpt_topbwc")
         _jrank = None
-        if (not is_data) and ("ak8_gpt_bc" in raw.fields):
+        # 2026-09-19, user (MAJOR): J must be chosen the SAME way for data and
+        # MC.  This used to be gated on `not is_data`, so any real data file
+        # silently fell back to the pT-leading AK8 (the ak8_gpt_* nodes are in
+        # common_branches -> present in data too).  Ungated; the equivalence
+        # is checked by check_data_mc_equivalence.py (same MC file loaded as
+        # is_data True/False -> identical J-derived columns).
+        if "ak8_gpt_bc" in raw.fields:
             for _nd in _JRANK_NODES:
                 if _nd not in raw.fields:
                     continue
@@ -4359,21 +4403,22 @@ class Histogrammer:
 
                 _code_key = ((0, "Wcb"), (5, "Wcb"), (6, "Wcb_res"),
                              (21, "Wcb_tmrg_bc"), (22, "Wcb_tmrg_bb"),
-                             # W background: two green merged lines (Wcq/Wqq,
-                             # the 2 darkest of the V green ramp); the !=J
-                             # (9/11) and resolved (10/12) W all fold into
-                             # grey "Rest" (V-resolved), 2026-09-03.
+                             # W background: Wcq is the one remaining green
+                             # merged line; W(qq) [4] now folds into "Rest"
+                             # along with the !=J (9/11) and resolved (10/12)
+                             # W (2026-09-19, user -- too small to carry its
+                             # own line, was previously its own "Wqq_light").
                              (1, "Wcq"), (9, "Rest"), (10, "Rest"),
-                             (4, "Wqq_light"), (11, "Rest"), (12, "Rest"),
+                             (4, "Rest"), (11, "Rest"), (12, "Rest"),
                              # hadronic-top proxy: 4 blue lines
                              (2, "Cat_Top_bc"), (7, "Cat_Top_bq"),
                              (23, "Cat_Top_bqqc"), (8, "Cat_Top_bqq"),
                              (20, "Cat_Top_bbc"),
-                             # merged Z: bb / cc now separate lines (were
-                             # both pooled into "Zhf" until 2026-09-12), light
-                             # qq' -> "Zlight" (all three green); resolved Z ->
-                             # Rest (V-resolved).
-                             (13, "Zlight"), (14, "Zcc"), (15, "Zbb"),
+                             # merged Z: bb stays its own line; cc [14] and
+                             # light qq' [13] now fold into "Rest" along with
+                             # resolved Z (2026-09-19, user -- same reasoning
+                             # as W(qq) above; were "Zcc"/"Zlight").
+                             (13, "Rest"), (14, "Rest"), (15, "Zbb"),
                              # QCD(bb): genuine gen-matched QCD-origin bb-bar,
                              # carved out of 'rest' (2026-09-14, user) -- same
                              # definition as topology 7 in build_trainset.py.
@@ -4761,10 +4806,10 @@ class Plotter:
         key_order = ["Wcb", "Wcb_tmrg_bc", "Wcb_tmrg_bb", "Cat_Top_bbc",
                      "Wcb_res",
                      "Wcb_nomt",
-                     "Wcq", "Wqq_light",
+                     "Wcq",
                      "Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq",
-                     "QCD_bb", "Rest", "Zbb", "Zcc", "Zlight"]
+                     "QCD_bb", "Rest", "Zbb"]
         # Subsets of Wcb / Cat_Top_bc (events with mt == -1) -- drawn as dotted
         # lines, but NOT counted in the grand total or the S/sqrt(S+B) bkg sum.
         _SUBSET_KEYS = ("Wcb_nomt", "Cat_Top_bc_nomt")
@@ -4797,9 +4842,9 @@ class Plotter:
             "Wcb_res":     r"$c,b,b'$ rsvd",
             "Wcb_nomt": r"$J$ w/o-$j^{*}$",
             "Cat_Top_bc_nomt": r"$t^2(b'c)$ w/o-$j^{*}$",
-            # W background -- 2 darkest of the green V ramp
+            # W background -- darkest of the green V ramp; W(qq) [4] folds
+            # into "Rest" (2026-09-19, user).
             "Wcq": r"$W(cq)$",
-            "Wqq_light": r"$W(qq)$",
             # hadronic-top proxy -- 4 blue lines
             "Cat_Top_bc":   r"$t^2(b'c)$ proxy",
             "Cat_Top_bq":   r"$t^2(b'q)$",
@@ -4809,14 +4854,14 @@ class Plotter:
             # 'rest' (2026-09-14, user) -- same definition as topology 7 in
             # build_trainset.py (>=2 AK4 with ak4_hflav==5, dR<0.8 of J).
             "QCD_bb": r"QCD($b\bar b$)",
-            "Rest": r"Rest: $g,q,c,b$, $V^{\mathrm{rsd}}$",
+            # Rest now also absorbs W(qq), Z(cc) and Z(qq) (2026-09-19, user)
+            # -- too small to carry their own lines; noted in the label.
+            "Rest": r"Rest: $g,q,c,b$, $qq,c\bar c$",
             # merged hadronic Z -- was one pooled "Zhf" line, split
             # 2026-09-12 (S1_tagger found the tagger cannot separate Z->bb
             # from real t2(b'b) signal -- worth seeing on its own here too);
-            # 3 lightest of the green V ramp now, darkest->lightest bb/cc/qq.
+            # Z(cc)/Z(qq) since folded into "Rest" above.
             "Zbb":    r"$Z(b\bar b)$",
-            "Zcc":    r"$Z(c\bar c)$",
-            "Zlight": r"$Z(qq)$",
         }
 
         # ``NORM`` CLI arg -> shape comparison (every line to unit area).
@@ -4837,7 +4882,6 @@ class Plotter:
         _SIG5 = ("Wcb", "Wcb_tmrg_bc", "Wcb_tmrg_bb", "Cat_Top_bbc", "Wcb_res")
         SIGNAL_KEYS = _SIG5
         SCALED_KEYS = _SIG5 + ("Wcb_nomt",)   # *SIGNAL_SCALE
-        PROXY_KEY = "Cat_Top_bc"
         # the 9 background MAT lines (all of key_order that is neither signal
         # nor a dotted subset) -- the composition shown by MAT-BKG.
         BKG_KEYS = tuple(k for k in key_order
@@ -4865,6 +4909,17 @@ class Plotter:
             if counts is None:
                 continue
 
+            # 2026-09-19, user: negative-weight MC (e.g. one QCD(bb) event of
+            # weight ~-6) makes bins with a NET NEGATIVE yield, which blow up
+            # S/sqrt(S+B) (B -> 0).  Set every bin with a yield < 0 to 0, per
+            # category, BEFORE totals / legend % / significance / drawing.
+            _cn = np.asarray(counts, dtype=np.float64)
+            _neg = _cn < 0
+            if _neg.any():
+                print(f"[MAT] {name}: {key}: {int(_neg.sum())} bin(s) with negative "
+                      f"yield set to 0 (removed {float(_cn[_neg].sum()):.3f})")
+                counts = np.where(_neg, 0.0, _cn)
+
             total = float(np.sum(counts))
             raw_tot[key] = total
             abs_hists[key] = counts
@@ -4886,13 +4941,10 @@ class Plotter:
             print(f"[WARN] Missing Wcb or Cat_Top_bc for matching plot {name}, skip.")
             return
 
-        # Auto signal scale: normalise the W->cb =J line to the t->bc proxy
-        # integral in the plotted range.  Fall back to 1.0 if either yield is
-        # empty (e.g. a truth_only var with no proxy entries).
-        _sig_yield = sum(raw_tot.get(k, 0.0) for k in SIGNAL_KEYS)
-        _proxy_yield = raw_tot.get(PROXY_KEY, 0.0)
-        SIGNAL_SCALE = (_proxy_yield / _sig_yield
-                        if (_sig_yield > 0 and _proxy_yield > 0) else 1.0)
+        # Signal scale: FLAT x100 in every region / component / selection,
+        # incl. preselection (2026-09-19, user) -- replaces the per-family
+        # proxy-yield normalisation.  Quoted on the Signal header as x100.
+        SIGNAL_SCALE = 100.0
 
         # Lines actually drawn + what sets the y-axis.
         if normalize:
@@ -4906,8 +4958,6 @@ class Plotter:
         # once each on the "Signal" / "BKG" group headers.  raw_tot is the
         # true (unscaled) yield; the drawn W->cb lines are *SIGNAL_SCALE
         # (the "xN" part of the label).
-        _grand = sum(v for k, v in raw_tot.items()
-                     if v > 0 and k not in _SUBSET_KEYS)
         # totals for the group headers
         _sig_tot = sum(raw_tot.get(k, 0.0) for k in _SIG5)
         _bkg_tot = sum(v for k, v in raw_tot.items()
@@ -4915,11 +4965,17 @@ class Plotter:
 
         def _pct_suffix(key):
             v = raw_tot.get(key, 0.0)
-            if _grand <= 0 or v <= 0:
+            # signal-column keys normalize to the signal total (matching
+            # the standalone "_sig" mode); everything else normalizes to
+            # the background total (matching the standalone "_bkg" mode) --
+            # 2026-09-19 user: combined-mode legend %'s should each sum to
+            # 100% within their own column, not the sig+bkg grand total.
+            _denom = _sig_tot if key in _SIG5 else _bkg_tot
+            if _denom <= 0 or v <= 0:
                 return ""
-            frac = 100.0 * v / _grand
+            frac = 100.0 * v / _denom
             # left (signal) legend: 2 dp; middle/right: 1 dp (2026-09-04 user)
-            _nd = 2 if key in SCALED_KEYS else 1
+            _nd = 1                # 1 dp on every legend (2026-09-19, user)
             _lim = 10.0 ** (-_nd)
             return (f"  <{_lim:g}%" if frac < 0.5 * _lim
                     else f"  {frac:.{_nd}f}%")
@@ -4992,6 +5048,9 @@ class Plotter:
         # halfway to kSpring) so the ramp stays a smooth dark->light 5-step
         # green family: Wcq / Wqq / Zbb / Zcc / Zlight.
         _c_z1,   _c_zcc, _c_z2 = "#47eb47", "#3df523", "#33ff00"  # ROOT 211 / new / kSpring(820)
+        # 2026-09-19, user: thinner histogram lines, ROOT SetLineWidth(2)
+        # (~2 px) -> 2*72/_DPI pt in matplotlib.
+        _LW = 2.0 * 72.0 / _DPI
         style_overrides = {
             # the W->cb SIGNAL -- 5 lines, one per topology, distinct colours,
             # all SOLID, uniform linewidth 2 (2026-09-04, user).  Top->bottom
@@ -5001,42 +5060,41 @@ class Plotter:
             #   Wcb_tmrg_bb  t^2(b',b)   amber
             #   Cat_Top_bbc  t^3(b',b,c) yellow
             #   Wcb_res      c,b,b' res.  pale khaki
-            "Wcb":          {"color": _c_sig["Wcb"],         "linestyle": "-", "linewidth": 2.0, "zorder": 9},
-            "Wcb_tmrg_bc":  {"color": _c_sig["Wcb_tmrg_bc"], "linestyle": "-", "linewidth": 2.0, "zorder": 9},
-            "Wcb_tmrg_bb":  {"color": _c_sig["Wcb_tmrg_bb"], "linestyle": "-", "linewidth": 2.0, "zorder": 9},
+            "Wcb":          {"color": _c_sig["Wcb"],         "linestyle": "-", "linewidth": _LW, "zorder": 9},
+            "Wcb_tmrg_bc":  {"color": _c_sig["Wcb_tmrg_bc"], "linestyle": "-", "linewidth": _LW, "zorder": 9},
+            "Wcb_tmrg_bb":  {"color": _c_sig["Wcb_tmrg_bb"], "linestyle": "-", "linewidth": _LW, "zorder": 9},
             # W->cb with c and b RESOLVED (separate AK4 jets) -- SIGNAL
             # (5th W->cb signal line; 2026-09-03 user: restored from Rest).
-            "Wcb_res":      {"color": _c_sig["Wcb_res"],     "linestyle": "-", "linewidth": 2.0, "zorder": 9},
+            "Wcb_res":      {"color": _c_sig["Wcb_res"],     "linestyle": "-", "linewidth": _LW, "zorder": 9},
             # "no m_t candidate" subsets -- dotted, same colour as the parent
             # line (red = signal Wcb, blue = t->bc proxy).
             # "no m_t candidate" (mt == -1) subsets -- dotted.  Wcb_nomt is the
             # signal subset, drawn GREY (2026-09-04, user) so it reads as a
             # "failed-reco" sideband rather than a signal line; Cat_Top_bc_nomt
             # (proxy) stays blue-dotted.
-            "Wcb_nomt":     {"color": "#6E6E6E", "linestyle": (0, (1, 1)), "linewidth": 1.5, "zorder": 10},
-            "Cat_Top_bc_nomt": {"color": "blue", "linestyle": (0, (1, 1)), "linewidth": 1.5, "zorder": 10},
-            # W background -- 2 darkest of the 4-line green V ramp, SOLID lw 2.
-            "Wcq":          {"color": _c_wq_a, "linestyle": "-", "linewidth": 2.0, "zorder": 6},
-            "Wqq_light":    {"color": _c_wq_b, "linestyle": "-", "linewidth": 2.0, "zorder": 6},
+            "Wcb_nomt":     {"color": "#6E6E6E", "linestyle": (0, (1, 1)), "linewidth": _LW, "zorder": 10},
+            "Cat_Top_bc_nomt": {"color": "blue", "linestyle": (0, (1, 1)), "linewidth": _LW, "zorder": 10},
+            # W background -- darkest of the V green ramp, SOLID lw 2; W(qq)
+            # folds into "Rest" (2026-09-19, user).
+            "Wcq":          {"color": _c_wq_a, "linestyle": "-", "linewidth": _LW, "zorder": 6},
             # background top -- 4-line blue->cyan ramp, all SOLID lw 2
             # (2026-09-04, user): proxy / (b'q) / (b'cq) / (b'qq).
-            "Cat_Top_bc":   {"color": _c_t1, "linestyle": "-", "linewidth": 2.0, "zorder": 8},
-            "Cat_Top_bq":   {"color": _c_t2, "linestyle": "-", "linewidth": 2.0, "zorder": 4},
-            "Cat_Top_bqqc": {"color": _c_t3, "linestyle": "-", "linewidth": 2.0, "zorder": 4},
-            "Cat_Top_bqq":  {"color": _c_t4, "linestyle": "-", "linewidth": 2.0, "zorder": 4},
+            "Cat_Top_bc":   {"color": _c_t1, "linestyle": "-", "linewidth": _LW, "zorder": 8},
+            "Cat_Top_bq":   {"color": _c_t2, "linestyle": "-", "linewidth": _LW, "zorder": 4},
+            "Cat_Top_bqqc": {"color": _c_t3, "linestyle": "-", "linewidth": _LW, "zorder": 4},
+            "Cat_Top_bqq":  {"color": _c_t4, "linestyle": "-", "linewidth": _LW, "zorder": 4},
             # t^3(b',b,c) fully-merged W->cb top -- SIGNAL, yellow solid
             # (2026-09-04 user: distinct colour, all 5 signal lines solid lw 2).
-            "Cat_Top_bbc": {"color": _c_sig["Cat_Top_bbc"], "linestyle": "-", "linewidth": 2.0, "zorder": 9},
+            "Cat_Top_bbc": {"color": _c_sig["Cat_Top_bbc"], "linestyle": "-", "linewidth": _LW, "zorder": 9},
             # QCD(bb), carved out of 'rest' (2026-09-14, user) -- distinct
             # brown/orange, solid, so it reads as its own physics process
             # rather than a grey catch-all like the remaining Rest line.
-            "QCD_bb":      {"color": "#B8600B", "linestyle": "-", "linewidth": 1.8, "zorder": 5},
-            "Rest":        {"color": "#9C9CA1", "linestyle": _ls2, "linewidth": 1.5, "zorder": 2},
-            # merged hadronic Z -- the 3 LIGHTEST of the green V ramp, SOLID
-            # lw 2.  Resolved Z stays in grey Rest.
-            "Zbb":         {"color": _c_z1,  "linestyle": "-", "linewidth": 2.0, "zorder": 3},
-            "Zcc":         {"color": _c_zcc, "linestyle": "-", "linewidth": 2.0, "zorder": 3},
-            "Zlight":      {"color": _c_z2,  "linestyle": "-", "linewidth": 2.0, "zorder": 3},
+            "QCD_bb":      {"color": "#B8600B", "linestyle": "-", "linewidth": _LW, "zorder": 5},
+            "Rest":        {"color": "#9C9CA1", "linestyle": _ls2, "linewidth": _LW, "zorder": 2},
+            # merged hadronic Z -- Zbb keeps the lightest of the green V ramp,
+            # SOLID lw 2.  Z(cc)/Z(qq) (light) and resolved Z fold into grey
+            # Rest (2026-09-19, user).
+            "Zbb":         {"color": _c_z1,  "linestyle": "-", "linewidth": _LW, "zorder": 3},
         }
 
         for key in key_order:
@@ -5073,7 +5131,7 @@ class Plotter:
                 ax=ax,
                 color="black",
                 linestyle=":",
-                linewidth=2.2,
+                linewidth=_LW,
                 zorder=11,
             )
 
@@ -5106,43 +5164,13 @@ class Plotter:
                 _f = np.full(len(_tot), np.nan)
                 _f[valid] = _comp[valid] / _tot[valid]
                 ax_ratio.plot(_xstep, _stepify(np.where(valid, _f, np.nan)),
-                              color=_compo_col(_ck), linewidth=1.4,
+                              color=_compo_col(_ck), linewidth=_LW,
                               solid_joinstyle="miter")
             ax_ratio.axhline(1.0, color="0.6", linestyle=":", linewidth=1)
             ax_ratio.set_ylim(0.0, cfg.get("sigonly_ymax") or 1.05)
             ax_ratio.set_ylabel(
                 r"component / total " + ("signal" if signal_only else "bkg"),
                 fontsize=_lp_fs(10), labelpad=2)
-        elif cfg.get("_topo3_lowerpad") and not normalize:
-            # 2026-09-17, user: for a score that TARGETS one specific signal
-            # topology (e.g. D_bb targets t^2(b'b)), the generic 5-line-S
-            # significance is not the useful number to show -- instead, show
-            # how the (still-shared) total S splits, per bin, into 3 hand-
-            # picked topology groups relevant to which region this score is
-            # selecting: (Wcb + t^2(b'c)), t^2(b'b), t^3(b'bc). Colours reuse
-            # the upper-panel per-topology colours directly (no legend --
-            # the upper-panel legend already keys them).
-            _z = np.zeros(len(bins) - 1)
-            _tot_S = sum((abs_hists[k] for k in SIGNAL_KEYS if k in abs_hists),
-                        start=_z.copy())
-            _groups = [
-                ("cb+b'c", ("Wcb", "Wcb_tmrg_bc"), _c_sig["Wcb"]),
-                ("b'b",    ("Wcb_tmrg_bb",),        _c_sig["Wcb_tmrg_bb"]),
-                ("b'bc",   ("Cat_Top_bbc",),        _c_sig["Cat_Top_bbc"]),
-            ]
-            valid = _tot_S > 0
-            for _glabel, _gkeys, _gcolor in _groups:
-                _gsum = sum((abs_hists[k] for k in _gkeys if k in abs_hists),
-                           start=_z.copy())
-                _frac = np.full(len(_tot_S), np.nan)
-                _frac[valid] = _gsum[valid] / _tot_S[valid]
-                ax_ratio.plot(np.repeat(bins, 2)[1:-1],
-                             _stepify(np.where(valid, _frac, np.nan)),
-                             color=_gcolor, linewidth=1.8, solid_joinstyle="miter")
-            ax_ratio.axhline(1.0, color="0.6", linestyle=":", linewidth=1)
-            ax_ratio.set_ylim(0.0, cfg.get("sigonly_ymax") or 1.05)
-            ax_ratio.set_ylabel(r"topology / total signal $S$",
-                                fontsize=_lp_fs(10), labelpad=2)
         elif normalize:
             # NORM: shape ratio  (W->cb =J) / (t->bc), both unit-area
             wcb, top = shape_hists["Wcb"], shape_hists["Cat_Top_bc"]
@@ -5166,7 +5194,7 @@ class Plotter:
                     color="0.6", alpha=0.35, linewidth=0,
                 )
             ax_ratio.plot(bin_centers[valid], ratio[valid],
-                          drawstyle="steps-mid", color="black", linewidth=1.3)
+                          drawstyle="steps-mid", color="black", linewidth=_LW)
             ax_ratio.axhline(1.0, color="red", linestyle="--", linewidth=1)
             ax_ratio.set_ylim(cfg.get("ratio_ylim", (0.0, 4.0)))
             ax_ratio.set_ylabel(r"$W\to cb$ (merged) / $t\to(cb)$",
@@ -5214,7 +5242,7 @@ class Plotter:
             # matplotlib bridge dropped bins with slanted segments / gaps.
             metric_draw = np.where(valid, metric, 0.0)
             hep.histplot(metric_draw, bins=bins, histtype="step",
-                         color="black", linewidth=1.3, ax=ax_ratio)
+                         color="black", linewidth=_LW, ax=ax_ratio)
 
             # Fixed y-axis for the S/sqrt(S+B) pad -- constant across every MAT
             # plot so the significance is comparable by eye between observables
@@ -5241,64 +5269,95 @@ class Plotter:
             else:
               # quadrature combination of the per-bin values drawn above
               _z_quad = float(np.sqrt(np.nansum(metric[valid] ** 2)))
-              # composite plots fill the pad's top band with grey block labels
-              # -> drop the quad-sum annotation into the low-curve mid-body
-              # (2026-09-06, user).
-              _qx, _qy, _qfs = ((0.42, 0.80, 8.0) if cfg.get("block_labels")
-                                else (0.055, 0.90, 9.5))
-              ax_ratio.text(_qx, _qy,
-                            rf"$\sqrt{{\sum_i S_i^2/(S_i+B_i)}} = {_z_quad:.3f}$",
-                            transform=ax_ratio.transAxes, fontsize=_qfs,
-                            va="top", ha="left", linespacing=1.6)
+              # (quad-sum is now quoted in the unified 2-line readout below.)
+              if os.environ.get("WCB_DEBUG_SIGNIF"):
+                  _k2 = np.where(valid, metric, 0.0) ** 2
+                  _o = np.argsort(-_k2)[:6]
+                  print(f"[SIGNIF-DBG] {name} total={_z_quad:.3f}  top bins (K^2 share):")
+                  for _b in _o:
+                      print(f"    bin {_b:3d} x=[{bins[_b]:.0f},{bins[_b+1]:.0f})  S={S[_b]:.3f} "
+                            f"B={B[_b]:.3f}  K={metric[_b]:.3f}  share={100*_k2[_b]/max(_k2.sum(),1e-12):.1f}%")
+                  print(f"    nbins with S>0: {int((S>0).sum())}  sumS={S.sum():.2f} sumB={B.sum():.1f}")
+                  _b0 = int(_o[0])
+                  print("    per-category content of the top bin:",
+                        {k: round(float(abs_hists[k][_b0]), 4) for k in abs_hists
+                         if abs(float(abs_hists[k][_b0])) > 0})
+                  print("    negative bins per category:",
+                        {k: int((np.asarray(abs_hists[k]) < 0).sum()) for k in abs_hists
+                         if (np.asarray(abs_hists[k]) < 0).any()})
 
-              # 1-bin optimisation (Root_plot.py optimize_n_bins(1)): the
-              # single contiguous window [x_lo, x_hi] that maximises the
-              # *integrated* S/sqrt(S+B).  Brute force over every window, require
-              # integral(B) >= 1.  Reported: window edges, S/sqrt(S+B),
-              # improvement vs the no-cut full-range S/sqrt(S+B), signal
-              # efficiency eps_S = S_win/S_tot and background rejection
-              # 1 - eps_B = 1 - B_win/B_tot.  Two magenta lines + text + stdout.
+              # 2-bin optimisation (2026-09-19, user).  Two ADJACENT bins
+              # a = [x0,x1), b = [x1,x2) with ALL THREE boundaries free
+              # (3 pink lines), maximising the quadrature sum
+              # hypot(S_a/sqrt(S_a+B_a), S_b/sqrt(S_b+B_b)), each bin needing
+              # B >= 1 and S > 0.  Same figure of merit as 03_Training_report_
+              # plots.py's best_2bin_cut / the SR windows.  eff(a,b) are the
+              # per-bin efficiencies S_bin/S_tot and B_bin/B_tot.
               _S_tot, _B_tot = float(S.sum()), float(B.sum())
               _sig_full = (_S_tot / np.sqrt(_S_tot + _B_tot)
                            if (_S_tot + _B_tot) > 0 else 0.0)
-              _cS = np.concatenate([[0.0], np.cumsum(S)])
-              _cB = np.concatenate([[0.0], np.cumsum(B)])
-              _i, _j = np.triu_indices(len(S) + 1, k=1)     # 0 <= i < j <= nbins
-              _bw = _cB[_j] - _cB[_i]
-              _sw = _cS[_j] - _cS[_i]
-              _ok = (_bw >= 1.0) & (_sw > 0.0)
-              if np.any(_ok):
-                  _sig_w = np.where(
-                      _ok, _sw / np.sqrt(np.where(_ok, _sw + _bw, 1.0)),
-                      -np.inf)
-                  _k = int(np.argmax(_sig_w))
-                  _x_lo, _x_hi = float(bins[_i[_k]]), float(bins[_j[_k]])
-                  _sig_opt = float(_sig_w[_k])
-                  _S_w, _B_w = float(_sw[_k]), float(_bw[_k])
-                  _eff_s = _S_w / _S_tot if _S_tot > 0 else float("nan")
-                  _rej_b = 1.0 - (_B_w / _B_tot) if _B_tot > 0 else float("nan")
+              _cSs = np.concatenate([[0.0], np.cumsum(S)])   # cS[k] = sum(S[:k])
+              _cBs = np.concatenate([[0.0], np.cumsum(B)])
+              _nbn = len(S)
+              _best, _bi, _bj, _bk = -1.0, None, None, None
+              for _jj in range(1, _nbn):
+                  _ia = np.arange(0, _jj)
+                  _kb = np.arange(_jj + 1, _nbn + 1)
+                  _Sa, _Ba = _cSs[_jj] - _cSs[_ia], _cBs[_jj] - _cBs[_ia]
+                  _Sb, _Bb = _cSs[_kb] - _cSs[_jj], _cBs[_kb] - _cBs[_jj]
+                  _oa = (_Ba >= 1.0) & (_Sa > 0.0)
+                  _ob = (_Bb >= 1.0) & (_Sb > 0.0)
+                  if not (_oa.any() and _ob.any()):
+                      continue
+                  _za = np.where(_oa, _Sa / np.sqrt(np.where(_oa, _Sa + _Ba, 1.0)), -np.inf)
+                  _zb = np.where(_ob, _Sb / np.sqrt(np.where(_ob, _Sb + _Bb, 1.0)), -np.inf)
+                  _zz = np.hypot(np.maximum(_za[:, None], 0.0), np.maximum(_zb[None, :], 0.0))
+                  _zz = np.where(np.isfinite(_za)[:, None] & np.isfinite(_zb)[None, :], _zz, -1.0)
+                  _m = np.unravel_index(int(np.argmax(_zz)), _zz.shape)
+                  if _zz[_m] > _best:
+                      _best, _bi, _bj, _bk = float(_zz[_m]), int(_ia[_m[0]]), _jj, int(_kb[_m[1]])
+              if _bi is not None:
+                  _x0, _x1, _x2 = float(bins[_bi]), float(bins[_bj]), float(bins[_bk])
+                  _sig_opt = _best
+                  _Sa_ = _cSs[_bj] - _cSs[_bi]; _Sb_ = _cSs[_bk] - _cSs[_bj]
+                  _Ba_ = _cBs[_bj] - _cBs[_bi]; _Bb_ = _cBs[_bk] - _cBs[_bj]
+                  _eff_s = _Sa_ / _S_tot if _S_tot > 0 else float("nan")
+                  _eff_s_hi = _Sb_ / _S_tot if _S_tot > 0 else float("nan")
+                  _effb = _Ba_ / _B_tot if _B_tot > 0 else float("nan")
+                  _effb_hi = _Bb_ / _B_tot if _B_tot > 0 else float("nan")
+                  _x_lo, _x_hi = _x0, _x1
                   _gain = 100.0 * (_sig_opt / _sig_full - 1.0) if _sig_full > 0 else float("nan")
-                  for _x in (_x_lo, _x_hi):
+                  # the 3 boundaries of the 2 optimal bins (pink lines)
+                  for _x in (_x0, _x1, _x2):
                       ax_ratio.axvline(_x, ymin=0.0, ymax=0.42, color="magenta",
-                                       linewidth=1.6, zorder=5)
-                  # block-label plots: top band is taken -> magenta opt readout
-                  # drops to the low-curve right side (2026-09-06, user).
-                  _my1, _my2 = ((0.66, 0.50) if cfg.get("block_labels")
-                                else (0.88, 0.72))
-                  ax_ratio.text(0.94, _my1,
-                                rf"$S/\sqrt{{S+B}}={_sig_opt:.3f}$ (+{_gain:.0f}%)",
-                                transform=ax_ratio.transAxes, fontsize=9.0,
-                                va="top", ha="right", color="magenta")
-                  ax_ratio.text(0.94, _my2,
-                                rf"$\varepsilon_S={_eff_s*100:.0f}\%$" "\n"
-                                rf"$1-\varepsilon_B={_rej_b*100:.1f}\%$",
-                                transform=ax_ratio.transAxes, fontsize=9.0,
-                                va="top", ha="right", color="magenta",
-                                linespacing=1.5)
-                  print(f"[MAT-opt] {name:28s} window [{_x_lo:.4g}, {_x_hi:.4g}]  "
+                                       linewidth=_LW, zorder=5, clip_on=False)
+
+                  def _s2(v):
+                      # 2 significant digits, plain (no exponent)
+                      if not np.isfinite(v):
+                          return "nan"
+                      if v == 0:
+                          return "0"
+                      _d = max(0, 1 - int(np.floor(np.log10(abs(v)))))
+                      return f"{v:.{_d}f}"
+
+                  _wine = "#990000"          # ROOT kRed+2
+                  # composite (block-label) plots: left, just below the grey
+                  # j* labels; others: top-left of the pad.
+                  _tx, _ty = ((0.03, 0.80) if cfg.get("block_labels")
+                              else (0.04, 0.93))
+                  ax_ratio.text(
+                      _tx, _ty,
+                      f"Total Signif.: {_z_quad:.2f},  2bins Signif.: "
+                      f"{_sig_opt:.2f} (+{_gain:.0f}%)\n"
+                      f"eff$_S$(a,b): {_s2(_eff_s*100)}%, {_s2(_eff_s_hi*100)}% ;  "
+                      f"eff$_B$(a,b): {_s2(_effb*100)}%, {_s2(_effb_hi*100)}%",
+                      transform=ax_ratio.transAxes, fontsize=9.0,
+                      va="top", ha="left", color=_wine, linespacing=1.5)
+                  print(f"[MAT-opt] {name:28s} 2 bins [{_x0:.4g}, {_x1:.4g}, {_x2:.4g}]  "
                         f"S/sqrt(S+B)={_sig_opt:.4f}  (full-range {_sig_full:.4f}, "
-                        f"{_gain:+.0f}%)  effS={_eff_s*100:.1f}%  "
-                        f"rej(1-effB)={_rej_b*100:.2f}%")
+                        f"{_gain:+.0f}%)  effS(a,b)={_eff_s*100:.1f}%/{_eff_s_hi*100:.1f}%  "
+                        f"effB(a,b)={_effb*100:.2f}%/{_effb_hi*100:.2f}%")
 
         ax_ratio.set_xlabel(cfg.get("xlabel", cfg.get("var", "")), labelpad=1,
                             **({"fontsize": _lp_fs(11)} if _lp2x else {}))
@@ -5365,7 +5424,7 @@ class Plotter:
                      "Wcb_res", "Wcb_total", "Wcb_nomt"]
         _t_keys   = ["Cat_Top_bc", "Cat_Top_bc_nomt",
                      "Cat_Top_bq", "Cat_Top_bqqc", "Cat_Top_bqq"]
-        _v_keys   = ["Wcq", "Wqq_light", "Zbb", "Zcc", "Zlight", "QCD_bb", "Rest"]
+        _v_keys   = ["Wcq", "Zbb", "QCD_bb", "Rest"]
         _hmap = {l: h for h, l in zip(*ax.get_legend_handles_labels())}
 
         # Legend style -- IDENTICAL for MAT and MAT-SIGNAL (2026-09-04, user):
@@ -5396,7 +5455,7 @@ class Plotter:
         _legs = [_make_legend(k, loc, anch) for k, loc, anch in (
             (_sig_keys, "upper left",   (0.01, _leg_y)),
             (_t_keys,   "upper center", (0.47, _leg_y)),   # -3% (2026-09-07, user)
-            (_v_keys,   "upper right",  (1.00, _leg_y)))]
+            (_v_keys,   "upper right",  (1.01, _leg_y)))]  # +1% right (2026-09-19, user)
         _created = [lg for lg in _legs if lg is not None]
         for _lg in _created[:-1]:            # last stays as ax._legend
             ax.add_artist(_lg)
@@ -5420,11 +5479,40 @@ class Plotter:
         # 2026-09-18, user: "the naming convention will be 'SR3b' not
         # 'SR3B' ... in the plot text" -- display-only (the CLI token,
         # _SELECTIONS key and filename suffix all stay uppercase "SR3B").
-        _sel_label = {"PRE": "Preselection", "SR": "SR",
+        _sel_label = {"PRE": "Preselection", "SR": "SR (SR1+SR2+SR3)",
                       "JB": "jb-Region",
+                      "SR1": "SR1", "SR2": "SR2", "SR3": "SR3",
+                      "SRA": "SRa (SR1a+SR2a+SR3a)",
+                      "SRB": "SRb (SR1b+SR2b+SR3b)",
                       "SR1A": "SR1a", "SR1B": "SR1b",
                       "SR2A": "SR2a", "SR2B": "SR2b",
                       "SR3A": "SR3a", "SR3B": "SR3b"}.get(_sel, _sel)
+        # 2026-09-19, user: also quote the D_xx score range each SRij cuts on
+        # -- read live from sr_cuts.json (same file build_mat_plot_settings
+        # uses for the _SELECTIONS strings) so it can never drift out of
+        # sync with the actual cut applied.
+        _SR_INFO = {"SR1A": ("cb", "lo"), "SR1B": ("cb", "hi"),
+                    "SR2A": ("bb", "lo"), "SR2B": ("bb", "hi"),
+                    "SR3A": ("bbc", "lo"), "SR3B": ("bbc", "hi")}
+        _SR_UNION = {"SR1": ("cb", "D_{cb}"), "SR2": ("bb", "D_{bb}"),
+                     "SR3": ("bbc", "D_{bbc}")}
+        if _sel in _SR_UNION:
+            _cls_u, _dl_u = _SR_UNION[_sel]
+            _p_u = Path(__file__).resolve().parent / "S1_tagger" / "sr_cuts.json"
+            _c_u = (json.loads(_p_u.read_text())["sr_cuts"] if _p_u.exists() else
+                    {"cb": (0.80, 0.95), "bb": (0.80, 0.95), "bbc": (0.50, 0.80)})
+            _sel_label += "  " + rf"(${_dl_u}>{_c_u[_cls_u][0]:.2f}$)"
+        if _sel in _SR_INFO:
+            _cls, _which = _SR_INFO[_sel]
+            _sr_cuts_path = Path(__file__).resolve().parent / "S1_tagger" / "sr_cuts.json"
+            _sr_cuts_disp = (json.loads(_sr_cuts_path.read_text())["sr_cuts"]
+                              if _sr_cuts_path.exists() else
+                              {"cb": (0.80, 0.95), "bb": (0.80, 0.95), "bbc": (0.50, 0.80)})
+            _lo_d, _hi_d = _sr_cuts_disp[_cls]
+            _dlab = {"cb": "D_{cb}", "bb": "D_{bb}", "bbc": "D_{bbc}"}[_cls]
+            _sel_label += ("  " + (rf"(${_lo_d:.2f}<{_dlab}\leq{_hi_d:.2f}$)"
+                                    if _which == "lo" else
+                                    rf"(${_dlab}>{_hi_d:.2f}$)"))
         if signal_only:
             _sel_label += " (signal only)"
         elif bkg_only:
@@ -5441,9 +5529,10 @@ class Plotter:
         # "CMS Simulation" baseline and UPRIGHT (non-italic) (2026-09-04, user;
         # +1% higher 2026-09-06, user; +1% higher & horizontally centred
         # 2026-09-12, user).
-        ax.text(0.5, 1.085, _sel_label, transform=ax.transAxes,
+        # 2026-09-19, user: +1% higher, +5% larger text.
+        ax.text(0.5, 1.095, _sel_label, transform=ax.transAxes,
                 ha="center", va="baseline", clip_on=False,
-                fontsize=CMS_LABEL_FONTSIZE * 0.85,
+                fontsize=CMS_LABEL_FONTSIZE * 0.85 * 1.05,
                 fontstyle="normal", fontweight="normal")
 
         ax.set_xlim(cfg.get("xlim", (bins[0], bins[-1])))
@@ -5471,6 +5560,14 @@ class Plotter:
                     _xtl, fontsize=_xfs, rotation=_xrot,
                     ha="center", va="top")
 
+        _xm = cfg.get("xminor_step")
+        if _xm:
+            from matplotlib.ticker import MultipleLocator
+            for _a in (ax, ax_ratio):
+                _a.xaxis.set_minor_locator(MultipleLocator(_xm))
+                _a.tick_params(axis="x", which="major", length=9, width=1.2)
+                _a.tick_params(axis="x", which="minor", length=3.5)
+
         # Optional dashed vertical separators between the sub-blocks of a
         # composite x-axis (spec "vlines" key, data-coord positions) --
         # SHORT tick-like marks confined to the bottom quarter of each pad
@@ -5479,7 +5576,7 @@ class Plotter:
         # (2026-09-06, user).
         _vlines = cfg.get("vlines")
         if _vlines:
-            _vlw = 1.1 * cfg.get("vline_width_mult", 1.0)
+            _vlw = _LW          # 2026-09-19, user: vertical lines = histogram width
             for _vx in _vlines:
                 ax.axvline(_vx, ymin=0.0, ymax=0.25, color="0.35",
                            linestyle=(0, (4, 3)), linewidth=_vlw, zorder=1)
@@ -5520,8 +5617,16 @@ class Plotter:
         _rot_pad = 0.0
         if _xticks is not None and cfg.get("xticklabels"):
             _rot_pad = 0.17 if _xrot == 90 else 0.055
-        fig.subplots_adjust(left=0.125, right=0.965, top=0.91,
-                            bottom=(0.085 + _rot_pad + 0.033 * _cap_nl))
+        # composite (block-label) plots: lower margin -4%, left margin -2%
+        # (2026-09-19, user; absolute figure fractions).
+        # D_cb/D_bb/D_bbc score plots (they feed the 9-panel montage):
+        # lower margin -1%, left margin -2%, y-title moved next to the tick
+        # numbers (2026-09-19, user).
+        _tight9 = str(cfg.get("var", "")) in ("score_M3_cb", "score_S2", "score_S3")
+        _dm_b, _dm_l = ((0.04, 0.02) if cfg.get("block_labels")
+                        else (0.01, 0.02) if _tight9 else (0.0, 0.0))
+        fig.subplots_adjust(left=0.125 - _dm_l, right=0.965, top=0.91,
+                            bottom=(0.085 + _rot_pad + 0.033 * _cap_nl - _dm_b))
         if _cap:
             fig.text(0.015, 0.012, _cap, fontsize=6.6, va="bottom", ha="left",
                      color="0.30", linespacing=1.45)
@@ -5530,12 +5635,26 @@ class Plotter:
         # region) so the two plot sets never clobber each other; "_norm" for
         # NORM-mode so it doesn't clobber the ABS-mode PNG of the same observable.
         _sel_suffix = {"PRE": "_PRE", "SR": "_SR", "JB": "_JB",
+                       "SR1": "_SR1", "SR2": "_SR2", "SR3": "_SR3",
+                       "SRA": "_SRA", "SRB": "_SRB",
                        "SR1A": "_SR1A", "SR1B": "_SR1B",
                        "SR2A": "_SR2A", "SR2B": "_SR2B",
                        "SR3A": "_SR3A", "SR3B": "_SR3B"}.get(_sel, "")
         _suffix = (_sel_suffix + ("_sig" if signal_only else "")
                    + ("_bkg" if bkg_only else "")
                    + ("_norm" if normalize else ""))
+        if _tight9:
+            # hug the y-title to the tick numbers: measure the tick-label
+            # extent and pull the label to ~3 px from it (a fixed 3%-of-width
+            # shift would run into the "10^n" tick labels of the log axis).
+            fig.canvas.draw()
+            _rend = fig.canvas.get_renderer()
+            _tl = [t.get_window_extent(_rend).x0 for t in ax.get_yticklabels()
+                   if t.get_text() and t.get_visible()]
+            if _tl:
+                _bb = ax.yaxis.label.get_window_extent(_rend)
+                _shift_px = (min(_tl) - 3.0) - _bb.x1
+                ax.yaxis.labelpad = ax.yaxis.labelpad - _shift_px * 72.0 / fig.dpi
         outbase = os.path.join(self.cfg.figure_path, name + _suffix)
         self._save_and_show(fig, outbase, tag=cfg.get("_progress", "MAT"))
 
@@ -6445,10 +6564,39 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     _sr_cuts_path = Path(__file__).resolve().parent / "S1_tagger" / "sr_cuts.json"
     _sr_cuts = (json.loads(_sr_cuts_path.read_text())["sr_cuts"] if _sr_cuts_path.exists()
                 else {"cb": (0.80, 0.95), "bb": (0.80, 0.95), "bbc": (0.50, 0.80)})
+    # EXCLUSIVE SR assignment (2026-09-19, user: "we should not double-count
+    # events"; option 1 = plain argmax, cb/SR1 is the dominant class): each
+    # event belongs to the class with the highest of (D_cb, D_bb, D_bbc) and
+    # only that class's a/b windows apply.  Ties are broken cb > bb > bbc
+    # (>= for cb, strict > where a higher-priority class exists) so the three
+    # regions partition the events with no overlap.  FLAT strings only (see
+    # the presel.py note above).
+    _ARG1 = "(score_M3_cb >= score_S2) and (score_M3_cb >= score_S3)"
+    _ARG2 = "(score_S2 > score_M3_cb) and (score_S2 >= score_S3)"
+    _ARG3 = "(score_S3 > score_M3_cb) and (score_S3 > score_S2)"
+    # Unions of the (mutually exclusive) SRij (2026-09-19, user): SR1 = SR1a+
+    # SR1b (= D_cb above the loose cut, cb-argmax), SR2, SR3 likewise; SRa =
+    # SR1a+SR2a+SR3a, SRb = SR1b+SR2b+SR3b; SR = all six.  Every group is
+    # fully parenthesised because "or" -> "|" binds looser than "and" -> "&".
+    _BASE = "(ak8_pt[0] > 200) and " + _MJ12 + " and " + _COMMON
+    _U1 = f"(score_M3_cb > {_sr_cuts['cb'][0]}) and " + _ARG1
+    _U2 = f"(score_S2 > {_sr_cuts['bb'][0]}) and " + _ARG2
+    _U3 = f"(score_S3 > {_sr_cuts['bbc'][0]}) and " + _ARG3
+    _UA = ("((" + f"(score_M3_cb > {_sr_cuts['cb'][0]}) and (score_M3_cb <= {_sr_cuts['cb'][1]}) and " + _ARG1
+           + ") or (" + f"(score_S2 > {_sr_cuts['bb'][0]}) and (score_S2 <= {_sr_cuts['bb'][1]}) and " + _ARG2
+           + ") or (" + f"(score_S3 > {_sr_cuts['bbc'][0]}) and (score_S3 <= {_sr_cuts['bbc'][1]}) and " + _ARG3 + "))")
+    _UB = ("((" + f"(score_M3_cb > {_sr_cuts['cb'][1]}) and " + _ARG1
+           + ") or (" + f"(score_S2 > {_sr_cuts['bb'][1]}) and " + _ARG2
+           + ") or (" + f"(score_S3 > {_sr_cuts['bbc'][1]}) and " + _ARG3 + "))")
     _SELECTIONS = {
         "PRE": "(ak8_pt[0] > 200) and " + _MJ12 + " and " + _COMMON,
-        "SR":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
-                   + _MJ12 + " and " + _COMMON),
+        "SR1":    "(" + _U1 + ") and " + _BASE,
+        "SR2":    "(" + _U2 + ") and " + _BASE,
+        "SR3":    "(" + _U3 + ") and " + _BASE,
+        "SRA":    _UA + " and " + _BASE,
+        "SRB":    _UB + " and " + _BASE,
+        # "SR" = inclusive: SR1 + SR2 + SR3 (was the legacy score_Dbc>0.9 SR)
+        "SR":     ("((" + _U1 + ") or (" + _U2 + ") or (" + _U3 + ")) and " + _BASE),
         "JB":     ("(ak8_pt[0] > 200) and (score_Dbc > 0.9) and "
                    "(score_SC > 0.05) and " + _COMMON),
         # 2026-09-18, user: retired the single plain >0.5 SR1/SR2/SR3 bands in
@@ -6458,17 +6606,20 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # themselves now come from _sr_cuts above (2-bin-optimal, re-derived
         # per training run) rather than being hardcoded here.
         "SR1A":   (f"(ak8_pt[0] > 200) and (score_M3_cb > {_sr_cuts['cb'][0]}) and "
-                   f"(score_M3_cb <= {_sr_cuts['cb'][1]}) and " + _MJ12 + " and " + _COMMON),
+                   f"(score_M3_cb <= {_sr_cuts['cb'][1]}) and " + _ARG1 + " and "
+                   + _MJ12 + " and " + _COMMON),
         "SR1B":   (f"(ak8_pt[0] > 200) and (score_M3_cb > {_sr_cuts['cb'][1]}) and "
-                   + _MJ12 + " and " + _COMMON),
+                   + _ARG1 + " and " + _MJ12 + " and " + _COMMON),
         "SR2A":   (f"(ak8_pt[0] > 200) and (score_S2 > {_sr_cuts['bb'][0]}) and "
-                   f"(score_S2 <= {_sr_cuts['bb'][1]}) and " + _MJ12 + " and " + _COMMON),
+                   f"(score_S2 <= {_sr_cuts['bb'][1]}) and " + _ARG2 + " and "
+                   + _MJ12 + " and " + _COMMON),
         "SR2B":   (f"(ak8_pt[0] > 200) and (score_S2 > {_sr_cuts['bb'][1]}) and "
-                   + _MJ12 + " and " + _COMMON),
+                   + _ARG2 + " and " + _MJ12 + " and " + _COMMON),
         "SR3A":   (f"(ak8_pt[0] > 200) and (score_S3 > {_sr_cuts['bbc'][0]}) and "
-                   f"(score_S3 <= {_sr_cuts['bbc'][1]}) and " + _MJ12 + " and " + _COMMON),
-        "SR3B":   (f"(ak8_pt[0] > 200) and (score_S3 > {_sr_cuts['bbc'][1]}) and "
+                   f"(score_S3 <= {_sr_cuts['bbc'][1]}) and " + _ARG3 + " and "
                    + _MJ12 + " and " + _COMMON),
+        "SR3B":   (f"(ak8_pt[0] > 200) and (score_S3 > {_sr_cuts['bbc'][1]}) and "
+                   + _ARG3 + " and " + _MJ12 + " and " + _COMMON),
     }
     CUT = _SELECTIONS.get(str(sel).upper(), _SELECTIONS["PRE"])
     PI = float(np.pi)
@@ -6478,7 +6629,8 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
           xticks=None, xtick_rotation=None, hide_total_signal=False,
           sig_ymax=None, sigonly_ymax=None,
           block_label_fontsize_mult=1.0, vline_width_mult=1.0,
-          ymax_headroom_mult=1.0, ymax_headroom_abs=None):
+          ymax_headroom_mult=1.0, ymax_headroom_abs=None,
+          xminor_step=None):
         # logx: log-spaced bin edges + log x-axis (lo must be > 0).
         # xticklabels: list of strings -> categorical x-axis.  Ticks default
         # to the bin centres (one label per bin); pass `xticks` (data-coord
@@ -6543,6 +6695,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
             # base + ymax_headroom_mult entirely when set; None (default)
             # leaves every other spec byte-identical.
             "ymax_headroom_abs": ymax_headroom_abs,
+            "xminor_step": xminor_step,
         }
 
     # =====================================================================
@@ -6730,7 +6883,7 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
         # will not touch the real spectra") -- 2 always-empty spacer bins
         # added, right after u/f and right before o/f; see the composite's
         # own layout comment in _attach_runtime_fields for the exact bin map.
-        ("ttreco_mSD_jstar_4block", "mSD_jstar_4block",       0.0, 640.0, 64,
+        ("ttreco_mSD_jstar_4block", "mSD_jstar_4block",       0.0, 680.0, 68,   # 2+16x4+2 bins (2026-09-19, user)
          r"$m_{SD}(J)$ per $j^{*}$ case [GeV]",
          False, False, False,
          # "50"/"200" per-block edge labels dropped (2026-09-18, fix): at only
@@ -6739,26 +6892,27 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
          # overlapped into unreadable text -- 100/150 mid-block ticks plus
          # the vline separators already convey the [50,200) block range.
          ["u/f",
-          "100", "150",
-          "100", "150",
-          "100", "150",
-          "100", "150",
+          "50", "100", "150",
+          "50", "100", "150",
+          "50", "100", "150",
+          "50", "100", "150",
           "o/f"],
          None,
-         [20.0, 170.0, 320.0, 470.0, 620.0],   # dashed separators: block0 | block1 | block2 | block3 edges
-         [(95.0,  r"$j^{*}{=}b_L$",                0.90),
-          (245.0, r"$j^{*}{=}c_L$",                0.90),
-          (395.0, r"$j^{*}{=}q$ (not $b_L/c_L$)",  0.90),
-          (545.0, r"$j^{*}$: N/A",                 0.90)],
+         [20.0, 180.0, 340.0, 500.0, 660.0],   # dashed separators: block0 | block1 | block2 | block3 edges
+         [(100.0, r"$j^{*}{=}b_L$",                0.88),   # 2% lower (2026-09-19, user)
+          (260.0, r"$j^{*}{=}c_L$",                0.88),
+          (420.0, r"$j^{*}{=}q$ (not $b_L/c_L$)",  0.88),
+          (580.0, r"$j^{*}$: N/A",                 0.88)],
          [5.0,
-          70.0, 120.0,
-          220.0, 270.0,
-          370.0, 420.0,
-          520.0, 570.0,
-          635.0],
+          30.0, 80.0, 130.0,      # block b: mSD = 50,100,150 GeV -> 20 + 160 b + (mSD-40)
+          190.0, 240.0, 290.0,
+          350.0, 400.0, 450.0,
+          510.0, 560.0, 610.0,
+          675.0],
          0,          # xtick_rotation: horizontal
          True, 0.65, 1.2,
-         1.10,       # block_label_fontsize_mult: +10%
+         1.21,       # block_label_fontsize_mult: +10% on top of the prior
+                     # +10% (2026-09-19, user) -> +21% vs the shared base
          1.30,       # vline_width_mult: +30%
          # ymax_headroom_mult (2026-09-18 fix): was 5.0 (on top of the shared
          # base 2.6x for any xticklabels composite = 13x total) -- massively
@@ -6771,7 +6925,8 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
          1.0,
          # ymax_headroom_abs (2026-09-18, user: "set the y-axis max to 2x the
          # max bin yield") -- exact, absolute headroom factor for this spec.
-         2.0),
+         2.0,
+         10.0),     # xminor_step: small ticks every 10 GeV (2026-09-19, user)
         # ("ttreco_bbestm1_flav",    "bbestm1_flav",           -0.5, 3.5, 4, r"ParticleNetAK4 tag of best-$m$ AK4 (bmk1)", False, False, False,
         #  [r"light/untag.", r"$c_L$", r"$b_L$ (not $b_M$)", r"$b_M$"]),  # commented out on request 2026-09-04
         # ("ttreco_bvuds_near",      "bvuds_near",              0.0, 1.0, 50, r"$b/(b{+}uds)$, nearest AK4", False),  # commented out on request
@@ -7094,12 +7249,6 @@ def build_mat_plot_settings(sel="PRE", signal_only=False):
     ]
 
     _out = [m(*s) for s in specs]
-    # 2026-09-17, user: D_bb (score_S2) targets one specific signal topology
-    # (t^2(b'b)) -- see the "_topo3_lowerpad" branch in draw_matching for
-    # what this flag replaces the significance panel with.
-    for _p in _out:
-        if _p.get("var") == "score_S2":
-            _p["_topo3_lowerpad"] = True
     return _out
 
 
@@ -7432,12 +7581,15 @@ def parse_args():
         nargs="?",
         default="ALL",
         type=str.upper,
-        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG", "REGIONS", "REGIONS-SIGNAL"],
+        choices=["ALL", "MAT", "MAT-SIGNAL", "MAT-BKG", "MAT-MULTI", "REGIONS", "REGIONS-SIGNAL"],
         help="ALL (default): run the normal Data/MC batch plots. "
              "MAT: matching-truth overlay only (Wcb vs Cat_Top_bc vs Rest, "
              "with a ratio panel).  "
              "MAT-SIGNAL: same overlay but the SIGNAL sample only -- draws "
              "just the 5 red W->cb lines (loads only ttbar-powheg, fast).  "
+             "MAT-MULTI: ONE streaming pass -> several selections (comma list, "
+             "default the 6 SRs) x {combined, _sig, _bkg} plots; e.g. "
+             "MAT-MULTI SR1A,SR1B,SR2A,SR2B,SR3A,SR3B (2026-09-19).  "
              "MAT-BKG: the mirror -- loads every sample EXCEPT ttbar-powheg, "
              "draws just the background lines, lower pad = per-bin component "
              "fraction (PNG suffix _bkg).  "
@@ -7463,7 +7615,24 @@ def parse_args():
     args = parser.parse_args()
 
     _NORMS = {"ABS", "NORM"}
-    _SELS = {"PRE", "SR", "JB", "SR1A", "SR1B", "SR2A", "SR2B", "SR3A", "SR3B"}
+    _SELS = {"PRE", "SR", "JB", "SR1", "SR2", "SR3", "SRA", "SRB",
+             "SR1A", "SR1B", "SR2A", "SR2B", "SR3A", "SR3B"}
+    if args.mode == "MAT-MULTI":
+        args.norm, args.sels = "ABS", []
+        for _tok in (args.opt_a, args.opt_b):
+            for _t in (_tok or "").split(","):
+                _t = _t.strip().upper()
+                if not _t:
+                    continue
+                if _t in _NORMS:
+                    args.norm = _t
+                elif _t in _SELS:
+                    args.sels.append(_t)
+                else:
+                    parser.error(f"MAT-MULTI: unrecognized token '{_t}'")
+        args.sels = args.sels or ["SR1A", "SR1B", "SR2A", "SR2B", "SR3A", "SR3B"]
+        args.sel = args.sels[0]
+        return args
     _toks = [t for t in (args.opt_a, args.opt_b) if t]
     _bad = [t for t in _toks if t not in _NORMS | _SELS]
     if _bad:
@@ -7509,6 +7678,41 @@ def stream_fill_histograms(manager, metas, specs, hist_maker,
     return accs
 
 
+def stream_fill_histograms_multi(manager, metas, specs, hist_maker,
+                                 signal_groups, first_sample=None):
+    """ONE streaming pass, three histogram sets per spec (2026-09-19):
+    ``all`` (every sample = MAT), ``sig`` (signal-group samples only =
+    MAT-SIGNAL) and ``bkg`` (non-signal-group samples only = MAT-BKG).  The
+    old separate runs differed only in WHICH SAMPLES they loaded, so
+    splitting the per-sample histograms by group reproduces all three from a
+    single read of the trees.  Returns (accs_all, accs_sig, accs_bkg), each
+    parallel to ``specs``."""
+    accs = {k: [({}, {}) for _ in specs] for k in ("all", "sig", "bkg")}
+    n = len(metas)
+    for i, meta in enumerate(metas):
+        sample = (first_sample if (i == 0 and first_sample is not None)
+                  else manager.materialize(meta))
+        if sample is None or sample.get("array") is None:
+            print(f"\n[FILL] {i + 1}/{n}  {meta['name']}: unreadable, skip.")
+            continue
+        tgt = "sig" if sample["group"] in signal_groups else "bkg"
+        for j, p in enumerate(specs):
+            hd, hv = hist_maker.make_histograms([sample], p)
+            for key in ("all", tgt):
+                ad, av = accs[key][j]
+                for k, c in hd.items():
+                    ad[k] = ad.get(k, 0) + c
+                for k, v in hv.items():
+                    av[k] = av.get(k, 0) + v
+        print(f"\r[FILL] {i + 1}/{n} | group={sample['group']:<10} "
+              f"| Mem={get_memory_mb():.1f} MB", end="")
+        sample["array"] = None
+        hist_maker.clear_context_cache()
+        gc.collect()
+    print("")
+    return accs["all"], accs["sig"], accs["bkg"]
+
+
 def main():
     t_total0 = time.time()
 
@@ -7519,6 +7723,7 @@ def main():
     # RSS under the lxplus memory cgroup.
     cfg.plot_mode = args.mode
     cfg.mat_sel = getattr(args, "sel", "PRE")
+    cfg.mat_sels = getattr(args, "sels", None)
     cfg.signal_only = args.mode in ("MAT-SIGNAL", "REGIONS-SIGNAL")
     cfg.bkg_only = (args.mode == "MAT-BKG")
     ensure_dir(cfg.figure_path)
@@ -7550,6 +7755,78 @@ def main():
     plotter = Plotter(cfg)
 
     # ------- MAT mode: matching-truth overlay only ----------
+    if args.mode == "MAT-MULTI":
+        _normalize = (args.norm == "NORM")
+        _spec_filt = [x for x in os.environ.get("WCB_MAT_SPECS", "").split(",")
+                      if x.strip()]
+        per_sel, all_specs = {}, []
+        for sel in args.sels:
+            ss = build_mat_plot_settings(sel, False)
+            if _spec_filt:
+                ss = [p for p in ss
+                      if any(x.strip() in p["name"] for x in _spec_filt)]
+            for p in ss:
+                p["_normalize"] = _normalize
+                p["_sel"] = sel
+                p["_signal_only"] = False
+                p["_bkg_only"] = False
+            per_sel[sel] = ss
+            all_specs += ss
+            print(f"[INFO] MAT-MULTI {sel}: {len(ss)} spec(s)   cut: "
+                  f"{ss[0]['cut'] if ss else '-'}")
+        _first = manager.materialize(sample_metas[0]) if sample_metas else None
+        if _first is not None:
+            _have = set(_first["array"].fields)
+            for sel, ss in per_sel.items():
+                if not ss:
+                    continue
+                _miss = sorted(f for f in set(re.findall(
+                    r"[A-Za-z_][A-Za-z0-9_]*", ss[0]["cut"]))
+                    if f not in _have
+                    and f not in ("and", "or", "not", "abs", "ak8_pt"))
+                if _miss:
+                    raise SystemExit(f"[ERROR] MAT-MULTI {sel}: cut needs "
+                                     f"{_miss} missing from cache "
+                                     f"'{cfg.cache_tag}'.")
+        t_fill0 = time.time()
+        print("=" * 100)
+        print(f"[INFO] MAT-MULTI: ONE pass, {len(args.sels)} selection(s), "
+              f"{len(all_specs)} spec-fills over {len(sample_metas)} samples "
+              f"-> combined + _sig + _bkg plots")
+        print("=" * 100)
+        a_all, a_sig, a_bkg = stream_fill_histograms_multi(
+            manager, sample_metas, all_specs, hist_maker,
+            cfg.signal_groups, first_sample=_first)
+        t_fill = time.time() - t_fill0
+
+        t_draw0 = time.time()
+        j = 0
+        for sel in args.sels:
+            for p in per_sel[sel]:
+                for accs_k, so, bo in ((a_all, False, False),
+                                       (a_sig, True, False),
+                                       (a_bkg, False, True)):
+                    hd, hv = accs_k[j]
+                    if len(hd) == 0:
+                        print(f"[WARN] {sel} {p['name']} "
+                              f"({'sig' if so else 'bkg' if bo else 'all'}): "
+                              f"empty, skip.")
+                        continue
+                    q = dict(p)
+                    q["_signal_only"], q["_bkg_only"] = so, bo
+                    q["_progress"] = f"MAT-MULTI {sel}"
+                    plotter.draw_matching(hd, q, hv)
+                j += 1
+        t_total = time.time() - t_total0
+        print("=" * 100)
+        print(f"[DONE] {len(plotter.saved_pngs)} plots in {fmt_hms(t_total)}")
+        print(f"[TIME]   fill : {fmt_hms(t_fill)}  ({t_fill:.1f}s)")
+        print(f"[TIME]   draw : {fmt_hms(time.time() - t_draw0)}")
+        for pth in plotter.saved_pngs:
+            print(f"       {os.path.basename(pth)}")
+        print("=" * 100)
+        return
+
     if args.mode in ("MAT", "MAT-SIGNAL", "MAT-BKG"):
         mat_settings = build_mat_plot_settings(args.sel, cfg.signal_only)
         mat_cut = mat_settings[0]["cut"] if mat_settings else "1"
