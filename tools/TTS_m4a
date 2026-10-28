@@ -1,0 +1,394 @@
+#!/bin/bash
+# TTS_m4a: read your own summaries (.tex / .md / .txt) aloud with macOS `say` -> .m4a in WatchAudioDrop
+DEST="$HOME/Library/Mobile Documents/com~apple~CloudDocs/WatchAudioDrop"
+EN_VOICE="Daniel"
+GR_VOICE="Melina"
+RATE=180
+BITRATE=96k
+MIN_WORDS=50
+
+if [ -x /opt/homebrew/bin/ffmpeg ]; then FFMPEG=/opt/homebrew/bin/ffmpeg; else FFMPEG=/usr/local/bin/ffmpeg; fi
+if [ -x /opt/homebrew/bin/ffprobe ]; then FFPROBE=/opt/homebrew/bin/ffprobe; else FFPROBE=/usr/local/bin/ffprobe; fi
+if [ -x /opt/homebrew/bin/pandoc ]; then PANDOC=/opt/homebrew/bin/pandoc; elif [ -x /usr/local/bin/pandoc ]; then PANDOC=/usr/local/bin/pandoc; else PANDOC=$(command -v pandoc); fi
+
+# ---- table + merge helpers (same as DOWNLOAD_m4p) ----
+format_row() {
+  local file="$1"
+  local size_bytes size_mb duration duration_fmt bitrate bitrate_kbps title artist base_noext
+  size_bytes=$(stat -f%z "$file" 2>/dev/null)
+  size_mb=$(awk -v b="$size_bytes" 'BEGIN{printf "%.2f", b/1048576}')
+  duration=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$file" 2>/dev/null)
+  duration_fmt=$(awk -v d="$duration" 'BEGIN{printf "%d:%02d", int(d/60), int(d)%60}')
+  bitrate=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "$file" 2>/dev/null)
+  bitrate_kbps=$(awk -v b="$bitrate" 'BEGIN{printf "%d", b/1000}')
+  title=$("$FFPROBE" -v error -show_entries format_tags=title -of csv=p=0 "$file" 2>/dev/null)
+  artist=$("$FFPROBE" -v error -show_entries format_tags=artist -of csv=p=0 "$file" 2>/dev/null)
+  artist=$(echo "$artist" | tr -d '"')
+  base_noext="$(basename "$file" .m4a)"
+  if [ -z "$artist" ] && [[ "$base_noext" == *" - "* ]]; then
+    artist="${base_noext%% - *}"
+    [ -z "$title" ] && title="${base_noext#* - }"
+  fi
+  [ -z "$title" ] && title="$base_noext"
+  [ -z "$artist" ] && artist="Unknown"
+  printf '%s\t%s\t%s\t%s kbps\t%s MB\n' "$title" "$artist" "$duration_fmt" "$bitrate_kbps" "$size_mb"
+}
+
+print_table() {
+  local idx=1
+  { printf '#\tTITLE\tARTIST\tDURATION\tQUALITY\tSIZE\n'; while IFS= read -r f; do printf '%d\t%s\n' "$idx" "$(format_row "$f")"; idx=$((idx+1)); done; } | column -t -s $'\t'
+}
+
+list_files_sorted() {
+  for f in "$DEST"/*.m4a; do [ -e "$f" ] || continue; stat -f '%m %N' "$f"; done | sort -n | cut -d' ' -f2-
+}
+
+show_table() {
+  echo ""
+  echo "=== All files in WatchAudioDrop (oldest to newest) ==="
+  list_files_sorted | print_table
+}
+
+stitch_files() {
+  local -a files=("$@")
+  local CONCAT_LIST COVER_TMP STAMP OUTPATH FINAL_TMP
+
+  CONCAT_LIST=$(mktemp)
+  for f in "${files[@]}"; do
+    esc=$(printf '%s' "$f" | sed "s/'/'\\\\''/g")
+    echo "file '$esc'" >> "$CONCAT_LIST"
+  done
+
+  STAMP=$(date +%Y%m%d_%H%M%S)
+  OUTPATH="$DEST/Stitched_${STAMP}.m4a"
+
+  "$FFMPEG" -y -f concat -safe 0 -i "$CONCAT_LIST" -map 0:a -vn -c:a aac -b:a 256k "$OUTPATH"
+  rm -f "$CONCAT_LIST"
+
+  COVER_TMP=""
+  if "$FFPROBE" -v error -select_streams v -show_entries stream=index -of csv=p=0 "${files[0]}" 2>/dev/null | grep -q .; then
+    COVER_TMP=$(mktemp /tmp/cover_XXXXXX.png)
+    "$FFMPEG" -y -i "${files[0]}" -an -map 0:v -c copy "$COVER_TMP" >/dev/null 2>&1
+  fi
+
+  if [ -n "$COVER_TMP" ] && [ -s "$COVER_TMP" ]; then
+    FINAL_TMP=$(mktemp /tmp/stitched_XXXXXX.m4a)
+    "$FFMPEG" -y -i "$OUTPATH" -i "$COVER_TMP" -map 0:a -map 1:v -c:a copy -c:v mjpeg -disposition:v attached_pic "$FINAL_TMP" >/dev/null 2>&1
+    if [ -s "$FINAL_TMP" ]; then
+      mv "$FINAL_TMP" "$OUTPATH"
+    else
+      rm -f "$FINAL_TMP"
+    fi
+    rm -f "$COVER_TMP"
+  fi
+
+  echo ""
+  echo "Stitched -> $(basename "$OUTPATH")"
+
+  echo "Deleting individual source files..."
+  for f in "${files[@]}"; do
+    rm -f "$f"
+    echo "  removed: $(basename "$f")"
+  done
+}
+
+# ---- text helper (perl): clean LaTeX/Markdown, read metadata, find \input-ed files, Greek ratio ----
+HELPER=$(mktemp /tmp/tts_helper_XXXXXX.pl)
+trap 'rm -f "$HELPER"' EXIT
+cat > "$HELPER" <<'PERL'
+use strict; use warnings;
+use File::Basename qw(dirname basename);
+use Cwd qw(abs_path);
+binmode STDIN, ':encoding(UTF-8)'; binmode STDOUT, ':encoding(UTF-8)';
+my ($mode, $file) = @ARGV;
+
+sub slurp { my $f = shift; open(my $h, '<:encoding(UTF-8)', $f) or return ''; local $/; my $t = <$h>; close $h; return defined $t ? $t : ''; }
+sub nocomment { my $t = shift; $t =~ s/(?<!\\)%[^\n]*//g; return $t; }
+sub resolve { my ($n, @dirs) = @_; $n =~ s/^\s+|\s+$//g; for my $d (@dirs) { my $p = ($n =~ m{^/}) ? $n : "$d/$n"; return abs_path($p) if -f $p; return abs_path("$p.tex") if -f "$p.tex"; } return undef; }
+my $INC_RE = qr/\\(?:input|include|subfile)\s*\{([^}]+)\}/;
+
+sub flatten {
+  my ($f, $root, $depth) = @_;
+  return '' if $depth > 10;
+  my $t = nocomment(slurp($f));
+  my $dir = dirname($f);
+  $t =~ s{$INC_RE}{ my $p = resolve($1, $dir, $root); defined $p ? flatten($p, $root, $depth + 1) : '' }ge;
+  return $t;
+}
+
+# \cmd[opt]{arg} with balanced braces: keep arg (1) or drop the whole command (0)
+sub cmd_arg {
+  my ($t, $names, $keep) = @_;
+  my $re = qr/\\(?:$names)\*?\s*(?:\[[^\]]*\]\s*)*(\{((?:[^{}]++|(?1))*)\})/;
+  if ($keep) { 1 while $t =~ s/$re/$2/g; } else { $t =~ s/$re//g; }
+  return $t;
+}
+
+sub heading { my $h = shift; $h =~ s/^\s+|\s+$//g; $h .= '.' if $h ne '' && $h !~ /[.!?:;]$/; return "\n\n$h\n\n"; }
+
+sub tex_pre {
+  my $t = shift;
+  $t =~ s/\\\{/\x01/g; $t =~ s/\\\}/\x02/g;
+  $t = $1 if $t =~ /\\begin\{document\}(.*?)(?:\\end\{document\}|\z)/s;
+  my $envs = 'figure|table|tabular|tabularx|longtable|equation|align|alignat|gather|multline|eqnarray|displaymath|math|tikzpicture|verbatim|lstlisting|minted|thebibliography|comment|wrapfigure';
+  $t =~ s/\\begin\{($envs)(\*?)\}.*?\\end\{\1\2\}//gs;
+  $t =~ s/\\\[.*?\\\]//gs; $t =~ s/\$\$.*?\$\$//gs;
+  $t = cmd_arg($t, 'textsc', 1);
+  $t = cmd_arg($t, 'cite[a-zA-Z]*|[a-zA-Z]*ref|label|footnote|footnotetext|thanks|includegraphics|bibliography|bibliographystyle|url|hspace|vspace|caption', 0);
+  $t =~ s/\\(?:maketitle|tableofcontents|listoffigures|listoftables|newpage|clearpage|noindent|centering|printbibliography)\b//g;
+  $t =~ s/\\(?:part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\s*(?:\[[^\]]*\]\s*)?(\{((?:[^{}]++|(?1))*)\})/heading($2)/ge;
+  return $t;
+}
+
+sub tex_full {
+  my $t = tex_pre(shift);
+  $t =~ s/\$[^\$]*\$//g; $t =~ s/\\\(.*?\\\)//gs;
+  $t =~ s/\\item\s*\[([^\]]*)\]/\n$1: /g; $t =~ s/\\item\b/\n/g;
+  $t =~ s/\\(?:begin|end)\s*\{[^}]*\}(?:\[[^\]]*\])?//g;
+  $t =~ s/\\\\(?:\[[^\]]*\])?/\n/g;
+  $t =~ s/\\['`^"~=.]\{?([a-zA-Z])\}?/$1/g;
+  $t =~ s/\\([&%\$#_])/$1/g;
+  $t = cmd_arg($t, '[a-zA-Z]+', 1);
+  $t =~ s/\\[a-zA-Z]+\*?(?:\[[^\]]*\])?//g;
+  $t =~ s/[{}]//g;
+  $t =~ s/``|''/"/g; $t =~ s/---/, /g; $t =~ s/--/\x{2013}/g; $t =~ s/~/ /g;
+  return $t;
+}
+
+sub md_full {
+  my $t = shift;
+  $t =~ s/\A---\n.*?\n---\n//s;
+  $t =~ s/^```.*?^```[^\n]*\n?//gms;
+  $t =~ s/!\[[^\]]*\]\([^)]*\)//g; $t =~ s/\[([^\]]*)\]\([^)]*\)/$1/g;
+  $t =~ s/<[^>]+>//g;
+  $t =~ s/^\s{0,3}#{1,6}\s*(.*?)\s*#*\s*$/heading($1)/gme;
+  $t =~ s/^\s*(?:[-*+]|\d+[.)])\s+//gm; $t =~ s/^\s*>\s?//gm;
+  $t =~ s/(\*\*|__|\*|_|`)(\S.*?)\1/$2/g;
+  return $t;
+}
+
+sub post {
+  my $t = shift;
+  $t =~ s/\x01/{/g; $t =~ s/\x02/}/g; $t =~ s/\x{A0}/ /g;
+  $t =~ s/\[@[^\]]*\]//g; $t =~ s/\[image\]|\[Image\]//g;
+  $t =~ s/[ \t]+/ /g; $t =~ s/ +\n/\n/g; $t =~ s/\n /\n/g;
+  $t =~ s/ +([,.;:!?])/$1/g; $t =~ s/,\s*,/,/g;
+  $t =~ s/(?<!\.)\.\s*\.(?!\.)/./g;
+  $t =~ s/\n{3,}/\n\n/g; $t =~ s/^\s+|\s+$//g;
+  $t =~ s/([^\s.!?:;,"\x{201D})])(?=\n\n|\z)/$1./g;
+  return "$t\n";
+}
+
+sub meta {
+  my $f = shift;
+  my ($title, $author) = ('', '');
+  my $t = nocomment(slurp($f));
+  if ($f =~ /\.tex$/i) {
+    $title = $2 if $t =~ /\\title\s*(?:\[[^\]]*\])?\s*(\{((?:[^{}]++|(?1))*)\})/s;
+    $author = $2 if $t =~ /\\author\s*(?:\[[^\]]*\])?\s*(\{((?:[^{}]++|(?1))*)\})/s;
+    $author =~ s/\\and\b.*//s;
+    for ($title, $author) { $_ = tex_full($_); s/\s+/ /g; s/^\s+|\s+[,.]?\s*$//g; }
+  } elsif ($f =~ /\.md$/i) {
+    if ($t =~ /\A---\n(.*?)\n---/s) { my $y = $1; $title = $1 if $y =~ /^title:\s*["']?(.*?)["']?\s*$/m; $author = $1 if $y =~ /^author:\s*["']?(.*?)["']?\s*$/m; }
+    $title = $1 if $title eq '' && $t =~ /^#\s+(.+?)\s*$/m;
+  }
+  (my $base = basename($f)) =~ s/\.[^.]+$//;
+  if ($base =~ /^(.+?) - (.+)$/) { ($author, $title) = ($1, $2); }
+  $title = $base if $title eq '';
+  print "$title\t$author\n";
+}
+
+if    ($mode eq 'pre')   { print tex_pre(flatten(abs_path($file), dirname(abs_path($file)), 0)); }
+elsif ($mode eq 'full')  { print post(tex_full(flatten(abs_path($file), dirname(abs_path($file)), 0))); }
+elsif ($mode eq 'md')    { print post(md_full(slurp($file))); }
+elsif ($mode eq 'txt')   { print post(slurp($file)); }
+elsif ($mode eq 'post')  { local $/; print post(<STDIN>); }
+elsif ($mode eq 'meta')  { meta($file); }
+elsif ($mode eq 'includes') {
+  my $t = nocomment(slurp($file)); my $dir = dirname(abs_path($file));
+  while ($t =~ /$INC_RE/g) { my $p = resolve($1, $dir, $ARGV[2] || $dir); print "$p\n" if defined $p; }
+}
+elsif ($mode eq 'greek') {
+  local $/; my $t = <STDIN>;
+  my $g = () = $t =~ /\p{Greek}/g; my $l = () = $t =~ /\p{L}/g;
+  printf "%d\n", $l ? 100 * $g / $l : 0;
+}
+PERL
+
+clean_text() {
+  local f="$1"
+  case "$f" in
+    *.tex|*.TEX)
+      if [ -n "$PANDOC" ]; then
+        perl "$HELPER" pre "$f" | "$PANDOC" -f latex -t plain --wrap=none 2>/dev/null | perl "$HELPER" post
+      else
+        perl "$HELPER" full "$f"
+      fi ;;
+    *.md|*.MD|*.markdown)
+      if [ -n "$PANDOC" ]; then
+        "$PANDOC" -f markdown -t plain --wrap=none "$f" 2>/dev/null | perl "$HELPER" post
+      else
+        perl "$HELPER" md "$f"
+      fi ;;
+    *) perl "$HELPER" txt "$f" ;;
+  esac
+}
+
+voice_exists() {
+  say -v '?' | grep -q "^$1 "
+}
+
+speak_one() {
+  local f="$1"
+  local txt aiff out meta title author words greek voice safe
+  txt=$(mktemp /tmp/tts_txt_XXXXXX)
+  clean_text "$f" > "$txt"
+  words=$(awk '{n+=NF} END{print n+0}' "$txt")
+
+  if [ "$PREVIEW" = 1 ]; then
+    echo "===== $(basename "$f")  ($words words) ====="
+    cat "$txt"
+    echo ""
+    rm -f "$txt"
+    return 0
+  fi
+
+  if [ "$words" -lt "$MIN_WORDS" ]; then
+    echo "skip: $(basename "$f")  (only $words words of text)"
+    rm -f "$txt"
+    return 0
+  fi
+
+  meta=$(perl "$HELPER" meta "$f")
+  title="${meta%%$'\t'*}"
+  author="${meta#*$'\t'}"
+
+  if [ -n "$VOICE" ]; then
+    voice="$VOICE"
+  else
+    greek=$(perl "$HELPER" greek < "$txt")
+    if [ "$greek" -ge 30 ]; then voice="$GR_VOICE"; else voice="$EN_VOICE"; fi
+  fi
+  if ! voice_exists "$voice"; then
+    echo "warning: voice '$voice' not installed (System Settings > Accessibility > Spoken Content > System voice > Manage Voices); using system default"
+    voice=""
+  fi
+
+  if [ -n "$author" ]; then safe="$author - $title"; else safe="$title"; fi
+  safe=$(printf '%s' "$safe" | sed -e 's/: / - /g' -e 's/[\/:]/-/g')
+  out="$DEST/$safe.m4a"
+  aiff=$(mktemp /tmp/tts_XXXXXX)
+  rm -f "$aiff"; aiff="$aiff.aiff"
+
+  echo ""
+  echo ">>> $(basename "$f")  ->  $safe.m4a   ($words words, voice ${voice:-default}, ${RATE} wpm, ~$(( words / RATE + 1 )) min)"
+  if [ -n "$voice" ]; then
+    say -v "$voice" -r "$RATE" --progress -f "$txt" -o "$aiff"
+  else
+    say -r "$RATE" --progress -f "$txt" -o "$aiff"
+  fi
+  "$FFMPEG" -y -i "$aiff" -ac 1 -c:a aac -b:a "$BITRATE" \
+    -metadata title="$title" -metadata artist="${author:-Unknown}" -metadata album="Summaries" -metadata genre="Audiobook" \
+    "$out" >/dev/null 2>&1
+  rm -f "$aiff" "$txt"
+
+  if [ -s "$out" ]; then echo "  saved: $(basename "$out")"; else echo "  FAILED: $(basename "$f")"; fi
+}
+
+# expand a folder into its root documents: every .tex/.md/.txt that is not \input-ed by another .tex (unless -e)
+collect_files() {
+  local d="$1" incl f
+  incl=$(mktemp)
+  if [ "$EACH" != 1 ]; then
+    find "$d" -type f -name '*.tex' | while IFS= read -r f; do perl "$HELPER" includes "$f" "$d"; done > "$incl"
+  fi
+  find "$d" -type f \( -name '*.tex' -o -name '*.md' -o -name '*.txt' \) | sort | while IFS= read -r f; do
+    f=$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")
+    grep -qxF "$f" "$incl" || echo "$f"
+  done
+  rm -f "$incl"
+}
+
+usage() {
+  echo "Usage: $0 [-v voice] [-r wpm] [-b bitrate] [-o outdir] [-e] [-p] <file.tex|file.md|file.txt|folder> ..."
+  echo "         -v  voice (default: $EN_VOICE, or $GR_VOICE when >=30% of letters are Greek)"
+  echo "         -r  speed in words per minute (default $RATE)"
+  echo "         -b  AAC bitrate (default $BITRATE, mono)"
+  echo "         -o  output folder (default WatchAudioDrop)"
+  echo "         -e  folder mode: one audio per file, do not fold \\input files into their parent"
+  echo "         -p  preview the cleaned text only, no audio"
+  echo "       $0 list                                     show the WatchAudioDrop table"
+  echo "       $0 merge <indices separated by _>           e.g. merge 1_2_4"
+  exit 1
+}
+
+# ---- LIST MODE ----
+if [ "$1" == "list" ]; then
+  show_table
+  exit 0
+fi
+
+# ---- MERGE MODE (existing files by index) ----
+if [ "$1" == "merge" ]; then
+  ORDER="$2"
+  if [ -z "$ORDER" ]; then
+    echo "Usage: $0 merge <indices separated by _>   e.g. merge 1_2_4"
+    exit 1
+  fi
+  FILES=()
+  while IFS= read -r f; do FILES+=("$f"); done < <(list_files_sorted)
+  IFS='_' read -ra IDX <<< "$ORDER"
+  SELECTED=()
+  for i in "${IDX[@]}"; do
+    pos=$((i-1))
+    f="${FILES[$pos]}"
+    if [ -z "$f" ]; then
+      echo "Index $i not found (only ${#FILES[@]} files available)."
+      exit 1
+    fi
+    SELECTED+=("$f")
+  done
+  open "$DEST"
+  stitch_files "${SELECTED[@]}"
+  show_table
+  exit 0
+fi
+
+# ---- TEXT -> SPEECH MODE ----
+VOICE=""; PREVIEW=0; EACH=0
+while getopts "v:r:b:o:ep" opt; do
+  case "$opt" in
+    v) VOICE="$OPTARG" ;;
+    r) RATE="$OPTARG" ;;
+    b) BITRATE="$OPTARG" ;;
+    o) DEST="$OPTARG" ;;
+    e) EACH=1 ;;
+    p) PREVIEW=1 ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND-1))
+[ $# -lt 1 ] && usage
+
+if [ "$PREVIEW" != 1 ]; then
+  [ -x "$FFMPEG" ] || { echo "ffmpeg not found (brew install ffmpeg)"; exit 1; }
+  [ -z "$PANDOC" ] && echo "note: pandoc not found, using the built-in LaTeX cleaner (brew install pandoc for better results)"
+  mkdir -p "$DEST"
+  open "$DEST"
+fi
+
+INPUTS=()
+for a in "$@"; do
+  if [ -d "$a" ]; then
+    while IFS= read -r f; do INPUTS+=("$f"); done < <(collect_files "$a")
+  elif [ -f "$a" ]; then
+    INPUTS+=("$a")
+  else
+    echo "not found: $a"
+  fi
+done
+[ ${#INPUTS[@]} -eq 0 ] && { echo "No .tex/.md/.txt files to read."; exit 1; }
+
+for f in "${INPUTS[@]}"; do speak_one "$f"; done
+[ "$PREVIEW" != 1 ] && show_table
+exit 0
